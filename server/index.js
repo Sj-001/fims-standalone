@@ -18,6 +18,16 @@ if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON && !process.env.GOOGLE_SERVICE_ACCO
 }
 
 const app = express();
+// Render (like Heroku and most PaaS hosts) terminates HTTPS at its edge and forwards requests to
+// this app over plain HTTP internally. Without this line, Express has no way to know the original
+// request was actually HTTPS, so it reports every request as insecure. That silently breaks the
+// session cookie below: with secure:true (forced by NODE_ENV=production), the cookie library
+// refuses to set a "secure" cookie on what it believes is an unencrypted connection, throws
+// internally, and cookie-session swallows that error — so login appears to succeed (200 OK) but no
+// session cookie is ever actually stored, and every request right after gets bounced back out as
+// unauthenticated. Trusting the first proxy hop makes Express read Render's X-Forwarded-Proto
+// header instead, so it correctly sees "https" and the cookie gets set as intended.
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json({ limit: '15mb' })); // extraction requests include a base64 JPEG
 app.use(cookieSession({
