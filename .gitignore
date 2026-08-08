@@ -8,3 +8,4 @@ client/build_check2/
 vite.config.js.timestamp-*.mjs
 render_test_tmp.js
 server/index_broken_test.js
+server/lib/sheets_testable.js

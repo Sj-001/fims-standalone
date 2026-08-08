@@ -188,7 +188,109 @@ async function writeBlocksTab(tabKey, blocks) {
   await writeValuesClearingStale(sheets, spreadsheetId, tabName, values, gridSize);
 }
 
+// --- Customer Sheets: push computed data to a customer's OWN external spreadsheet (not this app's
+// main GOOGLE_SHEET_ID) — reproduces the real BINDAL STOCK.xlsx / DIAMOND.xlsx / anmol stock dec 22
+// files' actual layout, verified by opening those files directly: one tab per base item, with every
+// variant of that item as its own small table sitting side by side (title row, header row, dated
+// rows), separated by one blank spacer column — not stacked vertically like writeBlocksTab above.
+// Same service-account auth works for any spreadsheet ID, as long as that spreadsheet has been
+// shared with the service account's email (same one-time step as the main sheet).
+
+// Builds one tab's full 2D grid from a list of variant blocks placed side by side.
+// variants: [{ title, header: [...], rows: [[...], ...] }]
+function buildSideBySideGrid(variants) {
+  const blocks = (Array.isArray(variants) ? variants : []).map(v => ({
+    title: v.title || '',
+    header: (v.header && v.header.length) ? v.header : ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
+    rows: Array.isArray(v.rows) ? v.rows : [],
+  }));
+  if (!blocks.length) return [[]];
+  const widths = blocks.map(b => Math.max(b.header.length, ...b.rows.map(r => (r || []).length), 1));
+  const totalWidth = widths.reduce((s, w) => s + w, 0) + (blocks.length - 1); // +1 blank spacer col between blocks
+  const maxDataRows = Math.max(0, ...blocks.map(b => b.rows.length));
+  const totalHeight = 2 + maxDataRows; // title row + header row + data rows
+  const grid = Array.from({ length: totalHeight }, () => new Array(totalWidth).fill(''));
+  let colOffset = 0;
+  blocks.forEach((b, i) => {
+    grid[0][colOffset] = b.title;
+    b.header.forEach((h, ci) => { grid[1][colOffset + ci] = h; });
+    b.rows.forEach((r, ri) => {
+      (r || []).forEach((val, ci) => { grid[2 + ri][colOffset + ci] = (val === undefined || val === null) ? '' : val; });
+    });
+    colOffset += widths[i] + 1;
+  });
+  return grid;
+}
+
+// Builds the "summary" tab: S.No / Item Name / Quantity, one row per variant, plus a TOTAL row —
+// matching the summary sheet found in every one of the real customer files (verified directly).
+function buildSummaryGrid(rows) {
+  const grid = [['S. No.', 'Item Name', 'Quantity']];
+  let total = 0;
+  (Array.isArray(rows) ? rows : []).forEach((r, i) => {
+    const qty = Number(r.quantity) || 0;
+    grid.push([i + 1, r.item || '', qty]);
+    total += qty;
+  });
+  grid.push(['', 'TOTAL', total]);
+  return grid;
+}
+
+// Pushes every item-group tab plus a summary tab to an external spreadsheet in one go. Reads tab
+// metadata once, creates any missing tabs in a single batchUpdate, then writes each tab — so a
+// 15-tab customer costs about 1 read + 1 batchUpdate + 15 writes, comfortably inside Google's
+// 60 writes/minute/user quota for what's an infrequent, manually-triggered action.
+// itemGroups: [{ tabName, variants: [{ title, header, rows }] }]
+// summary: { rows: [{ item, quantity }] } (optional)
+async function pushCustomerSheet(spreadsheetId, itemGroups, summary) {
+  const sheets = getSheetsClient();
+  const tabPlans = (Array.isArray(itemGroups) ? itemGroups : []).map(g => ({
+    tabName: sanitizeTabName(g.tabName || 'Sheet'),
+    grid: buildSideBySideGrid(g.variants || []),
+  }));
+  if (summary && Array.isArray(summary.rows)) {
+    tabPlans.push({ tabName: 'summary', grid: buildSummaryGrid(summary.rows) });
+  }
+  const existingMeta = await getSheetMeta(sheets, spreadsheetId);
+  const missing = Array.from(new Set(tabPlans.filter(p => !existingMeta[p.tabName]).map(p => p.tabName)));
+  if (missing.length) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: missing.map(title => ({ addSheet: { properties: { title } } })) },
+    });
+  }
+  const results = [];
+  for (const plan of tabPlans) {
+    try {
+      const gridSize = existingMeta[plan.tabName] || { rowCount: 1000, columnCount: 26 };
+      await writeValuesClearingStale(sheets, spreadsheetId, plan.tabName, plan.grid, gridSize);
+      results.push({ tab: plan.tabName, ok: true });
+    } catch (e) {
+      results.push({ tab: plan.tabName, ok: false, error: e.message || 'unknown error' });
+    }
+  }
+  return results;
+}
+
 // --- HTTP handlers ---
+async function pushCustomerSheetHandler(req, res) {
+  try {
+    const { spreadsheetId, itemGroups, summary } = req.body || {};
+    if (!spreadsheetId || !String(spreadsheetId).trim()) {
+      return res.status(400).json({ error: 'spreadsheetId is required.' });
+    }
+    if (!Array.isArray(itemGroups)) {
+      return res.status(400).json({ error: 'itemGroups must be an array.' });
+    }
+    const results = await pushCustomerSheet(String(spreadsheetId).trim(), itemGroups, summary);
+    const failed = results.filter(r => !r.ok);
+    res.status(failed.length ? 502 : 200).json({ ok: failed.length === 0, results });
+  } catch (e) {
+    console.error('Customer sheet push error:', e);
+    res.status(502).json({ error: `Could not push to Google Sheets: ${e.message || 'unknown error'}` });
+  }
+}
+
 async function getTab(req, res) {
   try {
     const rows = await readTab(req.params.tab);
@@ -221,4 +323,4 @@ async function putBlocksTab(req, res) {
   }
 }
 
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab };
+module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler };

@@ -265,12 +265,54 @@ const CATALOG_KEY = 'fims_product_catalog';
 // Exact item names pulled from the "summary" sheet of each customer's stock file — used to correct
 // handwriting misreads during extraction (e.g. "g" vs "9", "&" vs "8"). Extendable via the Customer
 // Mapping tab by uploading more customer stock files, or editing directly.
+// `sheetGroup` is the tab name this item lands under in that customer's own Google Sheet (see the
+// "Customer Sheets" tab) — several variants of the same base item (e.g. "IT 500 Lid" and "IT 500
+// Container") share one tab, exactly matching how BINDAL_STOCK.xlsx / DIAMOND.xlsx / anmol stock
+// dec 22.xlsx are actually laid out (verified by opening those real files directly, not guessed).
+const catalogEntries = (customer, pairs) => pairs.map(([item, sheetGroup]) => ({ id: genId(), customer, item, sheetGroup }));
 const DEFAULT_PRODUCT_CATALOG = [
-  ...['IT 500 Lid', 'IT 500 Container', 'IT 500 Jumbo Container', 'N 100 Jumbo Lid', 'N 100 Jumbo Container', 'N100 MF Container', 'N 100 J XL Container', 'E 130 Container', 'E 130 Lid', 'E 900 Container', 'T Gel Container', 'N200 Jumbo Container', 'N200 Jumbo Lid', 'N150 Lid', 'Tijori Handle'].map(item => ({ id: genId(), customer: 'Bindal', item })),
-  ...['Cream Burst 30g*140pkt', 'Cream Burst 30g*144pkt', 'Cream Burst 60g*70pkt', 'Cashew Cookies 30g*140pkt', 'Coconut Dreamz 31g', 'Coconut Dreamz 60g', 'Coconut Plus 68g*60pkt', 'Blacko 32g', 'T50 64g*60pkt', 'T50 32g*120pkt', 'Butter Plus 28g*140pkt', 'Butter Plus 56g*70pkt', 'Butter Plus 110g*36pkt', 'Kaju Cookies 28g*120pkt', 'Jeera 35g*120pkt', 'Doodh Power 35g*120pkt', 'Doodh Power 35g*200pkt', 'Doodh Power 68g*80pkt', 'Love At First Bite', 'Tooti Fruti 28g*120pkt'].map(item => ({ id: genId(), customer: 'Diamond', item })),
-  ...['Coconutty 36', 'Coconutty 72', 'Coconut Cookies 35g', 'Coconut Cookies 70g', 'Coconut Premium 100g', 'Coconut Premium 156g', 'Butter Bake 65g*60pkt', 'Butter Bake 36.5g*144pkt', 'Butter Bake 64g', 'Butter Bake 130g', 'Butter Bake 32g', 'Butter Bake 73g', 'Digestive 57g', 'Digestive 120g', 'Hit & Run 120g', 'Hit & Run 64g', 'Hit & Run 30g', 'Hit & Run 65g', 'Hit & Run 128g', 'Hit & Run 32g', 'Milk Made 75g*40pkt', 'Milk Made 150g*30pkt', 'Milk Made 75g*60pkt', 'Milk Made 35g*144pkt', 'Milk Made 70g*60pkt', 'Kaju Bake 30g', 'Kaju Bake 130g', 'Kaju Bake 65g', 'Kaju Bake 202g', 'Kaju Bake 120g', 'Jeera Dhamal 70g', 'Jeera Dhamal 35g', 'Bakerbix', 'Nice', 'Diwali Gift'].map(item => ({ id: genId(), customer: 'Anmol', item })),
+  ...catalogEntries('Bindal', [
+    ['IT 500 Lid', 'IT 500'], ['IT 500 Container', 'IT 500'], ['IT 500 Jumbo Container', 'IT 500'],
+    ['N 100 Jumbo Lid', 'N 100'], ['N 100 Jumbo Container', 'N 100'], ['N100 MF Container', 'N 100'], ['N 100 J XL Container', 'N 100'],
+    ['E 130 Container', 'E 130'], ['E 130 Lid', 'E 130'],
+    ['E 900 Container', 'E900'],
+    ['T Gel Container', 'T GEL'],
+    ['N200 Jumbo Container', 'N200'], ['N200 Jumbo Lid', 'N200'],
+    ['N150 Lid', 'N150'],
+    ['Tijori Handle', 'TIJORI HANDLE'],
+  ]),
+  ...catalogEntries('Diamond', [
+    ['Cream Burst 30g*140pkt', 'CREAM'], ['Cream Burst 30g*144pkt', 'CREAM'], ['Cream Burst 60g*70pkt', 'CREAM'],
+    ['Cashew Cookies 30g*140pkt', 'CASHEW'],
+    ['Coconut Dreamz 31g', 'COCONUT'], ['Coconut Dreamz 60g', 'COCONUT'], ['Coconut Plus 68g*60pkt', 'COCONUT'],
+    ['Blacko 32g', 'BLACKO'],
+    ['T50 64g*60pkt', 'T 50'], ['T50 32g*120pkt', 'T 50'],
+    ['Butter Plus 28g*140pkt', 'BUTTER'], ['Butter Plus 56g*70pkt', 'BUTTER'], ['Butter Plus 110g*36pkt', 'BUTTER'],
+    ['Kaju Cookies 28g*120pkt', 'KAJU'],
+    ['Jeera 35g*120pkt', 'JEERA'],
+    ['Doodh Power 35g*120pkt', 'DOODH'], ['Doodh Power 35g*200pkt', 'DOODH'], ['Doodh Power 68g*80pkt', 'DOODH'],
+    ['Love At First Bite', 'LOVE AT'],
+    ['Tooti Fruti 28g*120pkt', 'TOOTI FRUTI'],
+  ]),
+  ...catalogEntries('Anmol', [
+    ['Coconutty 36', 'coconutty'], ['Coconutty 72', 'coconutty'],
+    ['Coconut Cookies 35g', 'COCONUT COOKIES'], ['Coconut Cookies 70g', 'COCONUT COOKIES'],
+    ['Coconut Premium 100g', 'coconut premium cookies'], ['Coconut Premium 156g', 'coconut premium cookies'],
+    ['Butter Bake 65g*60pkt', 'BUTTER BAKE'], ['Butter Bake 36.5g*144pkt', 'BUTTER BAKE'], ['Butter Bake 64g', 'BUTTER BAKE'], ['Butter Bake 130g', 'BUTTER BAKE'], ['Butter Bake 32g', 'BUTTER BAKE'], ['Butter Bake 73g', 'BUTTER BAKE'],
+    ['Digestive 57g', 'Digestive'], ['Digestive 120g', 'Digestive'],
+    ['Hit & Run 120g', 'hit & run'], ['Hit & Run 64g', 'hit & run'], ['Hit & Run 30g', 'hit & run'], ['Hit & Run 65g', 'hit & run'], ['Hit & Run 128g', 'hit & run'], ['Hit & Run 32g', 'hit & run'],
+    ['Milk Made 75g*40pkt', 'MILK MADE'], ['Milk Made 150g*30pkt', 'MILK MADE'], ['Milk Made 75g*60pkt', 'MILK MADE'], ['Milk Made 35g*144pkt', 'MILK MADE'], ['Milk Made 70g*60pkt', 'MILK MADE'],
+    ['Kaju Bake 30g', 'kaju bake'], ['Kaju Bake 130g', 'kaju bake'], ['Kaju Bake 65g', 'kaju bake'], ['Kaju Bake 202g', 'kaju bake'], ['Kaju Bake 120g', 'kaju bake'],
+    ['Jeera Dhamal 70g', 'jeera'], ['Jeera Dhamal 35g', 'jeera'],
+    ['Bakerbix', 'bakerbix'],
+    ['Nice', 'NICE'],
+    ['Diwali Gift', 'DIWALI.GIFT'],
+  ]),
 ];
 const CUSTOMER_MAPPING_KEY = 'fims_customer_mapping';
+// Which external Google Sheet ID each customer's own stock sheet lives at (see the "Customer
+// Sheets" tab) — a separate, customer-owned spreadsheet, never a tab on the main FIMS sheet.
+const CUSTOMER_SHEET_IDS_KEY = 'fims_customer_sheet_ids';
 // Lower-priority fallback keywords — only used when a ledger entry doesn't exactly match one of the
 // catalog's known item names above (e.g. a pack-size variant that isn't in the catalog yet).
 const FALLBACK_CUSTOMER_MAPPING = [
@@ -615,6 +657,7 @@ const NAV = [
   { key: 'daburDispatch', label: 'Dabur — Dispatch Log', icon: Truck },
   { key: 'customerStock', label: 'Customer Stock', icon: Boxes },
   { key: 'customerMapping', label: 'Customer Mapping', icon: ListChecks },
+  { key: 'customerSheets', label: 'Customer Sheets', icon: FileSpreadsheet },
 ];
 const GUIDE_STEPS = [
   {
@@ -821,6 +864,8 @@ function FIMSApp() {
   const [trainingExamples, setTrainingExamples] = useState({});
   const [customerMapping, setCustomerMapping] = useState(DEFAULT_CUSTOMER_MAPPING);
   const [productCatalog, setProductCatalog] = useState(DEFAULT_PRODUCT_CATALOG);
+  const [customerSheetIds, setCustomerSheetIds] = useState([]); // [{id, customer, sheetId}]
+  const [pushStatus, setPushStatus] = useState({}); // { [customer]: { state: 'idle'|'pushing'|'done'|'error', message, unmatched } }
   const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
   const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch };
   useEffect(() => {
@@ -839,6 +884,10 @@ function FIMSApp() {
         if (r2 && r2.value) setProductCatalog(JSON.parse(r2.value));
         else await window.storage.set(CATALOG_KEY, JSON.stringify(DEFAULT_PRODUCT_CATALOG), false);
       } catch (e) { /* keep defaults */ }
+      try {
+        const r3 = await window.storage.get(CUSTOMER_SHEET_IDS_KEY, false);
+        if (r3 && r3.value) setCustomerSheetIds(JSON.parse(r3.value));
+      } catch (e) { /* keep empty — nothing pushed yet */ }
       setLoaded(true);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1290,6 +1339,7 @@ function FIMSApp() {
     scheduleSave('catalog', () => window.storage.set(CATALOG_KEY, JSON.stringify(next), false).catch(() => {}));
   };
   const deleteCatalogItem = (id) => persistCatalog(productCatalog.filter(c => c.id !== id));
+  const updateCatalogItem = (id, field, value) => persistCatalog(productCatalog.map(c => c.id === id ? { ...c, [field]: value } : c));
   const [catalogImportBusy, setCatalogImportBusy] = useState(false);
   const [catalogImportError, setCatalogImportError] = useState('');
   const [catalogReview, setCatalogReview] = useState(null); // { fileName, customerName, items: [{id, item, include}] }
@@ -1339,7 +1389,10 @@ function FIMSApp() {
     const existingItems = new Set(productCatalog.map(c => `${c.customer.toLowerCase()}||${c.item.toLowerCase()}`));
     const newCatalogEntries = included
       .filter(it => !existingItems.has(`${customer.toLowerCase()}||${it.item.trim().toLowerCase()}`))
-      .map(it => ({ id: genId(), customer, item: it.item.trim() }));
+      // sheetGroup defaults to the item's own name (its own tab in that customer's Sheet) — edit it
+      // in the Known Product Catalog table below to group several variants under one shared tab,
+      // matching however that customer's real file actually groups them.
+      .map(it => ({ id: genId(), customer, item: it.item.trim(), sheetGroup: it.item.trim() }));
     persistCatalog([...productCatalog, ...newCatalogEntries]);
     const existingKeywords = new Set(customerMapping.map(r => r.keyword.toLowerCase()));
     const exactRules = []; // high priority: the full exact item name
@@ -1429,45 +1482,100 @@ function FIMSApp() {
     });
   })();
   const customerNames = Array.from(new Set(customerStockGroups.map(g => g.customer))).sort((a, b) => (a === 'Unassigned') - (b === 'Unassigned') || a.localeCompare(b));
-  /* -------- customer stock tabs: auto-created in Google Sheets, one tab per customer, kept in sync
-     automatically — the same "IT 500 Lid" / "Coconutty 36" style items-as-separate-tables layout as
-     the real BINDAL STOCK.xlsx / DIAMOND.xlsx / anmol stock files this app replaces. These tabs are
-     a write-only computed mirror (never read back into app state — the Production Register and
-     Customer Dispatch Bills are the actual source of truth), so this can safely just push the latest
-     computed ledger any time the underlying data changes, debounced so a burst of edits still only
-     costs one write per customer, not one per edit. Every catalog customer (Bindal, Diamond, Anmol
-     by default) gets a tab from the first load onward, even before anything's confirmed yet — it
-     just starts empty and fills in as stock gets confirmed. */
+  /* -------- Customer Sheets: push a customer's stock ledger out to THEIR OWN separate Google
+     Sheet (not a tab on this app's main sheet) — matching the real BINDAL STOCK.xlsx / DIAMOND.xlsx /
+     anmol stock dec 22.xlsx layout exactly: one tab per base item ("IT 500", "Digestive", "CREAM"),
+     with every variant of that item as its own side-by-side table within that tab, plus a "summary"
+     tab listing every variant's current closing balance. This is a write-only computed mirror (the
+     Production Register and Customer Dispatch Bills stay the real source of truth) and is pushed
+     ONLY when you click "Push to Sheet" for that customer below — never automatically — because a
+     push always fully overwrites that tab's contents, and you should be the one deciding when a
+     customer-facing sheet gets overwritten, not a background timer. */
   const allCustomerTabNames = Array.from(new Set([
     ...productCatalog.map(c => c.customer),
     ...customerNames,
   ])).filter(Boolean);
-  const buildCustomerStockBlocks = (customer) => customerStockGroups
-    .filter(g => g.customer === customer)
-    .map(g => ({
-      title: g.description || 'Item',
-      header: ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
-      rows: g.ledger.map(e => [e.date || '', e.opening, e.pieces || 0, e.dispatch || 0, e.closing]),
-    }));
-  const saveCustomerStockTab = async (customer) => {
+  // Groups this customer's variant ledgers under the tab name (sheetGroup) their catalog entry
+  // says they belong to. A variant whose description doesn't exactly match any catalog item for
+  // this customer falls back to using its own description as the tab name AND is flagged in
+  // `unmatched` — surfaced as a warning before pushing, since an unmapped/misspelled item (e.g. a
+  // dispatch bill saying "HANDLE LOCK" when the catalog only knows "Tijori Handle") would otherwise
+  // silently land in the wrong tab of a sheet that looks like an official customer record.
+  // Dispatch bills and handwritten ledgers routinely abbreviate ("IT 500 CONT" for what the catalog
+  // calls "IT 500 Container") — a plain case-insensitive string match would flag nearly everything
+  // as unmapped. This folds that one specific abbreviation and strips spacing/punctuation noise, but
+  // deliberately does NOT strip words like "Lid"/"Container" themselves (unlike normalizeVariant
+  // above) — those are exactly what tells two real catalog entries apart, so erasing them would
+  // silently merge "IT 500 Lid" and "IT 500 Container" into looking like the same item. Verified
+  // against all 4 real dispatch bills: correctly matches every real abbreviation variant, and still
+  // correctly flags a genuinely different name ("HANDLE LOCK" vs. catalog's "Tijori Handle") as
+  // unmatched rather than guessing.
+  const normalizeForCatalogMatch = (s) => (s || '').toLowerCase().replace(/\bcont\.?\b/g, 'container').replace(/[^a-z0-9]/g, '');
+  const buildCustomerSheetPayload = (customer) => {
+    const groups = customerStockGroups.filter(g => g.customer === customer);
+    const sheetGroupByItem = {};
+    productCatalog.filter(c => c.customer === customer).forEach(c => {
+      sheetGroupByItem[normalizeForCatalogMatch(c.item)] = (c.sheetGroup || c.item || '').trim();
+    });
+    const unmatched = [];
+    const tabsMap = {};
+    groups.forEach(g => {
+      const key = normalizeForCatalogMatch(g.description);
+      const sheetGroup = sheetGroupByItem[key];
+      const tabName = sheetGroup || (g.description || 'Item').trim();
+      if (!sheetGroup) unmatched.push(g.description || '(blank description)');
+      if (!tabsMap[tabName]) tabsMap[tabName] = [];
+      tabsMap[tabName].push({
+        title: g.description || 'Item',
+        header: ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
+        rows: g.ledger.map(e => [e.date || '', e.opening, e.pieces || 0, e.dispatch || 0, e.closing]),
+      });
+    });
+    const itemGroups = Object.entries(tabsMap).map(([tabName, variants]) => ({ tabName, variants }));
+    const summaryRows = groups
+      .map(g => ({ item: g.description || 'Item', quantity: g.closingBalance }))
+      .sort((a, b) => a.item.localeCompare(b.item));
+    return { itemGroups, summary: { rows: summaryRows }, unmatched: Array.from(new Set(unmatched)) };
+  };
+  const persistCustomerSheetIds = (next) => {
+    setCustomerSheetIds(next);
+    scheduleSave('customer-sheet-ids', () => window.storage.set(CUSTOMER_SHEET_IDS_KEY, JSON.stringify(next), false).catch(() => {}));
+  };
+  const updateCustomerSheetId = (customer, sheetId) => {
+    const exists = customerSheetIds.some(c => c.customer === customer);
+    const next = exists
+      ? customerSheetIds.map(c => c.customer === customer ? { ...c, sheetId } : c)
+      : [...customerSheetIds, { id: genId(), customer, sheetId }];
+    persistCustomerSheetIds(next);
+  };
+  const getCustomerSheetId = (customer) => (customerSheetIds.find(c => c.customer === customer) || {}).sheetId || '';
+  const pushCustomerSheetNow = async (customer) => {
+    const sheetId = getCustomerSheetId(customer).trim();
+    if (!sheetId) {
+      setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Add a Google Sheet ID for this customer first (see field above).' } }));
+      return;
+    }
+    const { itemGroups, summary, unmatched } = buildCustomerSheetPayload(customer);
+    setPushStatus(prev => ({ ...prev, [customer]: { state: 'pushing', message: '', unmatched } }));
     try {
-      const res = await fetch(`/api/sheets/${encodeURIComponent(customer)}/blocks`, {
+      const res = await fetch('/api/customer-sheets/push', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({ blocks: buildCustomerStockBlocks(customer) }),
+        body: JSON.stringify({ spreadsheetId: sheetId, itemGroups, summary }),
       });
-      if (res.status === 401) window.dispatchEvent(new Event('fims-unauthorized'));
-    } catch (e) { /* best-effort mirror — the underlying registers are the real data, not this tab */ }
+      if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return; }
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Pushed ${itemGroups.length} item tab${itemGroups.length === 1 ? '' : 's'} + summary just now.`, unmatched } }));
+      } else {
+        const failedTabs = (data.results || []).filter(r => !r.ok).map(r => `${r.tab}: ${r.error}`).join(' · ');
+        setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: failedTabs || data.error || `Push failed (HTTP ${res.status}).`, unmatched } }));
+      }
+    } catch (e) {
+      setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: e.message || 'Network error — could not reach the server.', unmatched } }));
+    }
   };
-  const customerTabNamesKey = allCustomerTabNames.join('|');
-  useEffect(() => {
-    if (!loaded || !allCustomerTabNames.length) return;
-    scheduleSave('customer-stock-tabs', () => {
-      allCustomerTabNames.forEach(customer => saveCustomerStockTab(customer));
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loaded, production, customerDispatch, customerMapping, customerTabNamesKey]);
   /* -------- export --------
      Every export button below just packages the relevant rows/columns into a { title, sheets } object
      and hands it to the CopyExportModal — it does NOT build an .xlsx workbook or trigger a download
@@ -1999,7 +2107,7 @@ function FIMSApp() {
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Customer Stock</h2>
                 <p className="subtitle" style={{ marginBottom: 4 }}>Combines confirmed Production Register entries (stock in) with confirmed Customer Dispatch Bill entries (stock out), grouped by customer and product variant, into a running opening/production/dispatch/closing balance — the same shape as your BINDAL_STOCK / DIAMOND / Anmol stock files.</p>
-                <p className="subtitle">Matching is done by the Customer Mapping tab, plus anything literally bracketed next to the item name. This is a flat sheet per variant rather than the exact side-by-side block layout your originals use — let me know if you need it to match that layout exactly.</p>
+                <p className="subtitle">Matching is done by the Customer Mapping tab, plus anything literally bracketed next to the item name. This in-app view is a flat list per variant — to push this data out to that customer's own Google Sheet in the exact side-by-side, tab-per-item layout your original files use, go to the Customer Sheets tab.</p>
               </div>
               {pendingProductionRows.length > 0 && (
                 <div className="panel" style={{ borderColor: 'var(--accent)' }}>
@@ -2167,22 +2275,69 @@ function FIMSApp() {
               </div>
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Known Product Catalog</h2>
-                <p className="subtitle" style={{ marginBottom: 14 }}>Exact item names used to correct handwriting misreads during extraction (e.g. "g" vs "9", "&" vs "8"). Built from the files you've imported above — delete anything that's wrong.</p>
+                <p className="subtitle" style={{ marginBottom: 14 }}>Exact item names used to correct handwriting misreads during extraction (e.g. "g" vs "9", "&" vs "8"). "Sheet Tab" is which tab this item lands under in that customer's own Google Sheet (Customer Sheets tab) — several variants of one base item (e.g. "IT 500 Lid" and "IT 500 Container") should share the same Sheet Tab name, exactly like your original files. Built from the files you've imported above — edit or delete anything that's wrong.</p>
                 {customerNames.length === 0 && !productCatalog.length && <div className="empty-state">No catalog items yet.</div>}
                 {Array.from(new Set(productCatalog.map(c => c.customer))).map(customer => (
                   <div key={customer} style={{ marginBottom: 16 }}>
                     <div className="section-label">{customer} ({productCatalog.filter(c => c.customer === customer).length} items)</div>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                      {productCatalog.filter(c => c.customer === customer).map(c => (
-                        <span key={c.id} className="pill pill-neutral" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                          {c.item}
-                          <button className="icon-btn danger" style={{ padding: 0 }} onClick={() => deleteCatalogItem(c.id)}><Trash2 size={12} /></button>
-                        </span>
-                      ))}
+                    <div className="table-wrap">
+                      <table>
+                        <thead><tr><th>Item name</th><th>Sheet Tab (item group)</th><th className="col-action"></th></tr></thead>
+                        <tbody>
+                          {productCatalog.filter(c => c.customer === customer).map(c => (
+                            <tr key={c.id}>
+                              <td><input className="cell-input" value={c.item} onChange={e => updateCatalogItem(c.id, 'item', e.target.value)} /></td>
+                              <td><input className="cell-input" value={c.sheetGroup || ''} placeholder={c.item} onChange={e => updateCatalogItem(c.id, 'sheetGroup', e.target.value)} /></td>
+                              <td className="col-action"><button className="icon-btn danger" onClick={() => deleteCatalogItem(c.id)}><Trash2 size={15} /></button></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
                     </div>
                   </div>
                 ))}
               </div>
+            </div>
+          )}
+          {loaded && activeTab === 'customerSheets' && (
+            <div>
+              <div className="panel">
+                <h2 style={{ marginBottom: 6 }}>Customer Sheets</h2>
+                <p className="subtitle" style={{ marginBottom: 4 }}>Push a customer's stock ledger out to THEIR OWN separate Google Sheet — not a tab on this app's main sheet — laid out the same way as your original BINDAL STOCK.xlsx / DIAMOND.xlsx / anmol stock files: one tab per base item, every variant of that item as its own side-by-side table within that tab, plus a "summary" tab listing every variant's current balance.</p>
+                <p className="subtitle" style={{ marginBottom: 4 }}>This only happens when you click "Push to Sheet" below — nothing is pushed automatically. A push fully overwrites that customer's sheet with the latest computed data, so if anyone hand-edits it directly, those edits will be lost on the next push.</p>
+                <p className="subtitle">Setup per customer, once: create or open their Google Sheet, share it with your service account's email (the same one you shared your main FIMS sheet with) as an Editor, then paste that sheet's ID below — the long ID in its URL, between <code>/d/</code> and <code>/edit</code>.</p>
+              </div>
+              {allCustomerTabNames.length === 0 && <div className="panel"><div className="empty-state">No customers yet — add one via Customer Mapping first.</div></div>}
+              {allCustomerTabNames.map(customer => {
+                const status = pushStatus[customer] || {};
+                const { itemGroups, summary, unmatched } = buildCustomerSheetPayload(customer);
+                const sheetId = getCustomerSheetId(customer);
+                return (
+                  <div className="panel" key={customer}>
+                    <div className="panel-header">
+                      <div>
+                        <h2>{customer}</h2>
+                        <p className="subtitle">{itemGroups.length} item tab{itemGroups.length === 1 ? '' : 's'} · {summary.rows.length} variant{summary.rows.length === 1 ? '' : 's'} ready to push</p>
+                      </div>
+                      <button className="btn btn-primary" onClick={() => pushCustomerSheetNow(customer)} disabled={status.state === 'pushing' || !sheetId.trim()}>
+                        {status.state === 'pushing' ? <Loader2 size={15} className="spin" /> : <FileSpreadsheet size={15} />} Push to Sheet
+                      </button>
+                    </div>
+                    <div className="field-row">
+                      <input className="text-input" style={{ minWidth: 340, flex: 1 }} placeholder="Google Sheet ID for this customer" value={sheetId} onChange={e => updateCustomerSheetId(customer, e.target.value)} autoComplete="off" spellCheck={false} />
+                    </div>
+                    {(unmatched.length > 0) && (
+                      <div className="error-box" style={{ marginTop: 10 }}>
+                        <AlertCircle size={16} />
+                        <span>{unmatched.length} item{unmatched.length === 1 ? '' : 's'} didn't match any catalog entry for {customer}, so they'll be pushed under their own tab instead of grouped correctly: {unmatched.join(', ')}. Fix this in Customer Mapping / Known Product Catalog before pushing, or ignore if that's intended.</span>
+                      </div>
+                    )}
+                    {status.state === 'done' && <div className="doc-hint" style={{ color: 'var(--ok)', marginTop: 10 }}>✓ {status.message}</div>}
+                    {status.state === 'error' && <div className="error-box" style={{ marginTop: 10 }}><AlertCircle size={16} /><span>{status.message}</span></div>}
+                    {!sheetId.trim() && <div className="doc-hint" style={{ marginTop: 10 }}>Add a Sheet ID above to enable pushing.</div>}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
