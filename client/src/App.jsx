@@ -1,0 +1,2215 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import * as XLSX from 'xlsx';
+import {
+  Upload, Image as ImageIcon, Package, Boxes, Search, Truck, ClipboardList,
+  FileSpreadsheet, Download, CheckCircle2, XCircle, Trash2, Loader2,
+  AlertCircle, LayoutDashboard, FileText, Archive, ListChecks, Plus
+} from 'lucide-react';
+/* ============================== helpers ============================== */
+const num = (v) => {
+  const n = parseFloat(String(v ?? '').replace(/,/g, ''));
+  return isNaN(n) ? 0 : n;
+};
+const genId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+async function resizeImageToBase64(file, maxDim = 1500, quality = 0.85) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          if (width > height) { height = Math.round((height * maxDim) / width); width = maxDim; }
+          else { width = Math.round((width * maxDim) / height); height = maxDim; }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width; canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve({ dataUrl: canvas.toDataURL('image/jpeg', quality), base64: canvas.toDataURL('image/jpeg', quality).split(',')[1] });
+      };
+      img.onerror = () => reject(new Error('IMAGE_DECODE_FAILED'));
+      img.src = e.target.result;
+    };
+    reader.onerror = () => reject(new Error('FILE_READ_FAILED'));
+    reader.readAsDataURL(file);
+  });
+}
+let pdfjsLoadPromise = null;
+function loadPdfJs() {
+  if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  if (pdfjsLoadPromise) return pdfjsLoadPromise;
+  pdfjsLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+    script.onload = () => {
+      try {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        resolve(window.pdfjsLib);
+      } catch (e) { reject(e); }
+    };
+    script.onerror = () => reject(new Error('PDFJS_LOAD_FAILED'));
+    document.body.appendChild(script);
+  });
+  return pdfjsLoadPromise;
+}
+function canvasToScaled(canvas, maxDim, quality) {
+  let { width, height } = canvas;
+  let out = canvas;
+  if (width > maxDim || height > maxDim) {
+    let w = width, h = height;
+    if (w > h) { h = Math.round((h * maxDim) / w); w = maxDim; } else { w = Math.round((w * maxDim) / h); h = maxDim; }
+    const resized = document.createElement('canvas');
+    resized.width = w; resized.height = h;
+    resized.getContext('2d').drawImage(canvas, 0, 0, w, h);
+    out = resized;
+  }
+  const dataUrl = out.toDataURL('image/jpeg', quality);
+  return { dataUrl, base64: dataUrl.split(',')[1] };
+}
+// Detects which printed copy a PDF page is (Original/Duplicate/Triplicate/Extra/e-Way Bill) by reading
+// the PDF's own text layer — free, instant, no API call. Only works for real digital PDFs (which is
+// exactly how dispatch bills come in); photographed JPG/PNG pages have no text layer, so this always
+// returns 'unknown' for those and nothing changes for them. Used to skip sending duplicate/e-Way Bill
+// pages to the vision API at all for dispatch-bill uploads, since sending all of them was burning
+// through the rate limit on a single multi-copy bill for pages we were always going to discard anyway.
+function detectCopyLabel(text) {
+  const t = (text || '').replace(/\s+/g, ' ');
+  if (/e-?way\s*bill\s*details/i.test(t)) return 'ewaybill';
+  if (/original\s*for\s*recipient/i.test(t)) return 'original';
+  if (/duplicate\s*for\s*transporter/i.test(t)) return 'duplicate';
+  if (/triplicate\s*for\s*supplier/i.test(t)) return 'triplicate';
+  if (/extra\s*copy/i.test(t)) return 'extra';
+  if (/quadruplicate/i.test(t)) return 'extra';
+  return 'unknown';
+}
+async function pdfFileToPages(file, maxDim = 1500, quality = 0.85) {
+  const pdfjsLib = await loadPdfJs();
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const pages = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const viewport = page.getViewport({ scale: 2 });
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width; canvas.height = viewport.height;
+    const ctx = canvas.getContext('2d');
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    const { dataUrl, base64 } = canvasToScaled(canvas, maxDim, quality);
+    let copyLabel = 'unknown';
+    try {
+      const textContent = await page.getTextContent();
+      copyLabel = detectCopyLabel(textContent.items.map(it => it.str).join(' '));
+    } catch (e) { /* no text layer (scanned PDF) — leave as unknown, nothing gets auto-skipped */ }
+    pages.push({ dataUrl, base64, page: i, copyLabel });
+  }
+  return pages;
+}
+// Triggers a real file download of a workbook. Only ever called from a direct, explicit click on the
+// "Download .xlsx" button inside the export modal (never automatically) — each call is therefore its
+// own fresh user gesture, which is what browsers require before they'll reliably allow a download.
+// Earlier versions of this app ALSO called window.open() as an automatic "fallback" any time the artifact
+// was running inside an iframe — which, inside Claude.ai, is always. That meant every single export
+// silently fired two download attempts back-to-back (the <a download> click, then a second one via
+// window.open), which is exactly the kind of back-to-back automatic download pattern Chrome and other
+// browsers throttle after the first one in a session — the second, third, etc. get silently swallowed
+// with no error thrown, which is consistent with "the first export I tried worked, later ones didn't."
+// That automatic second attempt has been removed; this function now makes exactly one attempt per click.
+function downloadWorkbook(wb, filename) {
+  const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+  const blob = new Blob([wbout], { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  try {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }
+}
+// Tab-separated text pastes into Excel/Google Sheets as real columns — this is the export path that is
+// guaranteed to work no matter what the browser does with actual file downloads, because selecting text
+// and pressing Ctrl+C is a native browser action, not a scriptable API call that a sandbox can block.
+function toTSV(rows, columns) {
+  const esc = (v) => String(v ?? '').replace(/\t/g, ' ').replace(/\r?\n/g, ' ');
+  const header = columns.map(c => esc(c.label)).join('\t');
+  const body = rows.map(r => columns.map(c => esc(r[c.key])).join('\t')).join('\n');
+  return rows.length ? `${header}\n${body}` : header;
+}
+// For a multi-sheet export (e.g. one item per customer-stock sheet), stacks every sheet's title + TSV
+// block into ONE pasteable string, separated by a blank line. This exists so a 15-36-item customer
+// stock export doesn't require selecting the dropdown and copy-pasting once per item — one paste gets
+// everything, landing as stacked title/header/data blocks in a single Excel sheet (not separate tabs,
+// but every row of every item is present in one action). The per-item dropdown view is kept alongside
+// this for anyone who specifically wants to paste one item into its own existing tab.
+function toMultiBlockTSV(sheets) {
+  return sheets.map(s => `${s.name}\n${toTSV(s.rows, s.columns)}`).join('\n\n');
+}
+// Builds a valid, UNIQUE Excel worksheet name from arbitrary text: strips the characters Excel forbids
+// in sheet names (\ / ? * [ ] :), enforces the 31-character limit, falls back to "Sheet" if nothing is
+// left, and de-dupes case-insensitively (Excel treats "Kaju Bake" and "kaju bake" as the same name) by
+// appending _2, _3, ... Tested against duplicate, empty, overlong, unicode, and symbol-only names.
+function sanitizeSheetName(rawName, usedNamesLower) {
+  let base = String(rawName || '').replace(/[\\/*?:[\]]/g, '').trim();
+  if (!base) base = 'Sheet';
+  base = base.slice(0, 31);
+  let candidate = base;
+  let n = 2;
+  while (usedNamesLower.has(candidate.toLowerCase())) {
+    const suffix = `_${n}`;
+    candidate = base.slice(0, Math.max(1, 31 - suffix.length)) + suffix;
+    n++;
+  }
+  usedNamesLower.add(candidate.toLowerCase());
+  return candidate;
+}
+// A worksheet with a title line above the table (used for per-customer stock ledgers). Built as one
+// array-of-arrays so the title never overwrites real header cells — an earlier version wrote the title
+// into cell A1 with sheet_add_aoa AFTER json_to_sheet had already put "Date" there, silently clobbering
+// the header of every stock export.
+function buildTitledSheet(title, rows, columns) {
+  const header = columns.map(c => c.label);
+  const body = rows.map(r => columns.map(c => r[c.key] ?? ''));
+  return XLSX.utils.aoa_to_sheet([[title], [], header, ...body]);
+}
+function buildTableSheet(rows, columns) {
+  const data = rows.length ? rows.map(r => { const o = {}; columns.forEach(c => { o[c.label] = r[c.key]; }); return o; }) : [{}];
+  return XLSX.utils.json_to_sheet(data);
+}
+// Builds the actual .xlsx workbook from the modal's sheet list, on demand, only when the person clicks
+// "Download .xlsx" — kept separate from the copy-paste view (which is built instantly and can't fail)
+// so a workbook-building problem never blocks the one export path that's guaranteed to work.
+function buildWorkbookFromSheets(sheets) {
+  const wb = XLSX.utils.book_new();
+  const usedNamesLower = new Set();
+  sheets.forEach(s => {
+    const ws = s.kind === 'titled' ? buildTitledSheet(s.title || s.name, s.rows, s.columns) : buildTableSheet(s.rows, s.columns);
+    const safeName = sanitizeSheetName(s.name, usedNamesLower);
+    XLSX.utils.book_append_sheet(wb, ws, safeName);
+  });
+  return wb;
+}
+function repairTruncatedJson(text) {
+  // Best-effort recovery when a response got cut off mid-object: trim back to the
+  // last fully-closed brace/bracket, then close whatever's still left open.
+  const lastGood = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
+  if (lastGood === -1) throw new Error('UNPARSEABLE');
+  let s = text.slice(0, lastGood + 1);
+  const stack = [];
+  for (const ch of s) {
+    if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' && stack[stack.length - 1] === '{') stack.pop();
+    else if (ch === ']' && stack[stack.length - 1] === '[') stack.pop();
+  }
+  while (stack.length) s += (stack.pop() === '{' ? '}' : ']');
+  s = s.replace(/,(\s*[}\]])/g, '$1');
+  return JSON.parse(s);
+}
+// Standalone-hosting version: extraction always goes through OUR OWN backend at /api/extract,
+// which holds the real Anthropic API key server-side and forwards to Anthropic. The browser never
+// sees the key at all — there's no "own key vs free proxy" branch anymore because there's only one
+// path now, and it's never rate-limited by a shared quota (the whole point of this migration).
+// A 401 here means the login session expired; dispatching 'fims-unauthorized' sends the app back
+// to the login screen instead of showing a confusing extraction error.
+async function callClaudeExtract(systemPrompt, base64Image, signal) {
+  const res = await fetch('/api/extract', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    signal,
+    body: JSON.stringify({ systemPrompt, base64Image }),
+  });
+  if (res.status === 401) {
+    window.dispatchEvent(new Event('fims-unauthorized'));
+    throw new Error('EXTRACT_HTTP_401: session expired, please log in again');
+  }
+  if (!res.ok) {
+    const bodyText = await res.text().catch(() => '');
+    const err = new Error(`EXTRACT_HTTP_${res.status}: ${bodyText.slice(0, 300)}`);
+    err.status = res.status;
+    // surface a Retry-After hint if the server sent one — used to size the backoff wait
+    const retryAfter = res.headers && res.headers.get ? res.headers.get('retry-after') : null;
+    if (retryAfter) err.retryAfterMs = (parseFloat(retryAfter) || 0) * 1000;
+    throw err;
+  }
+  const data = await res.json();
+  const block = (data.content || []).find(b => b.type === 'text');
+  if (!block) throw new Error('EXTRACT_EMPTY: no text block in response');
+  let clean = block.text.trim();
+  clean = clean.replace(/^```(json)?/i, '').replace(/```$/,'').trim();
+  const firstBrace = Math.min(
+    ...['[', '{'].map(ch => { const i = clean.indexOf(ch); return i === -1 ? Infinity : i; })
+  );
+  if (firstBrace > 0 && firstBrace !== Infinity) clean = clean.slice(firstBrace);
+  try {
+    return JSON.parse(clean);
+  } catch (parseErr) {
+    // response may have been cut off before finishing — salvage what we can
+    return repairTruncatedJson(clean);
+  }
+}
+/* ============================== storage ============================== */
+const STORAGE_KEYS = {
+  rawMaterialIn: 'fims_raw_material_in',
+  consumption: 'fims_consumption',
+  production: 'fims_production',
+  customerDispatch: 'fims_customer_dispatch',
+  daburSpecs: 'fims_dabur_specs',
+  daburPO: 'fims_dabur_po',
+  daburDispatch: 'fims_dabur_dispatch',
+};
+const CATALOG_KEY = 'fims_product_catalog';
+// Exact item names pulled from the "summary" sheet of each customer's stock file — used to correct
+// handwriting misreads during extraction (e.g. "g" vs "9", "&" vs "8"). Extendable via the Customer
+// Mapping tab by uploading more customer stock files, or editing directly.
+const DEFAULT_PRODUCT_CATALOG = [
+  ...['IT 500 Lid', 'IT 500 Container', 'IT 500 Jumbo Container', 'N 100 Jumbo Lid', 'N 100 Jumbo Container', 'N100 MF Container', 'N 100 J XL Container', 'E 130 Container', 'E 130 Lid', 'E 900 Container', 'T Gel Container', 'N200 Jumbo Container', 'N200 Jumbo Lid', 'N150 Lid', 'Tijori Handle'].map(item => ({ id: genId(), customer: 'Bindal', item })),
+  ...['Cream Burst 30g*140pkt', 'Cream Burst 30g*144pkt', 'Cream Burst 60g*70pkt', 'Cashew Cookies 30g*140pkt', 'Coconut Dreamz 31g', 'Coconut Dreamz 60g', 'Coconut Plus 68g*60pkt', 'Blacko 32g', 'T50 64g*60pkt', 'T50 32g*120pkt', 'Butter Plus 28g*140pkt', 'Butter Plus 56g*70pkt', 'Butter Plus 110g*36pkt', 'Kaju Cookies 28g*120pkt', 'Jeera 35g*120pkt', 'Doodh Power 35g*120pkt', 'Doodh Power 35g*200pkt', 'Doodh Power 68g*80pkt', 'Love At First Bite', 'Tooti Fruti 28g*120pkt'].map(item => ({ id: genId(), customer: 'Diamond', item })),
+  ...['Coconutty 36', 'Coconutty 72', 'Coconut Cookies 35g', 'Coconut Cookies 70g', 'Coconut Premium 100g', 'Coconut Premium 156g', 'Butter Bake 65g*60pkt', 'Butter Bake 36.5g*144pkt', 'Butter Bake 64g', 'Butter Bake 130g', 'Butter Bake 32g', 'Butter Bake 73g', 'Digestive 57g', 'Digestive 120g', 'Hit & Run 120g', 'Hit & Run 64g', 'Hit & Run 30g', 'Hit & Run 65g', 'Hit & Run 128g', 'Hit & Run 32g', 'Milk Made 75g*40pkt', 'Milk Made 150g*30pkt', 'Milk Made 75g*60pkt', 'Milk Made 35g*144pkt', 'Milk Made 70g*60pkt', 'Kaju Bake 30g', 'Kaju Bake 130g', 'Kaju Bake 65g', 'Kaju Bake 202g', 'Kaju Bake 120g', 'Jeera Dhamal 70g', 'Jeera Dhamal 35g', 'Bakerbix', 'Nice', 'Diwali Gift'].map(item => ({ id: genId(), customer: 'Anmol', item })),
+];
+const CUSTOMER_MAPPING_KEY = 'fims_customer_mapping';
+// Lower-priority fallback keywords — only used when a ledger entry doesn't exactly match one of the
+// catalog's known item names above (e.g. a pack-size variant that isn't in the catalog yet).
+const FALLBACK_CUSTOMER_MAPPING = [
+  { id: genId(), keyword: 'tijori handle', customer: 'Bindal' },
+  { id: genId(), keyword: 'n-200', customer: 'Bindal' }, { id: genId(), keyword: 'n200', customer: 'Bindal' },
+  { id: genId(), keyword: 'e-130', customer: 'Bindal' }, { id: genId(), keyword: 'e130', customer: 'Bindal' }, { id: genId(), keyword: 'e 130', customer: 'Bindal' },
+  { id: genId(), keyword: 'e900', customer: 'Bindal' }, { id: genId(), keyword: 'e 900', customer: 'Bindal' },
+  { id: genId(), keyword: 't gel', customer: 'Bindal' }, { id: genId(), keyword: 't-gel', customer: 'Bindal' },
+  { id: genId(), keyword: 'n-100', customer: 'Bindal' }, { id: genId(), keyword: 'n100', customer: 'Bindal' }, { id: genId(), keyword: 'n 100', customer: 'Bindal' },
+  { id: genId(), keyword: 'it 500', customer: 'Bindal' }, { id: genId(), keyword: 'it500', customer: 'Bindal' }, { id: genId(), keyword: 'it-500', customer: 'Bindal' },
+  { id: genId(), keyword: 'n150', customer: 'Bindal' }, { id: genId(), keyword: 'n-150', customer: 'Bindal' }, { id: genId(), keyword: 'n 150', customer: 'Bindal' },
+  { id: genId(), keyword: 'box no', customer: 'Bindal' },
+  { id: genId(), keyword: 'coconut dreamz', customer: 'Diamond' }, { id: genId(), keyword: 'coconut dream', customer: 'Diamond' },
+  { id: genId(), keyword: 'coconut plus', customer: 'Diamond' },
+  { id: genId(), keyword: 'butter plus', customer: 'Diamond' },
+  { id: genId(), keyword: 'kaju cookies', customer: 'Diamond' },
+  { id: genId(), keyword: 'doodh', customer: 'Diamond' },
+  { id: genId(), keyword: 'blacko', customer: 'Diamond' },
+  { id: genId(), keyword: 'tooti fruti', customer: 'Diamond' }, { id: genId(), keyword: 'tooti frooti', customer: 'Diamond' },
+  { id: genId(), keyword: 'cashew', customer: 'Diamond' },
+  { id: genId(), keyword: 'love at', customer: 'Diamond' },
+  { id: genId(), keyword: 't-50', customer: 'Diamond' }, { id: genId(), keyword: 't 50', customer: 'Diamond' }, { id: genId(), keyword: 't50', customer: 'Diamond' }, { id: genId(), keyword: 't-so', customer: 'Diamond' },
+  { id: genId(), keyword: 'cream', customer: 'Diamond' },
+  { id: genId(), keyword: 'digestive', customer: 'Anmol' },
+  { id: genId(), keyword: 'milk made', customer: 'Anmol' },
+  { id: genId(), keyword: 'butter smiley', customer: 'Anmol' },
+  { id: genId(), keyword: 'butter bake', customer: 'Anmol' },
+  { id: genId(), keyword: 'nice', customer: 'Anmol' },
+  { id: genId(), keyword: 'kaju bake', customer: 'Anmol' },
+  { id: genId(), keyword: 'coconut cookies', customer: 'Anmol' },
+  { id: genId(), keyword: 'coconut premium', customer: 'Anmol' },
+  { id: genId(), keyword: 'coconutty', customer: 'Anmol' },
+  { id: genId(), keyword: 'jeera dhamal', customer: 'Anmol' }, { id: genId(), keyword: 'jeera dhamaal', customer: 'Anmol' }, { id: genId(), keyword: 'jeera dhamel', customer: 'Anmol' },
+  { id: genId(), keyword: 'jeera', customer: 'Diamond' },
+  { id: genId(), keyword: 'bakerbix', customer: 'Anmol' }, { id: genId(), keyword: 'bakers bix', customer: 'Anmol' }, { id: genId(), keyword: 'baker bix', customer: 'Anmol' },
+  { id: genId(), keyword: 'hit & run', customer: 'Anmol' }, { id: genId(), keyword: 'hit8 run', customer: 'Anmol' }, { id: genId(), keyword: 'hit & rum', customer: 'Anmol' }, { id: genId(), keyword: 'hit8 rum', customer: 'Anmol' }, { id: genId(), keyword: 'hits rum', customer: 'Anmol' }, { id: genId(), keyword: 'hit 8 rum', customer: 'Anmol' },
+  { id: genId(), keyword: 'diwali', customer: 'Anmol' },
+];
+// The mapping actually used: one EXACT-item-name rule per catalog entry (checked first, most reliable),
+// then the broader fallback keywords above for anything that doesn't hit an exact match.
+const DEFAULT_CUSTOMER_MAPPING = [
+  ...DEFAULT_PRODUCT_CATALOG.map(c => ({ id: genId(), keyword: c.item.toLowerCase(), customer: c.customer })),
+  ...FALLBACK_CUSTOMER_MAPPING,
+];
+function buildCatalogText(catalog) {
+  if (!catalog || !catalog.length) return '  (no known items yet)';
+  const byCustomer = {};
+  catalog.forEach(c => { (byCustomer[c.customer] = byCustomer[c.customer] || []).push(c.item); });
+  return Object.entries(byCustomer).map(([customer, items]) => `  ${customer}: ${items.join(', ')}`).join('\n');
+}
+// A row coming back from Google Sheets is always made of strings — every cell, no matter what was
+// written into it. That's fine for most fields (the `num()` helper already tolerates numeric
+// strings), but `stockConfirmed` is checked as a real boolean (`!row.stockConfirmed`), and the
+// string `"false"` is truthy in JS — so without this fix, every row would look permanently
+// "confirmed" after a single round trip through the Sheet. This coerces just that one known
+// boolean field back to a real boolean on the way in; everything else passes through untouched.
+function coerceStorageValue(row) {
+  if (!row || typeof row !== 'object') return row;
+  const out = { ...row };
+  if ('stockConfirmed' in out) out.stockConfirmed = out.stockConfirmed === true || out.stockConfirmed === 'true';
+  return out;
+}
+// window.storage shim: the original Claude.ai artifact persisted data through a built-in
+// `window.storage.get/set/delete(key, ephemeral)` API baked into the artifact sandbox. That API
+// doesn't exist outside Claude.ai, so this shim reimplements the same interface on top of our own
+// backend's /api/sheets/:tab endpoint (which in turn reads/writes a real Google Sheet tab) — every
+// other function in this file that calls window.storage needed zero further changes.
+// The backend's sheets endpoint speaks in arrays of flat row objects (so the Sheet stays a normal,
+// readable spreadsheet with real columns) — this shim bridges that to the original blob-string
+// interface, JSON-stringifying/parsing on the way through, and coercing row types on read.
+window.storage = {
+  async get(key) {
+    const res = await fetch(`/api/sheets/${encodeURIComponent(key)}`, { credentials: 'include' });
+    if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return null; }
+    if (!res.ok) throw new Error(`Sheets read failed: HTTP ${res.status}`);
+    const data = await res.json();
+    const rows = Array.isArray(data.rows) ? data.rows.map(coerceStorageValue) : [];
+    if (!rows.length) return null;
+    return { value: JSON.stringify(rows) };
+  },
+  async set(key, value) {
+    let rows = [];
+    try { rows = JSON.parse(value); } catch (e) { rows = []; }
+    if (!Array.isArray(rows)) rows = [];
+    const res = await fetch(`/api/sheets/${encodeURIComponent(key)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ rows }),
+    });
+    if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return; }
+    if (!res.ok) throw new Error(`Sheets write failed: HTTP ${res.status}`);
+  },
+  async delete(key) {
+    // Deleting = writing an empty array, which clears the tab's contents (the tab itself stays).
+    await window.storage.set(key, '[]');
+  },
+};
+async function loadRegister(key) {
+  try {
+    const r = await window.storage.get(key, false);
+    if (r && r.value) return JSON.parse(r.value);
+    return [];
+  } catch (e) { return []; }
+}
+async function saveRegister(key, rows) {
+  try { await window.storage.set(key, JSON.stringify(rows), false); } catch (e) { /* noop */ }
+}
+const TRAINING_KEY = 'fims_training_examples';
+const MAX_EXAMPLES_STORED = 15;
+const MAX_EXAMPLES_IN_PROMPT = 6;
+// Rate-limit handling: how long to wait before automatically retrying a page that got rate-limited,
+// growing each time in case the window hasn't reset yet. After exhausting these, we stop and let the
+// person resume manually via "Retry remaining" — that way we never spin forever silently.
+const RATE_LIMIT_BACKOFFS_MS = [20000, 40000, 60000];
+// Pacing gap between consecutive requests in a batch. Our backend uses a dedicated, spend-capped
+// Anthropic API key (1,000 requests/minute standard limit) instead of Claude.ai's shared free quota,
+// so this just needs to avoid firing a literal burst in the same instant — no long throttling needed.
+const BATCH_REQUEST_GAP_MS = 400;
+const sleep = (ms, signal) => new Promise((resolve, reject) => {
+  const timer = setTimeout(resolve, ms);
+  if (!signal) return;
+  if (signal.aborted) { clearTimeout(timer); reject(new DOMException('Cancelled', 'AbortError')); return; }
+  signal.addEventListener('abort', () => { clearTimeout(timer); reject(new DOMException('Cancelled', 'AbortError')); }, { once: true });
+});
+const isCancelled = (e) => e && e.name === 'AbortError';
+// Training examples are stored as one JS object (keyed by document type), not an array of flat rows
+// like every other register — so they don't fit the generic array-shaped window.storage shim above.
+// Instead this talks to the same /api/sheets/:tab backend endpoint directly, wrapping the whole
+// object as a single row with one 'blob' column. It'll show up in the Sheet as one JSON cell rather
+// than readable columns, which is fine — these are internal correction examples, not data anyone
+// needs to read or edit directly in the spreadsheet.
+async function loadTraining() {
+  try {
+    const res = await fetch(`/api/sheets/${TRAINING_KEY}`, { credentials: 'include' });
+    if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return {}; }
+    if (!res.ok) return {};
+    const data = await res.json();
+    const row = Array.isArray(data.rows) && data.rows[0];
+    if (row && row.blob) return JSON.parse(row.blob);
+    return {};
+  } catch (e) { return {}; }
+}
+async function saveTraining(obj) {
+  try {
+    await fetch(`/api/sheets/${TRAINING_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ rows: [{ blob: JSON.stringify(obj) }] }),
+    });
+  } catch (e) { /* noop */ }
+}
+function buildPromptWithTraining(basePrompt, examples) {
+  if (!examples || !examples.length) return basePrompt;
+  const recent = examples.slice(-MAX_EXAMPLES_IN_PROMPT);
+  const examplesText = recent.map((ex, i) =>
+    `Example ${i + 1}:\nExtracted (this had a mistake): ${JSON.stringify(ex.before)}\nHuman-corrected (this is right): ${JSON.stringify(ex.after)}`
+  ).join('\n\n');
+  return `${basePrompt}
+LEARNED CORRECTIONS — a person has corrected real extraction mistakes on this exact document type before. Each pair below shows a row as it was first extracted (with a mistake) and how a human corrected it. Study the pattern behind each correction — what kind of value was misread, which field it belongs in, how it should be formatted — and apply that same fix logic to this new document. Do not copy these exact values into unrelated rows; only apply the underlying pattern.
+${examplesText}`;
+}
+/* ============================== document type configs ============================== */
+const DOCUMENT_TYPES = [
+  {
+    key: 'mill_slip',
+    label: 'Mill Packing Slip (raw material inward)',
+    hint: 'Printed packing slip from a paper mill listing cardboard reels — e.g. Ashoka Pulp & Paper, Hanumant Paper Mills, Sardhana Papers, Shree Sidhbali.',
+    register: 'rawMaterialIn',
+    systemPrompt: `You read printed packing slips from paper mills that supply cardboard reels to a corrugated box factory. Extract every reel line item on the slip — there may be 2 to 80+ reels, do not stop early, and do not include "Total"/"Grand Total" summary rows. Return ONLY one JSON object in this exact shape, with the mill name and date given ONCE at the top level, not repeated per item:
+{"mill":"mill or company name","date":"slip date, DD/MM/YYYY","items":[{"reel_no":"reel number as string","size":"size only, e.g. 55 or 59.5","unit":"the size's unit of measure as printed, e.g. Inch or CM — leave empty string only if truly not shown anywhere on the slip","gsm":"GSM only, e.g. 140","bf":"BF only, e.g. 18","shade":"shade code if present, e.g. NS or GY, else empty string","weight_kg":number}]}
+IMPORTANT — column format varies between mills, read carefully:
+- Some slips have separate BF / GSM / SIZE / Unit columns already split out — just copy each value into its matching field. If there's a single "Unit" column applying to all rows, use that same value for every item.
+- Other slips (e.g. Ashoka Pulp & Paper) print a single combined column, sometimes mislabeled "SIZE * GSM", where each value is actually three numbers joined by "*" in the order Size*GSM*BF — for example "34*180*18" means size=34, gsm=180, bf=18, and "59.5*140*18" means size=59.5, gsm=140, bf=18. Do NOT put the whole compound string into the "size" field — split it into its three separate size/gsm/bf values. Do not assume which number is which; the pattern is always Size, then GSM, then BF, in that left-to-right order.
+- SHADE: some slips have their own dedicated "Shade" column (e.g. values like GY, NS) — use that value directly. Other slips have no separate shade column, but the GSM value has a letter code stuck to the end of it, e.g. "120NS" — in that case the number is the GSM (120) and the letters are the shade (NS); split them into "gsm":"120" and "shade":"NS". A third pattern: some slips group reels under bold section headings instead of a shade column — sometimes the heading directly names a shade code as one of its parts (e.g. "Kraft Paper - 25 - GY" means every row under it is shade GY, and the "25" there is the BF, not a separate thing to worry about if BF already has its own column), and sometimes the heading only names a paper type/colour with no explicit code (e.g. "BR Golden Yellow" or "Golden Yellow" means shade GY, "Kraft Paper" alone with no code means shade NS/Natural Shade). Either way, apply the heading's shade to every row listed under it until the next heading appears. Only do this when you are confident in the mapping — if a heading is unfamiliar or ambiguous, leave "shade" as an empty string rather than guessing. If there is genuinely no shade information anywhere for a row (no column, no code, no heading), also leave "shade" as an empty string.`,
+    shape: (raw) => {
+      if (!raw || !Array.isArray(raw.items)) return [];
+      return raw.items.map(it => ({ id: genId(), date: raw.date || '', mill: raw.mill || '', reel_no: it.reel_no || '', size: it.size || '', unit: it.unit || '', gsm: it.gsm || '', bf: it.bf || '', shade: it.shade || '', weight_kg: num(it.weight_kg) }));
+    },
+  },
+  {
+    key: 'consumption_sheet',
+    label: 'Daily Consumption Report (handwritten)',
+    hint: 'The handwritten daily sheet workers use to record raw material consumed — columns are usually Shade, GSM, Size, Weight, and Balance Left.',
+    register: 'consumption',
+    systemPrompt: `You read a handwritten daily raw-material consumption report from a corrugated box factory. The sheet has Hindi column headers. Most rows share one date written once at the top. Return ONLY one JSON object:
+{"date":"as written at the top, DD/MM/YYYY","items":[{"shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number","balance_left":"the टुकड़ा / Tukda column value (this is the running balance left, NOT a piece count) as a number, or empty string if that row has none","date_override":"only include this if a specific row has a different date than the header, else omit"}]}
+IMPORTANT:
+- The column that looks like it's labeled "S/K" is actually the SHADE column, not a party name or code. Decode its handwritten values: "S.K" or "SK" means shade NS (Sada Kraft / natural shade). "G.Y" or "GY" means shade GY (Golden Yellow). If you see a different value you don't recognize, copy it as written rather than forcing it into NS or GY.
+- There is no BF field on this document — do not invent one. What might look like a stray extra column is the Size column.
+- Do not skip the last column (टुकड़ा / Tukda) — it is the balance left, and must be captured for every row that has a value in it.
+- Interpret unclear handwriting as best you can; if a value is genuinely illegible leave it as an empty string rather than guessing wildly.`,
+    shape: (raw) => {
+      if (!raw || !Array.isArray(raw.items)) return [];
+      return raw.items.map(it => ({ id: genId(), date: it.date_override || raw.date || '', shade: it.shade || '', size: it.size || '', gsm: it.gsm || '', weight_consumed: num(it.weight_consumed), balance_left: it.balance_left === '' || it.balance_left == null ? '' : num(it.balance_left) }));
+    },
+  },
+  {
+    key: 'production_sheet',
+    label: 'Production Register (handwritten)',
+    hint: 'The handwritten daily production register — covers both page styles: the shade/size/GSM/weight/tukda style, and the product-description + quantity style. Extracted into one unified register.',
+    register: 'production',
+    systemPrompt: `You read a handwritten factory production register from a corrugated box factory. There are TWO different page styles used in this register — figure out which one you're looking at and extract accordingly:
+STYLE A — shade/size/GSM style: columns are typically SL.NO. (ignore it), a column commonly headed "S/K" (this records paper SHADE, not a party name — decode 'S.K'/'S/K' as shade NS, 'G.Y' as shade GY, normalize to the 2-letter code, leave blank if unfamiliar rather than guessing), then GMS (GSM), Size (no separate BF column exists here), Weight (kg), and Tukda (count of pieces produced for that row). Most rows share one date at the top of the page.
+STYLE B — product ledger style: each line has a DATE and a product DESCRIPTION, plus one or two quantity columns.
+- Extract the FULL item name exactly as it appears in the factory's own product catalog below — including the weight and pack count (e.g. "Butter Bake 65g x60", "T50 64g x60"). Do NOT shorten it to just the brand/family word (do not output just "T50" or "Butter Bake" alone) — the weight and pack count are part of the item name, not separate data.
+- Known handwriting misreads to correct, using the reference catalog below: the letter "g" (grams) is very often misread as the digit "9" — a pattern like "120g x60" is almost always grams, essentially never "1209 x60"; "&" is often misread as "8" or "5"; "Run" is often misread as "Rum". When a line clearly matches one of the catalog items below (allowing for this kind of misread), use the catalog's exact spelling. If it doesn't resemble anything in the catalog, transcribe your best reading rather than forcing a match.
+- Reference catalog of known exact item names (case as shown), grouped by customer for your own matching confidence only — still extract just the item name into "description", not the customer name:
+{{PRODUCT_CATALOG}}
+  (This list isn't exhaustive — other legitimate products exist too. Only use it to correct obvious misreads of these specific items, never to force an unrelated line into matching one of them.)
+- IMPORTANT: a customer name is sometimes written in brackets right next to the item name, either before or after it — e.g. "(Diamond) Cream Burst 30g x140" or "Cream Burst 30g x140 (Diamond)". Pull that bracketed name OUT into its own "customer_hint" field and do NOT leave it inside "description" — "description" should be just the clean item name with no bracket in it.
+- Dates are often written once then repeated below with a ditto mark (a tick, quote mark, or short symbol like " or 11 or //) — resolve a ditto mark to the same date as the row above, never leave date blank because of one.
+- Some pages have a single "Quantity" column — put that value into "pieces". Other pages have two columns headed roughly S and D side by side — S goes into "pieces", D goes into "dispatch". If a row only has one of the two, leave the other as 0.
+For EITHER style: do not include page-total or running-total rows (a lone number with no row content, usually at the bottom of a page or column). Extract every real row on the page, in order, exactly once — do not skip rows and do not repeat any row, even if faint printing or ruling lines make it look duplicated. If an actual customer/party name is written somewhere on the page itself (separate from the shade column — e.g. as a page header/title, applying to the WHOLE page, not a per-row bracket), include it as "party" for every item on that page; otherwise omit "party" entirely.
+Return ONLY one JSON object: {"date":"shared header date if Style A, DD/MM/YYYY, else omit","items":[{"date_override":"only if a specific row's date differs from the header or ditto-resolves to something else, else omit","party":"only if found as a whole-page header, else omit","customer_hint":"Style B only — a bracketed customer name found next to this specific item, else omit","shade":"Style A only, else omit","size":"Style A only, else omit","gsm":"Style A only, else omit","weight":"Style A only (number), else omit","description":"Style B only — the FULL exact item name including weight and pack count, with no bracketed customer name in it, else omit","pieces":"number — pieces produced (Tukda in Style A, the single Quantity or the S column in Style B)","dispatch":"number — Style B's D column only, else 0"}]}`,
+    shape: (raw) => {
+      if (!raw || !Array.isArray(raw.items)) return [];
+      return raw.items.map(it => ({
+        id: genId(), date: it.date_override || raw.date || it.date || '', party: it.party || '', shade: it.shade || '',
+        size: it.size || '', gsm: it.gsm || '', weight: num(it.weight), description: it.description || '',
+        customerHint: it.customer_hint || '', pieces: num(it.pieces), dispatch: num(it.dispatch),
+        stockConfirmed: false, confirmedCustomer: '',
+      }));
+    },
+  },
+  {
+    key: 'dispatch_bill',
+    label: 'Dispatch Bill / Tax Invoice',
+    hint: 'A printed tax invoice / dispatch bill sent to any customer (Bindal, Diamond, Anmol, or otherwise) — lands in its own Customer Dispatch Bills tab, separate from the Production Register, and reduces that customer’s stock balance on the Customer Stock tab and feeds the Order Availability Check.',
+    register: 'customerDispatch',
+    systemPrompt: `You read a printed GST tax invoice / dispatch bill for corrugated boxes sent to a customer.
+CRITICAL — you are shown ONE PAGE at a time, in isolation. You have no memory of any other page in this document, so you must decide what to do based only on what's printed on THIS page. Every dispatch bill is printed as a set of near-identical copies, each one labeled directly beside or below the words "Tax Invoice" at the very top: "(ORIGINAL FOR RECIPIENT)", "(DUPLICATE FOR TRANSPORTER)", "(TRIPLICATE FOR SUPPLIER)", "(EXTRA COPY)" — plus separate e-Way Bill pages mixed in between them. These copies are NOT separate invoices and NOT separate deliveries — they are the identical invoice printed several times.
+Extract line items ONLY from the page labeled exactly "(ORIGINAL FOR RECIPIENT)". For every other page — one labeled "(DUPLICATE FOR TRANSPORTER)", "(TRIPLICATE FOR SUPPLIER)", "(EXTRA COPY)", or any e-Way Bill page — return the same JSON shape with an empty items array, no matter how clear or legible that particular page is. Do not extract from a Duplicate/Triplicate/Extra copy just because it happens to be easier to read than the Original — a different page in this same upload batch is the Original and will be extracted from instead. If the page has no visible copy label at all, treat it as NOT the Original and return empty items.
+If the page you are looking at right now is purely an e-Way Bill, or is any non-Original copy you're deliberately skipping per the rule above, do NOT treat that as an error and do NOT refuse or apologize — just return the same JSON shape with an empty items array: {"invoice_no":"","date":"","party":"","buyer_order_no":"","items":[]}. An empty result is a completely valid, expected answer for most pages in a batch like this.
+Extract (only from the Original page):
+- "invoice_no": the Invoice No.
+- "date": the invoice date
+- "party": the Buyer (Bill to) name — the actual company name, e.g. "BINDAL TECHNOPOLYMER PVT. LTD." or "ANMOL INDUSTRIES LTD." — copy it as printed
+- "buyer_order_no": the Buyer's Order No. / PO reference if printed, else empty string
+- "items": one entry per line under "Description of Goods". Each line typically shows "CORRUGATED BOX" as a generic heading with the real product name in italics underneath (e.g. "IT 500 CONT", "HANDLE LOCK", "N 100 JUMBO XL CONT", "JEERA DHAMAL 35G x 144PKT") — use that italic sub-line as the description, NOT the generic "CORRUGATED BOX" text. Ignore the "(BOX:- N*M = total)" annotation underneath — it's just arithmetic, not part of the item name. "quantity" is the Quantity column value (e.g. 500 from "500.0 nos.").
+Return ONLY one JSON object: {"invoice_no":"","date":"","party":"","buyer_order_no":"","items":[{"description":"","quantity":number,"rate":number,"amount":number}]}`,
+    shape: (raw) => {
+      if (!raw || !Array.isArray(raw.items)) return [];
+      return raw.items.map(it => ({
+        id: genId(), date: raw.date || '', party: raw.party || '', description: it.description || '',
+        customerHint: raw.party || '', invoice_no: raw.invoice_no || '', buyer_order_no: raw.buyer_order_no || '',
+        quantity: num(it.quantity), rate: num(it.rate), amount: num(it.amount),
+        stockConfirmed: false, confirmedCustomer: '',
+      }));
+    },
+  },
+  {
+    key: 'dabur_spec',
+    label: 'Dabur Spec Sheet (reference)',
+    hint: 'Printed Dabur PM Specification sheet for a box item — replaces the manual diary.',
+    register: 'daburSpecs',
+    systemPrompt: `You read a printed "Dabur India Limited — PM Specification" sheet for a corrugated box. Return ONLY a JSON array with ONE object:
+[{"product_name":"product/item name","box_size":"Length x Width x Height with units, from the Length/Width/Height rows","gsm_combo":"the paper combination and GSM text, e.g. 140(VK)/120(SK)/120(SK)/120(SK)/150(SK)","partition_size":"partition size/count if listed","plate_size":"plate/central-plate size if listed","compression":"compression strength / bursting factor spec","notes":"any other short important spec worth keeping, 1 sentence max"}]`,
+    shape: (raw) => (Array.isArray(raw) ? raw : []).map(r => ({ id: genId(), product_name: r.product_name || '', box_size: r.box_size || '', gsm_combo: r.gsm_combo || '', partition_size: r.partition_size || '', plate_size: r.plate_size || '', compression: r.compression || '', notes: r.notes || '' })),
+  },
+  {
+    key: 'dabur_po',
+    label: 'Dabur Purchase Order (printed)',
+    hint: 'Printed purchase order from Dabur — creates entries on the Pending PO list.',
+    register: 'daburPO',
+    systemPrompt: `You read a printed Dabur purchase order (may be titled "Draft Purchase Order"). Return ONLY one JSON object:
+{"po_number":"P.O. Number","date":"PO date DD/MM/YYYY","items":[{"material_desc":"material/description text","hsn":"HSN/SAC code if present","quantity":number,"rate":number,"delivery_date":"delivery date if present, else empty string"}]}`,
+    shape: (raw) => {
+      if (!raw || !Array.isArray(raw.items)) return [];
+      return raw.items.map(it => ({
+        id: genId(), po_number: raw.po_number || '', date: raw.date || '', material_desc: it.material_desc || '',
+        hsn: it.hsn || '', quantity: num(it.quantity), rate: num(it.rate), delivery_date: it.delivery_date || ''
+      }));
+    },
+  },
+  {
+    key: 'dabur_dispatch',
+    label: 'Dabur Dispatch Bill (updates Pending PO)',
+    hint: 'The dispatch bill / invoice sent against a Dabur PO — reduces the pending quantity on that PO.',
+    register: 'daburDispatch',
+    systemPrompt: `You read a printed tax invoice / dispatch bill for goods dispatched against a Dabur purchase order.
+CRITICAL — you are shown ONE PAGE at a time, in isolation. You have no memory of any other page in this document, so you must decide what to do based only on what's printed on THIS page. Every dispatch bill is printed as a set of near-identical copies, each one labeled directly beside or below the words "Tax Invoice" at the very top: "(ORIGINAL FOR RECIPIENT)", "(DUPLICATE FOR TRANSPORTER)", "(TRIPLICATE FOR SUPPLIER)", "(EXTRA COPY)" — plus separate e-Way Bill pages mixed in between them. These copies are NOT separate invoices — they are the identical invoice printed several times.
+Extract line items ONLY from the page labeled exactly "(ORIGINAL FOR RECIPIENT)". For every other page — "(DUPLICATE FOR TRANSPORTER)", "(TRIPLICATE FOR SUPPLIER)", "(EXTRA COPY)", or any e-Way Bill page — return the same JSON shape with an empty items array, no matter how clear or legible that page is. Do not extract from a Duplicate/Triplicate/Extra copy just because it's easier to read than the Original — a different page in this same batch is the Original and will be extracted from instead. If the page has no visible copy label at all, treat it as NOT the Original and return empty items.
+If the page you are looking at right now is purely an e-Way Bill, or is any non-Original copy you're deliberately skipping per the rule above, do NOT treat that as an error and do NOT refuse or apologize — just return the same JSON shape with an empty items array. An empty result is a completely valid, expected answer for most pages in a batch like this.
+Return ONLY one JSON object:
+{"invoice_no":"invoice number","date":"invoice date","party":"buyer name, usually Dabur / Anmol Industries etc.","buyer_order_no":"the Buyer's Order No. / PO number referenced on the invoice — this is critical, look carefully, there may be more than one","items":[{"description":"item description","quantity":number,"rate":number,"amount":number}]}
+If multiple buyer order numbers are listed, use the first one and mention any others inside the description field of the relevant item.`,
+    shape: (raw) => {
+      if (!raw || !Array.isArray(raw.items)) return [];
+      return raw.items.map(it => ({
+        id: genId(), date: raw.date || '', invoice_no: raw.invoice_no || '', party: raw.party || '',
+        buyer_order_no: raw.buyer_order_no || '', description: it.description || '', quantity: num(it.quantity), rate: num(it.rate), amount: num(it.amount)
+      }));
+    },
+  },
+];
+const COLUMNS = {
+  rawMaterialIn: [
+    { key: 'date', label: 'Date' }, { key: 'mill', label: 'Mill' }, { key: 'reel_no', label: 'Reel No' },
+    { key: 'size', label: 'Size' }, { key: 'unit', label: 'Unit' }, { key: 'gsm', label: 'GSM' }, { key: 'bf', label: 'BF' }, { key: 'shade', label: 'Shade' },
+    { key: 'weight_kg', label: 'Weight (kg)', type: 'number' },
+  ],
+  consumption: [
+    { key: 'date', label: 'Date' }, { key: 'shade', label: 'Shade' }, { key: 'size', label: 'Size' }, { key: 'gsm', label: 'GSM' },
+    { key: 'weight_consumed', label: 'Weight Consumed', type: 'number' }, { key: 'balance_left', label: 'Balance Left (Tukda)', type: 'number' },
+  ],
+  production: [
+    { key: 'date', label: 'Date' }, { key: 'party', label: 'Party (if noted)' }, { key: 'description', label: 'Description (as written)' },
+    { key: 'customerHint', label: 'Bracketed Customer' },
+    { key: 'pieces', label: 'Pieces Produced', type: 'number' }, { key: 'dispatch', label: 'Dispatch (handwritten, if noted)', type: 'number' },
+  ],
+  customerDispatch: [
+    { key: 'date', label: 'Date' }, { key: 'invoice_no', label: 'Invoice No' }, { key: 'party', label: 'Party' },
+    { key: 'buyer_order_no', label: 'Buyer Order No' }, { key: 'description', label: 'Description' },
+    { key: 'quantity', label: 'Quantity Dispatched', type: 'number' }, { key: 'rate', label: 'Rate', type: 'number' }, { key: 'amount', label: 'Amount', type: 'number' },
+  ],
+  daburSpecs: [
+    { key: 'product_name', label: 'Product' }, { key: 'box_size', label: 'Box Size (L x W x H)' },
+    { key: 'gsm_combo', label: 'Paper Combination / GSM' }, { key: 'partition_size', label: 'Partition' },
+    { key: 'plate_size', label: 'Plate' }, { key: 'compression', label: 'Compression' }, { key: 'notes', label: 'Notes' },
+  ],
+  daburPO: [
+    { key: 'po_number', label: 'PO Number' }, { key: 'date', label: 'Date' }, { key: 'material_desc', label: 'Material' },
+    { key: 'hsn', label: 'HSN' }, { key: 'quantity', label: 'Ordered Qty', type: 'number' }, { key: 'rate', label: 'Rate', type: 'number' }, { key: 'delivery_date', label: 'Delivery Date' },
+  ],
+  daburDispatch: [
+    { key: 'date', label: 'Date' }, { key: 'invoice_no', label: 'Invoice No' }, { key: 'party', label: 'Party' },
+    { key: 'buyer_order_no', label: 'PO Ref No' }, { key: 'description', label: 'Description' },
+    { key: 'quantity', label: 'Quantity', type: 'number' }, { key: 'rate', label: 'Rate', type: 'number' }, { key: 'amount', label: 'Amount', type: 'number' },
+  ],
+};
+const NAV = [
+  { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
+  { key: 'upload', label: 'Upload & Extract', icon: Upload },
+  { key: 'rawMaterialIn', label: 'Raw Material Register', icon: Archive },
+  { key: 'production', label: 'Production Register', icon: ClipboardList },
+  { key: 'customerDispatch', label: 'Customer Dispatch Bills', icon: Package },
+  { key: 'orderCheck', label: 'Order Availability Check', icon: Search },
+  { key: 'daburSpecs', label: 'Dabur — Spec Master', icon: FileText },
+  { key: 'daburPO', label: 'Dabur — Pending PO', icon: ListChecks },
+  { key: 'daburDispatch', label: 'Dabur — Dispatch Log', icon: Truck },
+  { key: 'customerStock', label: 'Customer Stock', icon: Boxes },
+  { key: 'customerMapping', label: 'Customer Mapping', icon: ListChecks },
+];
+const GUIDE_STEPS = [
+  {
+    title: 'Upload a document',
+    tab: 'upload',
+    what: 'This is where every photo, scan, or PDF enters the system — mill slips, consumption sheets, production register pages, dispatch bills, Dabur specs/POs, all of it.',
+    how: 'Pick the document type from the dropdown first (this tells the system what to look for), then upload the file. JPG, PNG, and PDF all work. For iPhone photos, make sure they’re saved as JPG/PNG, not HEIC.',
+  },
+  {
+    title: 'Extract, then review before anything is saved',
+    tab: 'upload',
+    what: 'Click "Extract data" and it reads the document into a table. Nothing is saved yet — this is a proposal, not a done deal.',
+    how: 'Check every row against the actual document. Fix anything wrong by clicking directly into a cell. Delete a row if it shouldn’t be there. Only once it looks right, click "Add rows to register."',
+  },
+  {
+    title: 'Raw Material Register fills itself in from there',
+    tab: 'rawMaterialIn',
+    what: 'Mill slips become inward entries; daily consumption sheets become consumption entries. The Balance table at the top (In minus Consumed, by size/GSM) is fully automatic — you never edit it directly.',
+    how: 'Upload slips and consumption sheets as they come in. If a balance looks wrong, the fix is correcting the underlying inward/consumption row below, not the balance itself.',
+  },
+  {
+    title: 'Production Register handles two different page styles',
+    tab: 'production',
+    what: 'Some of your handwritten pages track shade/size/GSM (box blanks); others list a product description and quantity (finished goods, e.g. "Butter Bake 65g x60"). Both land in this one table — the system figures out which style a page is automatically.',
+    how: 'Upload as usual. If a page has a customer name written on it (as a page header, not a bracket next to one item), it’s worth double-checking the Party column got filled in — that field is what the Order Availability Check searches by.',
+  },
+  {
+    title: 'New finished-goods rows wait in Customer Stock for your OK',
+    tab: 'customerStock',
+    what: 'Any Production Register row with a product description, and any Customer Dispatch Bill row, shows up in "Pending Review" at the top of Customer Stock. Neither counts toward any customer’s balance until you confirm it.',
+    how: 'Check the suggested customer for each row (auto-matched, editable if it’s wrong), then confirm one at a time or use "Confirm all suggested." Once confirmed, production rows add to that customer’s stock and dispatch bill rows subtract from it, in the running balance below.',
+  },
+  {
+    title: 'Customer Mapping decides who gets what',
+    tab: 'customerMapping',
+    what: 'This is the rulebook Customer Stock uses to guess which customer a product belongs to — plus the reference catalog of exact item names that helps correct handwriting misreads during extraction.',
+    how: 'Upload a customer’s stock .xlsx (a new one, or an updated version of one you’ve shared already) to add its products automatically. You can also add, edit, or delete individual rules by hand at any time — rules are checked top to bottom, first match wins.',
+  },
+  {
+    title: 'Check what’s available before promising a customer an order',
+    tab: 'orderCheck',
+    what: 'Type a party name (and optionally a size/GSM keyword) to see pieces produced vs. pieces dispatched, and what’s left. It shows you the exact matching rows too, not just a number, so you can double-check it.',
+    how: 'This searches the Production Register’s Party field, so it only works well once party names are actually filled in on those rows.',
+  },
+  {
+    title: 'Dispatch bills record what actually went out',
+    tab: 'upload',
+    what: 'Upload dispatch bills / tax invoices from the same dropdown as everything else — they land in their own Customer Dispatch Bills tab (kept separate from the Production Register) and, once confirmed, reduce that customer’s balance on both the Order Availability Check and Customer Stock.',
+    how: 'Same upload-extract-review-confirm pattern as everywhere else. These invoices are usually printed with several duplicate copies (Original/Duplicate/Triplicate/Extra Copy) plus an e-Way Bill page — the extraction already knows to count the transaction once, not once per copy.',
+  },
+  {
+    title: 'The Dabur side runs in parallel: Specs → PO → Dispatch',
+    tab: 'daburSpecs',
+    what: 'Spec Master replaces the manual diary — one row per box item. Pending PO tracks what Dabur has ordered and what’s still owed, with a 10% tolerance (a PO counts as Fulfilled once you’ve dispatched 90%+ of it). Dabur Dispatch Log is what drives that pending calculation, matched by PO number.',
+    how: 'Upload spec sheets once per item. Upload each PO as it arrives. Upload dispatch bills against Dabur POs to keep the pending list current.',
+  },
+  {
+    title: 'Export whenever you need an actual Excel file',
+    tab: 'dashboard',
+    what: 'Every table has its own "Export" button for just that data. The top-right "Export all to Excel" button bundles everything — every register, plus one sheet per customer’s stock — into one file. Every export opens a window with your data ready to copy-paste (always works), plus a "Download .xlsx" button for a real file (usually works — click Cancel then Export again if a download seems to silently do nothing, since browsers sometimes block a second automatic-feeling download in the same session).',
+    how: 'The app itself is the real, permanent record — it doesn’t reset. Exporting just gives you a snapshot copy to hand off or back up; export as often or as rarely as you like.',
+  },
+];
+/* ============================== small components ============================== */
+function Pill({ tone = 'neutral', children }) {
+  return <span className={`pill pill-${tone}`}>{children}</span>;
+}
+function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.' }) {
+  if (!rows.length) return <div className="empty-state">{emptyLabel}</div>;
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>{columns.map(c => <th key={c.key}>{c.label}</th>)}<th className="col-action"></th></tr>
+        </thead>
+        <tbody>
+          {rows.map(row => (
+            <tr key={row.id}>
+              {columns.map(c => (
+                <td key={c.key}>
+                  <input
+                    className="cell-input"
+                    type={c.type === 'number' ? 'number' : 'text'}
+                    value={row[c.key] ?? ''}
+                    onChange={(e) => onUpdate(row.id, c.key, c.type === 'number' ? e.target.value : e.target.value)}
+                  />
+                </td>
+              ))}
+              <td className="col-action">
+                <button className="icon-btn danger" title="Delete row" onClick={() => onDelete(row.id)}>
+                  <Trash2 size={15} />
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+function RegisterPanel({ title, subtitle, columns, rows, onUpdate, onDelete, onExport, extra }) {
+  return (
+    <div className="panel">
+      <div className="panel-header">
+        <div>
+          <h2>{title}</h2>
+          {subtitle && <p className="subtitle">{subtitle}</p>}
+        </div>
+        <button className="btn btn-ghost" onClick={onExport}><Download size={15} /> Export this table</button>
+      </div>
+      {extra}
+      <EditableTable columns={columns} rows={rows} onUpdate={onUpdate} onDelete={onDelete} />
+    </div>
+  );
+}
+// The export window for every "Export" button in the app. Opens INSTANTLY with the data already laid
+// out as copy-paste-ready text (this can never fail — it's just string formatting, no browser API
+// involved), and additionally offers a "Download .xlsx" button that builds and downloads a real file
+// on click. Building the workbook happens lazily, right here, only when that button is pressed — so if
+// anything about a particular table's data ever did trip up the xlsx library, it would show as a small
+// inline message in this window with the copy-paste data still sitting right there, not as a silent
+// "nothing happened" click.
+function CopyExportModal({ data, onClose }) {
+  const isMulti = data.sheets.length > 1;
+  const [activeIdx, setActiveIdx] = useState(0);
+  // 'all' pastes every sheet as one stacked block in a single Ctrl+C — the default for multi-sheet
+  // exports (customer stock, export-all) so getting the complete data never requires repeating the
+  // copy-paste once per item. 'single' keeps the original one-sheet-at-a-time dropdown view, for anyone
+  // who specifically wants to paste one item into its own existing Excel tab.
+  const [copyMode, setCopyMode] = useState(isMulti ? 'all' : 'single');
+  const [downloadState, setDownloadState] = useState('idle'); // idle | done | error:<msg>
+  const textareaRef = useRef(null);
+  const sheet = data.sheets[activeIdx] || data.sheets[0];
+  const tsv = isMulti && copyMode === 'all' ? toMultiBlockTSV(data.sheets) : toTSV(sheet.rows, sheet.columns);
+  useEffect(() => {
+    if (textareaRef.current) { textareaRef.current.focus(); textareaRef.current.select(); }
+  }, [activeIdx, copyMode, sheet]);
+  const selectAll = () => { if (textareaRef.current) { textareaRef.current.focus(); textareaRef.current.select(); } };
+  const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || '');
+  const downloadXlsx = () => {
+    try {
+      const wb = buildWorkbookFromSheets(data.sheets);
+      downloadWorkbook(wb, `${data.title.replace(/\s+/g, '_')}.xlsx`);
+      setDownloadState('done');
+    } catch (e) {
+      console.error('Download error:', e);
+      setDownloadState(`error:${e.message || 'unknown error'}`);
+    }
+  };
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(35,38,43,0.55)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }} onClick={onClose}>
+      <div style={{ background: '#fff', borderRadius: 8, padding: 22, maxWidth: 760, width: '100%', maxHeight: '85vh', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+        <h2 style={{ marginBottom: 6 }}>{data.title}</h2>
+        <p className="subtitle" style={{ marginBottom: 10 }}>
+          Two ways to get this out — the copy-paste method below always works: click "Select all", press {isMac ? 'Cmd+C' : 'Ctrl+C'}, then paste into a blank Excel or Google Sheets cell — it splits into columns automatically. "Download .xlsx" gives you a real file (one sheet per item, matching your usual layout) and usually works too; if a download seems to do nothing, it's likely your browser silently blocking a second automatic-feeling download in this session — the copy-paste data above is unaffected either way.
+        </p>
+        {isMulti && (
+          <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+            <button className={`btn ${copyMode === 'all' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setCopyMode('all')}>All {data.sheets.length} items (one paste)</button>
+            <button className={`btn ${copyMode === 'single' ? 'btn-primary' : 'btn-ghost'}`} onClick={() => setCopyMode('single')}>One item at a time</button>
+          </div>
+        )}
+        {isMulti && copyMode === 'all' && (
+          <p className="doc-hint" style={{ marginTop: -4, marginBottom: 10 }}>
+            Pastes every item's ledger stacked into one sheet, each with its own name and header row — everything in a single paste. Not split into separate tabs like your original files; use "One item at a time" below, or "Download .xlsx", if you need that exact layout.
+          </p>
+        )}
+        {isMulti && copyMode === 'single' && (
+          <select className="doc-select" value={activeIdx} onChange={e => setActiveIdx(Number(e.target.value))} style={{ marginBottom: 10 }}>
+            {data.sheets.map((s, i) => <option key={i} value={i}>{s.name}</option>)}
+          </select>
+        )}
+        <textarea ref={textareaRef} readOnly value={tsv}
+          style={{ flex: 1, minHeight: 260, fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, padding: 10, border: '1px solid var(--rule)', borderRadius: 6, resize: 'vertical' }}
+          onFocus={(e) => e.target.select()} />
+        {downloadState === 'done' && (
+          <div className="doc-hint" style={{ color: 'var(--ok)', marginTop: 8 }}>
+            Download triggered — check your browser's downloads (or the tab bar for a new tab). If you don't see it after a few seconds, use copy-paste above instead; it's unaffected.
+          </div>
+        )}
+        {typeof downloadState === 'string' && downloadState.startsWith('error:') && (
+          <div className="error-box" style={{ marginTop: 8 }}><AlertCircle size={16} /><span>Couldn't build the file ({downloadState.slice(6)}) — the copy-paste data above is unaffected, use that instead.</span></div>
+        )}
+        <div className="review-actions" style={{ marginTop: 12 }}>
+          <button className="btn btn-primary" onClick={selectAll}>Select all</button>
+          <button className="btn btn-ghost" onClick={downloadXlsx}><Download size={15} /> Download .xlsx</button>
+          <button className="btn btn-ghost" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+/* ============================== main app ============================== */
+function FIMSApp() {
+  const [activeTab, setActiveTab] = useState('dashboard');
+  const [loaded, setLoaded] = useState(false);
+  const [rawMaterialIn, setRawMaterialIn] = useState([]);
+  const [consumption, setConsumption] = useState([]);
+  const [production, setProduction] = useState([]);
+  const [customerDispatch, setCustomerDispatch] = useState([]);
+  const [daburSpecs, setDaburSpecs] = useState([]);
+  const [daburPO, setDaburPO] = useState([]);
+  const [daburDispatch, setDaburDispatch] = useState([]);
+  const [trainingExamples, setTrainingExamples] = useState({});
+  const [customerMapping, setCustomerMapping] = useState(DEFAULT_CUSTOMER_MAPPING);
+  const [productCatalog, setProductCatalog] = useState(DEFAULT_PRODUCT_CATALOG);
+  const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
+  const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch };
+  useEffect(() => {
+    (async () => {
+      const entries = await Promise.all(Object.entries(STORAGE_KEYS).map(async ([k, storageKey]) => [k, await loadRegister(storageKey)]));
+      const loadedMap = Object.fromEntries(entries);
+      Object.entries(loadedMap).forEach(([k, rows]) => registerSetters[k] && registerSetters[k](rows));
+      setTrainingExamples(await loadTraining());
+      try {
+        const r = await window.storage.get(CUSTOMER_MAPPING_KEY, false);
+        if (r && r.value) setCustomerMapping(JSON.parse(r.value));
+        else await window.storage.set(CUSTOMER_MAPPING_KEY, JSON.stringify(DEFAULT_CUSTOMER_MAPPING), false);
+      } catch (e) { /* keep defaults */ }
+      try {
+        const r2 = await window.storage.get(CATALOG_KEY, false);
+        if (r2 && r2.value) setProductCatalog(JSON.parse(r2.value));
+        else await window.storage.set(CATALOG_KEY, JSON.stringify(DEFAULT_PRODUCT_CATALOG), false);
+      } catch (e) { /* keep defaults */ }
+      setLoaded(true);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const persist = useCallback((registerKey, rows) => {
+    saveRegister(STORAGE_KEYS[registerKey], rows);
+  }, []);
+  const updateRow = (registerKey) => (id, field, value) => {
+    registerSetters[registerKey](prev => {
+      const next = prev.map(r => r.id === id ? { ...r, [field]: value } : r);
+      persist(registerKey, next);
+      return next;
+    });
+  };
+  const deleteRow = (registerKey) => (id) => {
+    registerSetters[registerKey](prev => {
+      const next = prev.filter(r => r.id !== id);
+      persist(registerKey, next);
+      return next;
+    });
+  };
+  const addRows = (registerKey, rows) => {
+    registerSetters[registerKey](prev => {
+      const next = [...prev, ...rows];
+      persist(registerKey, next);
+      return next;
+    });
+  };
+  /* -------- upload & extract state -------- */
+  const [docType, setDocType] = useState(DOCUMENT_TYPES[0].key);
+  const [preview, setPreview] = useState(null);
+  const [base64Img, setBase64Img] = useState(null);
+  const [queuedPages, setQueuedPages] = useState([]); // [{id, dataUrl, base64, label}] — one entry per image file, or per PDF page
+  const [skippedPages, setSkippedPages] = useState([]); // pages auto-detected as a non-original copy / e-Way Bill — never sent to the API
+  const [queuedIndex, setQueuedIndex] = useState(0);
+  const [pdfLoading, setPdfLoading] = useState(false);
+  const [extracting, setExtracting] = useState(false);
+  const [cancelRequested, setCancelRequested] = useState(false);
+  const abortControllerRef = useRef(null);
+  const [errorMsg, setErrorMsg] = useState('');
+  const [fileResults, setFileResults] = useState([]); // [{id, label, status: pending|extracting|done|error, rows, originalRows, error}]
+  const [activeResultIndex, setActiveResultIndex] = useState(0);
+  const activeConfig = DOCUMENT_TYPES.find(d => d.key === docType);
+  const isDispatchDocType = docType === 'dispatch_bill' || docType === 'dabur_dispatch';
+  const handleFiles = async (fileList) => {
+    setErrorMsg(''); setFileResults([]); setActiveResultIndex(0); setQueuedPages([]); setSkippedPages([]); setQueuedIndex(0);
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    setPdfLoading(true);
+    try {
+      const allPages = [];
+      const failedFiles = [];
+      for (const file of files) {
+        const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+        try {
+          if (isPdf) {
+            const pages = await pdfFileToPages(file);
+            if (!pages.length) throw new Error('NO_PAGES');
+            pages.forEach((p, idx) => allPages.push({
+              id: genId(), dataUrl: p.dataUrl, base64: p.base64, copyLabel: p.copyLabel,
+              label: pages.length > 1 ? `${file.name} — page ${idx + 1}` : file.name,
+            }));
+          } else {
+            const { dataUrl, base64 } = await resizeImageToBase64(file);
+            allPages.push({ id: genId(), dataUrl, base64, copyLabel: 'unknown', label: file.name });
+          }
+        } catch (e) {
+          failedFiles.push(file.name);
+        }
+      }
+      if (!allPages.length) throw new Error('NO_READABLE_FILES');
+      // For dispatch-bill uploads, a single bill's PDF usually contains 5-6 near-identical copies
+      // (Original, Duplicate, Triplicate, Extra, plus e-Way Bill pages) that we only ever want the
+      // Original from anyway (see the extraction prompt). Sending every copy to the vision API just
+      // to get an empty result back was burning through the rate limit on a single bill — since the
+      // PDF has a real text layer, we can tell copies apart for free and skip the API call entirely
+      // for ones we're always going to discard. Pages we can't confidently classify (e.g. photographed
+      // JPGs with no text layer) stay queued as normal, nothing is silently dropped.
+      let toQueue = allPages;
+      let toSkip = [];
+      if (isDispatchDocType) {
+        const original = allPages.filter(p => p.copyLabel === 'original');
+        const undetermined = allPages.filter(p => p.copyLabel === 'unknown');
+        const nonOriginal = allPages.filter(p => p.copyLabel && !['original', 'unknown'].includes(p.copyLabel));
+        // if nothing was confidently detected as the Original, don't skip anything — safer to let
+        // extraction run on every page (as before) than to risk silently discarding the real bill
+        if (original.length > 0) { toQueue = [...original, ...undetermined]; toSkip = nonOriginal; }
+      }
+      setQueuedPages(toQueue);
+      setSkippedPages(toSkip);
+      setQueuedIndex(0);
+      setPreview(toQueue[0].dataUrl);
+      setBase64Img(toQueue[0].base64);
+      const notes = [];
+      if (toSkip.length) notes.push(`Detected and skipped ${toSkip.length} duplicate/e-Way Bill page(s) automatically — no API calls used for those. ${toQueue.length} original page(s) left to extract.`);
+      if (failedFiles.length) notes.push(`Couldn't read: ${failedFiles.join(', ')}. If any is a HEIC photo, re-save as JPG/PNG first. The rest loaded fine below.`);
+      if (notes.length) setErrorMsg(notes.join(' '));
+    } catch (e) {
+      setErrorMsg('Could not read any of these files. If they’re HEIC photos from an iPhone, re-save as JPG/PNG first (Settings → Camera → Formats → Most Compatible), or take a screenshot and upload that instead.');
+      setPreview(null); setBase64Img(null);
+    } finally {
+      setPdfLoading(false);
+    }
+  };
+  const restoreSkippedPage = (id) => {
+    setSkippedPages(prev => {
+      const page = prev.find(p => p.id === id);
+      if (page) setQueuedPages(q => [...q, page]);
+      return prev.filter(p => p.id !== id);
+    });
+  };
+  const selectQueuedPage = (idx) => {
+    setQueuedIndex(idx);
+    setPreview(queuedPages[idx].dataUrl);
+    setBase64Img(queuedPages[idx].base64);
+    setActiveResultIndex(idx);
+  };
+  // Detects both textual "rate limit" wording in an error body and a raw 429 status code —
+  // some responses phrase it as "rate_limit_error" (underscore, no space) which the old text-only
+  // check could miss, which is why dispatch-bill batches (many requests back-to-back) were slipping
+  // through as generic failures instead of being treated as rate limits.
+  const isRateLimitError = (e) => e?.status === 429 || /rate limit/i.test(e?.message || '') || /EXTRACT_HTTP_429/.test(e?.message || '');
+  const extractWithRetry = async (prompt, base64, signal, attempts = 2) => {
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        return await callClaudeExtract(prompt, base64, signal);
+      } catch (e) {
+        lastErr = e;
+        if (isCancelled(e) || isRateLimitError(e)) break; // let the caller handle rate limits with a longer backoff, cancellation with a clean stop — not this quick retry
+        if (i < attempts - 1) await sleep(600, signal); // brief pause before retry
+      }
+    }
+    throw lastErr;
+  };
+  // Runs one extraction, and if it's specifically a rate-limit error, waits and retries automatically
+  // (growing backoff) before giving up — rate limits are usually a per-minute window that clears on
+  // its own, so a short wait-and-retry recovers most of the time without the person having to do anything.
+  // onTick fires every second during a wait so the UI can show a live countdown instead of a frozen
+  // message, and the whole wait aborts immediately if `signal` is cancelled (the person hit Cancel).
+  const extractWithRateLimitBackoff = async (prompt, base64, signal, onWaiting, onTick) => {
+    for (let i = 0; i <= RATE_LIMIT_BACKOFFS_MS.length; i++) {
+      try {
+        return await extractWithRetry(prompt, base64, signal);
+      } catch (e) {
+        if (isRateLimitError(e) && i < RATE_LIMIT_BACKOFFS_MS.length) {
+          const waitMs = e.retryAfterMs && e.retryAfterMs > 0 ? e.retryAfterMs : RATE_LIMIT_BACKOFFS_MS[i];
+          if (onWaiting) onWaiting(waitMs, i + 1, RATE_LIMIT_BACKOFFS_MS.length);
+          let remaining = Math.ceil(waitMs / 1000);
+          if (onTick) onTick(remaining);
+          const tickTimer = setInterval(() => { remaining -= 1; if (onTick) onTick(Math.max(remaining, 0)); }, 1000);
+          try {
+            await sleep(waitMs, signal);
+          } finally {
+            clearInterval(tickTimer);
+          }
+          continue;
+        }
+        throw e;
+      }
+    }
+  };
+  const cancelExtraction = () => {
+    setCancelRequested(true);
+    if (abortControllerRef.current) abortControllerRef.current.abort();
+  };
+  const removeQueuedPage = (id) => {
+    setQueuedPages(prev => {
+      const next = prev.filter(p => p.id !== id);
+      const clampedIdx = Math.max(0, Math.min(queuedIndex, next.length - 1));
+      if (next.length) { setPreview(next[clampedIdx].dataUrl); setBase64Img(next[clampedIdx].base64); }
+      else { setPreview(null); setBase64Img(null); }
+      setQueuedIndex(clampedIdx);
+      return next;
+    });
+    setFileResults(prev => prev.filter(r => r.id !== id));
+  };
+  // The friendly explanation appends the raw server response (what e.message actually contains, e.g.
+  // "EXTRACT_HTTP_429: {...}") so the real diagnostic text is right there to copy over if needed,
+  // instead of requiring browser DevTools.
+  const rateLimitExplainer = (e) => {
+    const friendly = 'Still hitting a rate limit even after automatic retries — unusual at normal usage (this app\'s API key gets 1,000 requests/minute). Wait a minute and try again, or check the Anthropic Console for the account this key belongs to.';
+    const detail = e && e.message ? String(e.message).slice(0, 300) : '';
+    return detail ? `${friendly} (Server said: ${detail})` : friendly;
+  };
+  const runExtraction = async () => {
+    // Defensive guard against a double-fire (e.g. a fast double-click landing before React re-renders
+    // the button's disabled state) — without this, two overlapping calls could each open their own
+    // AbortController and fire their own API request for what was visually a single click.
+    if (extracting || !base64Img || !queuedPages.length) return;
+    const current = queuedPages[queuedIndex];
+    setExtracting(true); setErrorMsg(''); setCancelRequested(false);
+    abortControllerRef.current = new AbortController();
+    setFileResults(prev => {
+      const existing = prev.find(r => r.id === current.id);
+      const base = existing || { id: current.id, label: current.label, status: 'pending', rows: [], originalRows: [], error: '' };
+      const next = prev.some(r => r.id === current.id) ? prev.map(r => r.id === current.id ? { ...base, status: 'extracting' } : r) : [...prev, { ...base, status: 'extracting' }];
+      return next;
+    });
+    setActiveResultIndex(queuedIndex);
+    try {
+      const basePrompt = activeConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog));
+      const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[docType]);
+      const raw = await extractWithRateLimitBackoff(promptWithTraining, base64Img, abortControllerRef.current.signal, (waitMs, attempt, total) => {
+        setErrorMsg(`Rate limit hit — waiting ${Math.round(waitMs / 1000)}s and retrying automatically (attempt ${attempt} of ${total})… Click Cancel below if you'd rather stop.`);
+      }, (secondsLeft) => {
+        setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
+      });
+      const rows = activeConfig.shape(raw);
+      if (!rows.length) setErrorMsg('No line items found on this page. If this is a duplicate copy or an e-Way Bill page, that’s expected — just move to the next one. Otherwise, try a clearer photo or crop closer to the table.');
+      else setErrorMsg('');
+      setFileResults(prev => prev.map(r => r.id === current.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })) } : r));
+    } catch (e) {
+      console.error('Extraction error:', e);
+      if (isCancelled(e)) {
+        setErrorMsg('Cancelled.');
+        setFileResults(prev => prev.map(r => r.id === current.id ? { ...r, status: 'pending', error: '' } : r));
+      } else if (isRateLimitError(e)) {
+        setErrorMsg(rateLimitExplainer(e));
+        setFileResults(prev => prev.map(r => r.id === current.id ? { ...r, status: 'pending', error: '' } : r));
+      } else {
+        const msg = e.message || 'unknown error';
+        setErrorMsg(`Extraction failed (${msg}). Retried automatically already — try a clearer photo, better lighting, or make sure the whole document fits in frame.`);
+        setFileResults(prev => prev.map(r => r.id === current.id ? { ...r, status: 'error', error: msg } : r));
+      }
+    } finally {
+      setExtracting(false);
+      abortControllerRef.current = null;
+    }
+  };
+  const extractQueue = async (targets) => {
+    setExtracting(true); setErrorMsg(''); setCancelRequested(false);
+    abortControllerRef.current = new AbortController();
+    const signal = abortControllerRef.current.signal;
+    const basePrompt = activeConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog));
+    const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[docType]);
+    const gapMs = BATCH_REQUEST_GAP_MS;
+    let anySucceeded = false;
+    let rateLimited = false;
+    let lastRateLimitError = null;
+    let cancelled = false;
+    for (let t = 0; t < targets.length; t++) {
+      const p = targets[t];
+      // skip files that were removed from the queue mid-batch (e.g. via the × on a thumbnail)
+      if (!queuedPages.some(q => q.id === p.id)) continue;
+      try {
+        // small pacing gap between requests (skip before the very first one) so a big multi-copy
+        // dispatch-bill upload doesn't fire a literal burst of requests in the same instant.
+        if (t > 0) await sleep(gapMs, signal);
+      } catch (e) { cancelled = true; break; }
+      setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'extracting' } : r));
+      try {
+        const raw = await extractWithRateLimitBackoff(promptWithTraining, p.base64, signal, (waitMs, attempt, total) => {
+          setErrorMsg(`Rate limit hit on "${p.label}" — waiting ${Math.round(waitMs / 1000)}s and retrying automatically (attempt ${attempt} of ${total})… Click Cancel below if you'd rather stop.`);
+        }, (secondsLeft) => {
+          setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
+        });
+        const rows = activeConfig.shape(raw);
+        anySucceeded = true;
+        setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })) } : r));
+      } catch (e) {
+        console.error('Extraction error:', e);
+        if (isCancelled(e)) {
+          cancelled = true;
+          setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'pending', error: '' } : r));
+          break;
+        }
+        if (isRateLimitError(e)) {
+          rateLimited = true;
+          lastRateLimitError = e;
+          setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'pending', error: '' } : r));
+          break; // stop hammering the same wall even after retries — leftover files stay pending, resumable
+        }
+        setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'error', error: e.message || 'unknown error' } : r));
+      }
+    }
+    if (cancelled) {
+      setErrorMsg('Cancelled — files not yet extracted are still queued below, untouched. Remove any you don\'t want with the × on its thumbnail, or hit "Retry remaining" to pick back up.');
+    } else if (rateLimited) {
+      setErrorMsg(`${rateLimitExplainer(lastRateLimitError)} Anything already extracted in this batch is safe and untouched — use "Retry remaining" below once you're ready to continue.`);
+    } else if (!anySucceeded && targets.length) {
+      setErrorMsg('Every file in this batch failed to extract. Check your connection and try again, or extract one file at a time to isolate the problem.');
+    } else {
+      setErrorMsg('');
+    }
+    setExtracting(false);
+    abortControllerRef.current = null;
+  };
+  const runExtractionAllQueued = async () => {
+    if (extracting || !queuedPages.length) return;
+    const initial = queuedPages.map(p => ({ id: p.id, label: p.label, status: 'pending', rows: [], originalRows: [], error: '' }));
+    setFileResults(initial);
+    setActiveResultIndex(0);
+    await extractQueue(queuedPages);
+  };
+  const runExtractionRemaining = async () => {
+    if (extracting) return;
+    const targets = queuedPages.filter(p => {
+      const r = fileResults.find(fr => fr.id === p.id);
+      return r && (r.status === 'pending' || r.status === 'error');
+    });
+    if (!targets.length) return;
+    await extractQueue(targets);
+  };
+  const recordCorrections = (originalRows, finalRows) => {
+    if (!originalRows || !finalRows.length) return;
+    const corrections = [];
+    finalRows.forEach(row => {
+      const orig = originalRows.find(o => o.id === row.id);
+      if (!orig) return;
+      const changed = Object.keys(row).some(k => k !== 'id' && String(orig[k] ?? '') !== String(row[k] ?? ''));
+      if (changed) {
+        const { id: _i1, ...beforeClean } = orig;
+        const { id: _i2, ...afterClean } = row;
+        corrections.push({ before: beforeClean, after: afterClean });
+      }
+    });
+    if (!corrections.length) return;
+    setTrainingExamples(prev => {
+      const list = [...(prev[docType] || []), ...corrections].slice(-MAX_EXAMPLES_STORED);
+      const next = { ...prev, [docType]: list };
+      saveTraining(next);
+      return next;
+    });
+  };
+  const clearTrainingForType = () => {
+    setTrainingExamples(prev => {
+      const next = { ...prev };
+      delete next[docType];
+      saveTraining(next);
+      return next;
+    });
+  };
+  const confirmPage = (idx) => {
+    const page = fileResults[idx];
+    if (!page || !page.rows.length) return;
+    recordCorrections(page.originalRows, page.rows);
+    addRows(activeConfig.register, page.rows);
+    setFileResults(prev => prev.filter((_, i) => i !== idx));
+    setActiveResultIndex(prev => Math.max(0, Math.min(prev, fileResults.length - 2)));
+  };
+  const confirmAllPages = () => {
+    const donePages = fileResults.filter(r => r.status === 'done' && r.rows.length);
+    donePages.forEach(page => recordCorrections(page.originalRows, page.rows));
+    const allRows = donePages.flatMap(p => p.rows);
+    if (allRows.length) addRows(activeConfig.register, allRows);
+    setFileResults([]); setActiveResultIndex(0); setPreview(null); setBase64Img(null); setQueuedPages([]);
+  };
+  const discardPage = (idx) => {
+    setFileResults(prev => prev.filter((_, i) => i !== idx));
+    setActiveResultIndex(prev => Math.max(0, Math.min(prev, fileResults.length - 2)));
+  };
+  const discardAllPages = () => { setFileResults([]); setActiveResultIndex(0); };
+  const updateReviewCell = (pageIdx, rowId, field, value) => {
+    setFileResults(prev => prev.map((page, i) => i !== pageIdx ? page : { ...page, rows: page.rows.map(r => r.id === rowId ? { ...r, [field]: value } : r) }));
+  };
+  const deleteReviewRow = (pageIdx, rowId) => {
+    setFileResults(prev => prev.map((page, i) => i !== pageIdx ? page : { ...page, rows: page.rows.filter(r => r.id !== rowId) }));
+  };
+  /* -------- raw material balance -------- */
+  const balanceRows = (() => {
+    const map = {};
+    rawMaterialIn.forEach(r => {
+      const key = `${(r.size || '').trim()}|${(r.gsm || '').trim()}`;
+      if (!map[key]) map[key] = { id: key, size: r.size, gsm: r.gsm, weight_in: 0, weight_consumed: 0 };
+      map[key].weight_in += num(r.weight_kg);
+    });
+    consumption.forEach(c => {
+      const key = `${(c.size || '').trim()}|${(c.gsm || '').trim()}`;
+      if (!map[key]) map[key] = { id: key, size: c.size, gsm: c.gsm, weight_in: 0, weight_consumed: 0 };
+      map[key].weight_consumed += num(c.weight_consumed);
+    });
+    return Object.values(map).map(v => ({ ...v, balance: v.weight_in - v.weight_consumed }));
+  })();
+  /* -------- order availability check -------- */
+  const [checkParty, setCheckParty] = useState('');
+  const [checkKeyword, setCheckKeyword] = useState('');
+  const [checkResult, setCheckResult] = useState(null);
+  const runCheck = () => {
+    const p = checkParty.trim().toLowerCase();
+    const k = checkKeyword.trim().toLowerCase();
+    if (!p) { setCheckResult(null); return; }
+    const partyMatch = r => (r.party || '').toLowerCase().includes(p) || (r.confirmedCustomer || '').toLowerCase().includes(p) || (r.customerHint || '').toLowerCase().includes(p);
+    const keywordMatch = r => !k || (r.size || '').toLowerCase().includes(k) || (r.gsm || '').toLowerCase().includes(k) || (r.description || '').toLowerCase().includes(k);
+    const matchProd = production.filter(r => partyMatch(r) && keywordMatch(r) && num(r.pieces) > 0);
+    const matchDisp = customerDispatch.filter(r => partyMatch(r) && keywordMatch(r) && num(r.quantity) > 0);
+    const produced = matchProd.reduce((s, r) => s + num(r.pieces), 0);
+    const dispatched = matchDisp.reduce((s, r) => s + num(r.quantity), 0);
+    setCheckResult({ produced, dispatched, available: produced - dispatched, matchProd, matchDisp });
+  };
+  /* -------- dabur PO pending calc -------- */
+  const PO_TOLERANCE = 0.10; // ±10% — a PO counts as fulfilled once dispatched qty reaches 90% of ordered qty
+  const daburPOWithPending = daburPO.map(po => {
+    const matched = daburDispatch.filter(d => d.buyer_order_no && po.po_number && d.buyer_order_no.replace(/\s/g, '') === String(po.po_number).replace(/\s/g, ''));
+    const dispatchedQty = matched.reduce((s, d) => s + num(d.quantity), 0);
+    const orderedQty = num(po.quantity);
+    const fulfilled = orderedQty > 0 && dispatchedQty >= orderedQty * (1 - PO_TOLERANCE);
+    const shortfall = orderedQty - dispatchedQty;
+    return { ...po, dispatched_qty: dispatchedQty, pending_qty: fulfilled ? 0 : Math.max(0, shortfall), fulfilled };
+  });
+  /* -------- customer mapping (editable) -------- */
+  const persistCustomerMapping = (next) => {
+    setCustomerMapping(next);
+    try { window.storage.set(CUSTOMER_MAPPING_KEY, JSON.stringify(next), false); } catch (e) { /* noop */ }
+  };
+  const addMappingRow = () => persistCustomerMapping([...customerMapping, { id: genId(), keyword: '', customer: '' }]);
+  const updateMappingRow = (id, field, value) => persistCustomerMapping(customerMapping.map(r => r.id === id ? { ...r, [field]: value } : r));
+  const deleteMappingRow = (id) => persistCustomerMapping(customerMapping.filter(r => r.id !== id));
+  /* -------- product catalog (editable + importable from a customer's stock .xlsx) -------- */
+  const persistCatalog = (next) => {
+    setProductCatalog(next);
+    try { window.storage.set(CATALOG_KEY, JSON.stringify(next), false); } catch (e) { /* noop */ }
+  };
+  const deleteCatalogItem = (id) => persistCatalog(productCatalog.filter(c => c.id !== id));
+  const [catalogImportBusy, setCatalogImportBusy] = useState(false);
+  const [catalogImportError, setCatalogImportError] = useState('');
+  const [catalogReview, setCatalogReview] = useState(null); // { fileName, customerName, items: [{id, item, include}] }
+  const handleCatalogFile = async (file) => {
+    if (!file) return;
+    setCatalogImportError(''); setCatalogReview(null); setCatalogImportBusy(true);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+      const summarySheetName = wb.SheetNames.find(n => /summary/i.test(n));
+      let items = [];
+      if (summarySheetName) {
+        const ws = wb.Sheets[summarySheetName];
+        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+        let headerRowIdx = rows.findIndex(r => r.some(c => String(c).toLowerCase().includes('item name')));
+        let itemColIdx = headerRowIdx >= 0 ? rows[headerRowIdx].findIndex(c => String(c).toLowerCase().includes('item name')) : -1;
+        for (let i = headerRowIdx >= 0 ? headerRowIdx + 1 : 0; i < rows.length; i++) {
+          const row = rows[i];
+          const val = itemColIdx >= 0 ? row[itemColIdx] : row.find(c => typeof c === 'string' && c.trim());
+          const clean = String(val || '').trim();
+          if (clean && clean.toLowerCase() !== 'total') items.push(clean);
+        }
+      } else {
+        items = wb.SheetNames.filter(n => !/summary/i.test(n));
+      }
+      items = Array.from(new Set(items));
+      if (!items.length) { setCatalogImportError('Could not find a product list in this file — looked for a "summary" sheet, then fell back to sheet tab names, and found nothing usable.'); setCatalogImportBusy(false); return; }
+      const suggestedCustomer = file.name.replace(/\.[^.]+$/, '').replace(/[_-]?stock/gi, '').replace(/[_-]?\d{1,4}([_-]\d{1,4})*$/g, '').replace(/[_-]+/g, ' ').trim();
+      setCatalogReview({
+        fileName: file.name,
+        customerName: suggestedCustomer.charAt(0).toUpperCase() + suggestedCustomer.slice(1),
+        items: items.map(item => ({ id: genId(), item, include: true })),
+      });
+    } catch (e) {
+      setCatalogImportError(`Could not read this file (${e.message || 'unknown error'}). Make sure it's a real .xlsx file.`);
+    } finally {
+      setCatalogImportBusy(false);
+    }
+  };
+  const updateCatalogReviewItem = (id, field, value) => {
+    setCatalogReview(prev => ({ ...prev, items: prev.items.map(it => it.id === id ? { ...it, [field]: value } : it) }));
+  };
+  const confirmCatalogImport = () => {
+    if (!catalogReview || !catalogReview.customerName.trim()) return;
+    const customer = catalogReview.customerName.trim();
+    const included = catalogReview.items.filter(it => it.include && it.item.trim());
+    const existingItems = new Set(productCatalog.map(c => `${c.customer.toLowerCase()}||${c.item.toLowerCase()}`));
+    const newCatalogEntries = included
+      .filter(it => !existingItems.has(`${customer.toLowerCase()}||${it.item.trim().toLowerCase()}`))
+      .map(it => ({ id: genId(), customer, item: it.item.trim() }));
+    persistCatalog([...productCatalog, ...newCatalogEntries]);
+    const existingKeywords = new Set(customerMapping.map(r => r.keyword.toLowerCase()));
+    const exactRules = []; // high priority: the full exact item name
+    const fallbackRules = []; // low priority: broader family keyword, in case ledger has an unlisted pack size
+    included.forEach(it => {
+      const exact = it.item.trim().toLowerCase();
+      if (exact && !existingKeywords.has(exact)) {
+        exactRules.push({ id: genId(), keyword: exact, customer });
+        existingKeywords.add(exact);
+      }
+      const fallback = exact.replace(/[\d].*$/, '').trim();
+      if (fallback && fallback.length > 2 && !existingKeywords.has(fallback)) {
+        fallbackRules.push({ id: genId(), keyword: fallback, customer });
+        existingKeywords.add(fallback);
+      }
+    });
+    // exact rules go first (checked before existing rules too, since they're most specific),
+    // fallback rules go last so they never shadow anything more specific already in the list
+    persistCustomerMapping([...exactRules, ...customerMapping, ...fallbackRules]);
+    setCatalogReview(null);
+  };
+  const matchCustomer = (row) => {
+    const hint = (row.customerHint || '').trim();
+    if (hint) return hint.charAt(0).toUpperCase() + hint.slice(1).toLowerCase();
+    const d = (row.description || '').toLowerCase();
+    for (const rule of customerMapping) {
+      if (rule.keyword && d.includes(rule.keyword.toLowerCase())) return rule.customer || 'Unassigned';
+    }
+    return 'Unassigned';
+  };
+  const normalizeVariant = (description) => {
+    let s = (description || '').toLowerCase();
+    s = s.replace(/\(diamond\)/g, '');
+    s = s.replace(/\bcorrugated box\b/g, '');
+    s = s.replace(/\b(container|cont|jumbo|box|lid|pkt|pkts|pcs|nos|j)\b/g, '');
+    s = s.replace(/[^a-z0-9]/g, '');
+    return s.trim();
+  };
+  /* -------- customer stock: combine confirmed Production Register rows (stock in) with confirmed
+     Customer Dispatch Bill rows (stock out), grouped by customer + variant -------- */
+  const pendingProductionRows = production.filter(row => (row.description || '').trim() && !row.stockConfirmed);
+  const pendingDispatchRows = customerDispatch.filter(row => (row.description || '').trim() && !row.stockConfirmed);
+  const confirmedProductionRows = production.filter(row => (row.description || '').trim() && row.stockConfirmed);
+  const confirmedDispatchRows = customerDispatch.filter(row => (row.description || '').trim() && row.stockConfirmed);
+  const confirmStockRow = (registerKey, row, chosenCustomer) => {
+    // NOTE: must be `||`, not `??` — every fresh row starts with confirmedCustomer as '' (empty
+    // string, not null/undefined), so `??` would treat that '' as "already chosen" and never fall
+    // through to the matched suggestion, silently confirming everything as Unassigned.
+    const customer = (chosenCustomer || row.confirmedCustomer || matchCustomer(row)).trim() || 'Unassigned';
+    registerSetters[registerKey](prev => {
+      const next = prev.map(r => r.id === row.id ? { ...r, confirmedCustomer: customer, stockConfirmed: true } : r);
+      persist(registerKey, next);
+      return next;
+    });
+  };
+  const confirmAllPendingProduction = () => { pendingProductionRows.forEach(r => confirmStockRow('production', r)); };
+  const confirmAllPendingDispatch = () => { pendingDispatchRows.forEach(r => confirmStockRow('customerDispatch', r)); };
+  const updatePendingCustomer = (registerKey) => (id, value) => {
+    registerSetters[registerKey](prev => {
+      const next = prev.map(r => r.id === id ? { ...r, confirmedCustomer: value } : r);
+      persist(registerKey, next);
+      return next;
+    });
+  };
+  const customerStockGroups = (() => {
+    const groups = {};
+    const addEntry = (row, pieces, dispatchQty) => {
+      const customer = row.confirmedCustomer || matchCustomer(row);
+      const variantKey = normalizeVariant(row.description);
+      const key = `${customer}||${variantKey}`;
+      if (!groups[key]) groups[key] = { id: key, customer, description: row.description, entries: [] };
+      groups[key].entries.push({ id: row.id, date: row.date, pieces, dispatch: dispatchQty });
+    };
+    confirmedProductionRows.forEach(row => addEntry(row, num(row.pieces), num(row.dispatch)));
+    confirmedDispatchRows.forEach(row => addEntry(row, 0, num(row.quantity)));
+    return Object.values(groups).map(g => {
+      const sorted = [...g.entries].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+      let running = 0;
+      const ledger = sorted.map(e => {
+        const opening = running;
+        running = opening + num(e.pieces) - num(e.dispatch);
+        return { ...e, opening, closing: running };
+      });
+      const totalProduction = sorted.reduce((s, e) => s + num(e.pieces), 0);
+      const totalDispatch = sorted.reduce((s, e) => s + num(e.dispatch), 0);
+      return { ...g, ledger, totalProduction, totalDispatch, closingBalance: running };
+    });
+  })();
+  const customerNames = Array.from(new Set(customerStockGroups.map(g => g.customer))).sort((a, b) => (a === 'Unassigned') - (b === 'Unassigned') || a.localeCompare(b));
+  /* -------- export --------
+     Every export button below just packages the relevant rows/columns into a { title, sheets } object
+     and hands it to the CopyExportModal — it does NOT build an .xlsx workbook or trigger a download
+     itself. That's deliberate: packaging plain JS data can't fail, so the modal (with the
+     always-works copy-paste view) is guaranteed to open. The actual .xlsx file is only built, on
+     demand, if the person clicks "Download .xlsx" inside that modal. */
+  const [copyModal, setCopyModal] = useState(null); // { title, sheets: [{name, rows, columns, kind, title}] }
+  const exportSheet = (name, rows, columns) => {
+    setCopyModal({ title: name, sheets: [{ name, rows, columns, kind: 'table' }] });
+  };
+  const exportCustomerStock = (customer) => {
+    const groupsForCustomer = customerStockGroups.filter(g => g.customer === customer);
+    const stockColumns = [
+      { key: 'date', label: 'Date' }, { key: 'opening', label: 'Opening' }, { key: 'pieces', label: 'Production' },
+      { key: 'dispatch', label: 'Dispatch' }, { key: 'closing', label: 'Closing' },
+    ];
+    const sheets = groupsForCustomer.length
+      ? groupsForCustomer.map(g => ({ name: g.description || 'variant', title: g.description, rows: g.ledger, columns: stockColumns, kind: 'titled' }))
+      : [{ name: 'No data yet', rows: [], columns: stockColumns, kind: 'table' }];
+    setCopyModal({ title: `${customer} Stock`, sheets });
+  };
+  const exportAll = () => {
+    const sheets = [];
+    sheets.push({ name: 'Raw Material In', rows: rawMaterialIn, columns: COLUMNS.rawMaterialIn, kind: 'table' });
+    sheets.push({ name: 'Consumption', rows: consumption, columns: COLUMNS.consumption, kind: 'table' });
+    sheets.push({
+      name: 'RM Balance', kind: 'table', rows: balanceRows, columns: [
+        { key: 'size', label: 'Size' }, { key: 'gsm', label: 'GSM' },
+        { key: 'weight_in', label: 'Total In (kg)' }, { key: 'weight_consumed', label: 'Total Consumed (kg)' }, { key: 'balance', label: 'Balance Left (kg)' },
+      ],
+    });
+    sheets.push({ name: 'Production Register', rows: production, columns: COLUMNS.production, kind: 'table' });
+    sheets.push({ name: 'Customer Dispatch Bills', rows: customerDispatch, columns: COLUMNS.customerDispatch, kind: 'table' });
+    sheets.push({ name: 'Dabur Spec Master', rows: daburSpecs, columns: COLUMNS.daburSpecs, kind: 'table' });
+    sheets.push({
+      name: 'Dabur Pending PO', kind: 'table', rows: daburPOWithPending.map(r => ({ ...r, status: r.fulfilled ? 'Fulfilled' : 'Pending' })), columns: [
+        ...COLUMNS.daburPO, { key: 'dispatched_qty', label: 'Dispatched Qty' }, { key: 'pending_qty', label: 'Pending Qty' }, { key: 'status', label: 'Status' },
+      ],
+    });
+    sheets.push({ name: 'Dabur Dispatch', rows: daburDispatch, columns: COLUMNS.daburDispatch, kind: 'table' });
+    customerNames.forEach(customer => {
+      const rows = customerStockGroups.filter(g => g.customer === customer).flatMap(g => g.ledger.map(e => ({
+        description: g.description, date: e.date, opening: e.opening, production: e.pieces, dispatch: e.dispatch, closing: e.closing,
+      })));
+      sheets.push({
+        name: `Stock - ${customer}`, kind: 'table', rows, columns: [
+          { key: 'description', label: 'Description' }, { key: 'date', label: 'Date' }, { key: 'opening', label: 'Opening' },
+          { key: 'production', label: 'Production' }, { key: 'dispatch', label: 'Dispatch' }, { key: 'closing', label: 'Closing' },
+        ],
+      });
+    });
+    setCopyModal({ title: 'All Registers', sheets });
+  };
+  /* ============================== render ============================== */
+  const counts = {
+    rawMaterialIn: rawMaterialIn.length, consumption: consumption.length, production: production.length,
+    customerDispatch: customerDispatch.length, daburSpecs: daburSpecs.length, daburPO: daburPO.length, daburDispatch: daburDispatch.length,
+  };
+  return (
+    <>
+    <div className="fims-root">
+      <style>{`
+        .fims-root {
+          --paper: #ece8df;
+          --paper-raised: #f6f3ec;
+          --ink: #23262b;
+          --ink-soft: #5b5e63;
+          --rule: #cfc9ba;
+          --ledger-red: #a23b2e;
+          --accent: #a97a2f;
+          --accent-soft: #f0e2c4;
+          --ok: #2f6f5e;
+          --ok-soft: #dceae4;
+          --warn-soft: #f3ddd6;
+          font-family: 'IBM Plex Sans', 'Segoe UI', sans-serif;
+          background: var(--paper);
+          color: var(--ink);
+          min-height: 100%;
+          display: flex;
+          border-radius: 8px;
+          overflow: hidden;
+          border: 1px solid var(--rule);
+        }
+        .fims-root * { box-sizing: border-box; }
+        .fims-root h1, .fims-root h2, .fims-root h3 {
+          font-family: 'Fraunces', Georgia, serif;
+          margin: 0;
+          color: var(--ink);
+        }
+        .sidebar {
+          width: 232px;
+          flex-shrink: 0;
+          background: var(--ink);
+          color: #e8e5dc;
+          display: flex;
+          flex-direction: column;
+          padding: 20px 0;
+        }
+        .brand {
+          padding: 0 18px 18px 18px;
+          border-bottom: 1px solid rgba(255,255,255,0.12);
+          margin-bottom: 10px;
+        }
+        .brand h1 { font-size: 17px; line-height: 1.3; color: #f6f3ec; }
+        .brand p { font-size: 11px; color: #a7a396; margin-top: 4px; letter-spacing: 0.04em; text-transform: uppercase; }
+        .nav-item {
+          display: flex; align-items: center; gap: 10px;
+          padding: 10px 18px;
+          font-size: 13.5px;
+          cursor: pointer;
+          color: #cfcabd;
+          border-left: 3px solid transparent;
+          transition: background 0.12s, color 0.12s;
+        }
+        .nav-item:hover { background: rgba(255,255,255,0.05); color: #f6f3ec; }
+        .nav-item.active { background: rgba(169,122,47,0.18); color: #f6f3ec; border-left-color: var(--accent); }
+        .nav-count { margin-left: auto; font-size: 11px; background: rgba(255,255,255,0.12); padding: 1px 7px; border-radius: 20px; color: #e8e5dc; }
+        .main {
+          flex: 1;
+          min-width: 0;
+          display: flex;
+          flex-direction: column;
+          max-height: 88vh;
+          overflow-y: auto;
+        }
+        .topbar {
+          display: flex; align-items: center; justify-content: space-between;
+          padding: 16px 26px;
+          background: var(--paper-raised);
+          border-bottom: 1px solid var(--rule);
+          position: sticky; top: 0; z-index: 5;
+        }
+        .topbar h2 { font-size: 20px; }
+        .content { padding: 24px 26px 40px 26px; }
+        .panel { background: var(--paper-raised); border: 1px solid var(--rule); border-radius: 6px; padding: 20px; margin-bottom: 20px; position: relative; }
+        .panel::before {
+          content: ''; position: absolute; left: 14px; top: 0; bottom: 0; width: 2px; background: var(--ledger-red); opacity: 0.55;
+        }
+        .panel { padding-left: 30px; }
+        .panel-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 14px; gap: 12px; }
+        .subtitle { font-size: 12.5px; color: var(--ink-soft); margin-top: 4px; max-width: 560px; }
+        .btn {
+          font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+          border-radius: 5px; padding: 8px 14px; display: inline-flex; align-items: center; gap: 6px;
+          border: 1px solid transparent; transition: transform 0.08s, background 0.12s;
+        }
+        .btn:active { transform: scale(0.98); }
+        .btn-primary { background: var(--accent); color: #fff; }
+        .btn-primary:hover { background: #96692a; }
+        .btn-primary:disabled { background: #c9bda0; cursor: not-allowed; }
+        .btn-ghost { background: transparent; border-color: var(--rule); color: var(--ink); }
+        .btn-ghost:hover { background: var(--accent-soft); }
+        .btn-danger { background: var(--ledger-red); color: #fff; }
+        .icon-btn { background: transparent; border: none; cursor: pointer; color: var(--ink-soft); padding: 4px; border-radius: 4px; }
+        .icon-btn.danger:hover { color: var(--ledger-red); background: var(--warn-soft); }
+        .table-wrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 4px; }
+        table { border-collapse: collapse; width: 100%; font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; }
+        thead th {
+          text-align: left; background: var(--accent-soft); color: #5c4419; font-family: 'IBM Plex Sans', sans-serif;
+          font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; padding: 8px 10px; border-bottom: 2px solid var(--rule); white-space: nowrap;
+        }
+        tbody td { border-bottom: 1px solid var(--rule); padding: 2px 4px; }
+        tbody tr:hover { background: rgba(169,122,47,0.06); }
+        .cell-input {
+          width: 100%; border: 1px solid transparent; background: transparent; font: inherit; color: var(--ink);
+          padding: 6px 6px; border-radius: 3px; min-width: 70px;
+        }
+        .cell-input:focus { outline: none; border-color: var(--accent); background: #fff; }
+        .col-action { width: 34px; text-align: center; }
+        .empty-state { padding: 30px; text-align: center; color: var(--ink-soft); font-size: 13px; border: 1px dashed var(--rule); border-radius: 6px; }
+        .pill { font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 20px; display: inline-block; }
+        .pill-ok { background: var(--ok-soft); color: var(--ok); }
+        .pill-warn { background: var(--warn-soft); color: var(--ledger-red); }
+        .pill-neutral { background: var(--accent-soft); color: #5c4419; }
+        .dash-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; margin-bottom: 8px; }
+        .dash-card {
+          background: var(--paper-raised); border: 1px solid var(--rule); border-radius: 6px; padding: 16px 18px; cursor: pointer;
+          transition: transform 0.1s, box-shadow 0.1s;
+        }
+        .dash-card:hover { transform: translateY(-2px); box-shadow: 0 4px 10px rgba(0,0,0,0.08); }
+        .dash-card .num { font-family: 'Fraunces', serif; font-size: 30px; }
+        .dash-card .lbl { font-size: 12px; color: var(--ink-soft); margin-top: 2px; }
+        .guide-step { display: flex; gap: 14px; padding: 16px 0; border-bottom: 1px solid var(--rule); cursor: pointer; }
+        .guide-step:last-child { border-bottom: none; }
+        .guide-step:hover .guide-title { color: var(--accent); }
+        .guide-num {
+          flex-shrink: 0; width: 30px; height: 30px; border-radius: 50%; background: var(--accent); color: #fff;
+          font-family: 'Fraunces', serif; font-size: 14px; display: flex; align-items: center; justify-content: center;
+        }
+        .guide-title { font-size: 14.5px; font-weight: 700; margin-bottom: 4px; transition: color 0.12s; }
+        .guide-what { font-size: 12.5px; color: var(--ink); margin-bottom: 4px; line-height: 1.5; }
+        .guide-how { font-size: 12.5px; color: var(--ink-soft); line-height: 1.5; }
+        .guide-how b { color: var(--ink); font-weight: 600; }
+        .upload-grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 20px; align-items: start; }
+        @media (max-width: 880px) { .upload-grid { grid-template-columns: 1fr; } }
+        .doc-select { width: 100%; padding: 10px 12px; border-radius: 5px; border: 1px solid var(--rule); font: inherit; font-size: 13.5px; background: #fff; margin-bottom: 6px; }
+        .doc-hint { font-size: 12px; color: var(--ink-soft); margin-bottom: 16px; }
+        .dropzone {
+          display: flex; flex-direction: column; align-items: center; justify-content: center;
+          width: 100%; box-sizing: border-box;
+          border: 2px dashed var(--rule); border-radius: 8px; padding: 26px; text-align: center;
+          background: #fff; cursor: pointer; transition: border-color 0.12s, background 0.12s;
+        }
+        .dropzone:hover { background: var(--accent-soft); border-color: var(--accent); }
+        .preview-img { max-width: 100%; max-height: 260px; border-radius: 6px; border: 1px solid var(--rule); margin-top: 12px; }
+        .error-box { display: flex; gap: 8px; align-items: flex-start; background: var(--warn-soft); border: 1px solid var(--ledger-red); color: #6b241a; padding: 10px 12px; border-radius: 5px; font-size: 12.5px; margin: 10px 0; }
+        .field-row { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+        .text-input { padding: 8px 10px; border-radius: 5px; border: 1px solid var(--rule); font: inherit; font-size: 13px; }
+        .check-result { margin-top: 16px; }
+        .check-stats { display: flex; gap: 14px; margin-bottom: 14px; flex-wrap: wrap; }
+        .stat-box { background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; padding: 12px 18px; min-width: 130px; }
+        .stat-box .val { font-family: 'Fraunces', serif; font-size: 24px; }
+        .stat-box .lbl { font-size: 11px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.04em; }
+        .review-box { border: 1px solid var(--accent); border-radius: 6px; padding: 16px; background: #fff; margin-top: 18px; }
+        .review-actions { display: flex; gap: 10px; margin-top: 14px; }
+        .section-label { font-size: 13px; font-weight: 700; margin: 18px 0 8px 0; color: var(--ink); }
+        .spin { animation: fims-spin 1s linear infinite; }
+        @keyframes fims-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+      `}</style>
+      <aside className="sidebar">
+        <div className="brand">
+          <h1>Shyam Adarsh Pack</h1>
+          <p>Inventory &amp; Production</p>
+        </div>
+        {NAV.map(item => {
+          const Icon = item.icon;
+          const count = counts[item.key];
+          return (
+            <div key={item.key} className={`nav-item ${activeTab === item.key ? 'active' : ''}`} onClick={() => setActiveTab(item.key)}>
+              <Icon size={16} />
+              <span>{item.label}</span>
+              {typeof count === 'number' && <span className="nav-count">{count}</span>}
+            </div>
+          );
+        })}
+      </aside>
+      <div className="main">
+        <div className="topbar">
+          <h2>{NAV.find(n => n.key === activeTab)?.label}</h2>
+          <button className="btn btn-primary" onClick={exportAll}><FileSpreadsheet size={15} /> Export all to Excel</button>
+        </div>
+        <div className="content">
+          {!loaded && <div className="empty-state">Loading your registers…</div>}
+          {loaded && activeTab === 'dashboard' && (
+            <div>
+              <div className="panel">
+                <h2 style={{ marginBottom: 4 }}>How this system works</h2>
+                <p className="subtitle" style={{ marginBottom: 6 }}>The order things usually happen in, start to finish. Click any step to jump straight to that tab.</p>
+                {GUIDE_STEPS.map((step, i) => (
+                  <div className="guide-step" key={i} onClick={() => setActiveTab(step.tab)}>
+                    <div className="guide-num">{i + 1}</div>
+                    <div>
+                      <div className="guide-title">{step.title}</div>
+                      <div className="guide-what">{step.what}</div>
+                      <div className="guide-how"><b>Do this:</b> {step.how}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <p className="subtitle" style={{ marginBottom: 18 }}>Everything below is stored on this device for your account and stays put between visits. Click any card to jump to that register.</p>
+              <div className="dash-grid">
+                {NAV.filter(n => n.key !== 'dashboard' && n.key !== 'upload' && n.key !== 'orderCheck' && n.key !== 'customerStock' && n.key !== 'customerMapping' && n.key !== 'settings').map(n => (
+                  <div className="dash-card" key={n.key} onClick={() => setActiveTab(n.key)}>
+                    <div className="num">{counts[n.key]}</div>
+                    <div className="lbl">{n.label}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {loaded && activeTab === 'upload' && (
+            <div className="upload-grid">
+              <div className="panel" style={{ paddingLeft: 30 }}>
+                <h2 style={{ marginBottom: 14 }}>1. Choose document &amp; upload</h2>
+                <select className="doc-select" value={docType} onChange={(e) => { setDocType(e.target.value); setFileResults([]); setActiveResultIndex(0); setPreview(null); setBase64Img(null); setQueuedPages([]); setSkippedPages([]); }}>
+                  {DOCUMENT_TYPES.map(d => <option key={d.key} value={d.key}>{d.label}</option>)}
+                </select>
+                <div className="doc-hint">{activeConfig.hint}</div>
+                <div className="doc-hint" style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: -8 }}>
+                  {(trainingExamples[docType]?.length || 0) > 0
+                    ? <>
+                        <span>📚 {trainingExamples[docType].length} correction{trainingExamples[docType].length === 1 ? '' : 's'} learned for this document type.</span>
+                        <button className="icon-btn" style={{ textDecoration: 'underline', fontSize: 11.5 }} onClick={clearTrainingForType}>reset</button>
+                      </>
+                    : <span>No corrections learned yet for this document type — edits you make in the review step below will be remembered for next time.</span>}
+                </div>
+                <label className="dropzone" htmlFor="fileInput">
+                  <Upload size={22} style={{ marginBottom: 6 }} />
+                  <div style={{ fontSize: 13.5, fontWeight: 600 }}>Click to upload photos, scans, or PDFs</div>
+                  <div style={{ fontSize: 11.5, color: 'var(--ink-soft)', marginTop: 4 }}>JPG, PNG, or PDF — select multiple files at once if you like. Emailed or hard-copy docs — scan, photograph, or save the PDF, then upload here.</div>
+                </label>
+                <input id="fileInput" type="file" accept="image/*,application/pdf" multiple style={{ display: 'none' }} onChange={(e) => handleFiles(e.target.files)} />
+                {pdfLoading && <div className="doc-hint" style={{ marginTop: 10 }}><Loader2 size={13} className="spin" style={{ verticalAlign: 'middle', marginRight: 6 }} />Reading file(s)…</div>}
+                {preview && <img src={preview} alt="preview" className="preview-img" />}
+                {queuedPages.length > 1 && (
+                  <div style={{ marginTop: 10 }}>
+                    <div className="doc-hint">{queuedIndex + 1} of {queuedPages.length}: {queuedPages[queuedIndex]?.label} — click a thumbnail to preview it, click × to drop it from the queue (works anytime, even mid-extraction), or extract everything at once.</div>
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
+                      {queuedPages.map((p, idx) => (
+                        <div key={p.id} style={{ position: 'relative' }}>
+                          <img src={p.dataUrl} alt={p.label} title={p.label}
+                            onClick={() => selectQueuedPage(idx)}
+                            style={{ width: 54, height: 54, objectFit: 'cover', borderRadius: 4, cursor: 'pointer', border: idx === queuedIndex ? '2px solid var(--accent)' : '1px solid var(--rule)' }} />
+                          <button
+                            title="Remove from queue"
+                            onClick={(e) => { e.stopPropagation(); removeQueuedPage(p.id); }}
+                            style={{ position: 'absolute', top: -6, right: -6, width: 18, height: 18, borderRadius: '50%', border: 'none', background: 'var(--ledger-red)', color: '#fff', fontSize: 11, lineHeight: '18px', textAlign: 'center', padding: 0, cursor: 'pointer' }}>
+                            ×
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {skippedPages.length > 0 && (
+                  <div style={{ marginTop: 10 }}>
+                    <div className="doc-hint" style={{ marginBottom: 4 }}>Auto-skipped as duplicate/e-Way Bill pages (no API call used) — click + to queue one anyway if you actually need it:</div>
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                      {skippedPages.map(p => (
+                        <div key={p.id} style={{ position: 'relative' }}>
+                          <img src={p.dataUrl} alt={p.label} title={`${p.label} (${p.copyLabel})`}
+                            style={{ width: 54, height: 54, objectFit: 'cover', borderRadius: 4, opacity: 0.5, border: '1px dashed var(--rule)' }} />
+                          <button
+                            title="Queue this page anyway"
+                            onClick={() => restoreSkippedPage(p.id)}
+                            style={{ position: 'absolute', top: -6, right: -6, width: 18, height: 18, borderRadius: '50%', border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 12, lineHeight: '18px', textAlign: 'center', padding: 0, cursor: 'pointer' }}>
+                            +
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {errorMsg && <div className="error-box"><AlertCircle size={16} /><span>{errorMsg}</span></div>}
+                <div style={{ marginTop: 14, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                  <button className="btn btn-primary" disabled={!base64Img || extracting} onClick={runExtraction}>
+                    {extracting ? <Loader2 size={15} className="spin" /> : <ImageIcon size={15} />}
+                    {extracting ? 'Reading document…' : queuedPages.length > 1 ? `Extract this one only` : 'Extract data'}
+                  </button>
+                  {queuedPages.length > 1 && (
+                    <button className="btn btn-ghost" disabled={extracting} onClick={runExtractionAllQueued}>
+                      <FileText size={15} /> Extract all {queuedPages.length}
+                    </button>
+                  )}
+                  {extracting && (
+                    <button className="btn btn-danger" onClick={cancelExtraction}>
+                      <XCircle size={15} /> Cancel
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="panel" style={{ paddingLeft: 30 }}>
+                <h2 style={{ marginBottom: 14 }}>2. Review &amp; confirm</h2>
+                {!fileResults.length && <div className="empty-state">Extracted rows will show up here for you to check and correct before they're added to the register. Nothing is saved automatically.</div>}
+                {fileResults.length > 0 && (() => {
+                  const idx = Math.min(activeResultIndex, fileResults.length - 1);
+                  const page = fileResults[idx];
+                  const doneCount = fileResults.filter(r => r.status === 'done').length;
+                  const remainingCount = fileResults.filter(r => r.status === 'pending' || r.status === 'error').length;
+                  return (
+                    <div>
+                      {fileResults.length > 1 && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+                          <button className="icon-btn" disabled={idx === 0} onClick={() => setActiveResultIndex(idx - 1)}>◀</button>
+                          <span style={{ fontSize: 12.5 }}>File {idx + 1} of {fileResults.length} — {doneCount} done so far</span>
+                          <button className="icon-btn" disabled={idx === fileResults.length - 1} onClick={() => setActiveResultIndex(idx + 1)}>▶</button>
+                          <div style={{ display: 'flex', gap: 5, marginLeft: 6, flexWrap: 'wrap' }}>
+                            {fileResults.map((r, i) => (
+                              <span key={r.id} onClick={() => setActiveResultIndex(i)} title={r.label}
+                                style={{
+                                  width: 22, height: 22, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                  fontSize: 10, cursor: 'pointer', border: i === idx ? '2px solid var(--accent)' : '1px solid var(--rule)',
+                                  background: r.status === 'done' ? 'var(--ok-soft)' : r.status === 'error' ? 'var(--warn-soft)' : r.status === 'extracting' ? 'var(--accent-soft)' : '#fff',
+                                }}>
+                                {r.status === 'extracting' ? <Loader2 size={11} className="spin" /> : i + 1}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      <p className="subtitle" style={{ marginBottom: 10 }}>{page.label}</p>
+                      {page.status === 'extracting' && <div className="doc-hint"><Loader2 size={13} className="spin" style={{ verticalAlign: 'middle', marginRight: 6 }} />Reading this one…</div>}
+                      {page.status === 'pending' && <div className="doc-hint">Waiting its turn…</div>}
+                      {page.status === 'error' && (
+                        <div>
+                          <div className="error-box"><AlertCircle size={16} /><span>Failed: {page.error}</span></div>
+                          <button className="btn btn-ghost" onClick={() => selectQueuedPage(idx)}>Select this file, then hit "Extract this one only" to retry</button>
+                        </div>
+                      )}
+                      {page.status === 'done' && (
+                        <div>
+                          <p className="subtitle" style={{ marginBottom: 10 }}>{page.rows.length} row(s) found for <strong>{activeConfig.label}</strong>. Fix anything that looks wrong, then confirm.</p>
+                          <EditableTable columns={COLUMNS[activeConfig.register]} rows={page.rows}
+                            onUpdate={(rowId, field, value) => updateReviewCell(idx, rowId, field, value)}
+                            onDelete={(rowId) => deleteReviewRow(idx, rowId)}
+                            emptyLabel="All rows removed — nothing to add." />
+                          <div className="review-actions">
+                            <button className="btn btn-primary" onClick={() => confirmPage(idx)} disabled={!page.rows.length}><CheckCircle2 size={15} /> Add {page.rows.length} row(s) to register</button>
+                            <button className="btn btn-ghost" onClick={() => discardPage(idx)}><XCircle size={15} /> Discard this file</button>
+                          </div>
+                        </div>
+                      )}
+                      {fileResults.length > 1 && (doneCount > 0 || remainingCount > 0) && (
+                        <div className="review-actions" style={{ borderTop: '1px solid var(--rule)', paddingTop: 14, marginTop: 14, flexWrap: 'wrap' }}>
+                          {doneCount > 0 && <button className="btn btn-primary" onClick={confirmAllPages}><CheckCircle2 size={15} /> Confirm all {doneCount} completed file(s) at once</button>}
+                          {extracting && <button className="btn btn-danger" onClick={cancelExtraction}><XCircle size={15} /> Cancel</button>}
+                          {!extracting && remainingCount > 0 && <button className="btn btn-ghost" onClick={runExtractionRemaining}><Upload size={15} /> Retry remaining {remainingCount}</button>}
+                          <button className="btn btn-ghost" disabled={extracting} onClick={discardAllPages}><XCircle size={15} /> Discard everything</button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            </div>
+          )}
+          {loaded && activeTab === 'rawMaterialIn' && (
+            <div>
+              <div className="panel">
+                <div className="panel-header">
+                  <div><h2>Raw Material Balance</h2><p className="subtitle">Computed automatically from inward slips minus consumption entries, grouped by size / GSM. (BF isn't part of the match — the handwritten consumption sheets don't record it.)</p></div>
+                  <button className="btn btn-ghost" onClick={() => exportSheet('RM_Balance', balanceRows, [
+                    { key: 'size', label: 'Size' }, { key: 'gsm', label: 'GSM' },
+                    { key: 'weight_in', label: 'Total In (kg)' }, { key: 'weight_consumed', label: 'Total Consumed (kg)' }, { key: 'balance', label: 'Balance Left (kg)' },
+                  ])}><Download size={15} /> Export</button>
+                </div>
+                {!balanceRows.length && <div className="empty-state">Upload some mill slips and consumption reports to see balances here.</div>}
+                {!!balanceRows.length && (
+                  <div className="table-wrap">
+                    <table>
+                      <thead><tr><th>Size</th><th>GSM</th><th>Total In (kg)</th><th>Total Consumed (kg)</th><th>Balance Left (kg)</th></tr></thead>
+                      <tbody>
+                        {balanceRows.map(b => (
+                          <tr key={b.id}>
+                            <td style={{ padding: '6px 10px' }}>{b.size}</td><td style={{ padding: '6px 10px' }}>{b.gsm}</td>
+                            <td style={{ padding: '6px 10px' }}>{b.weight_in.toFixed(1)}</td><td style={{ padding: '6px 10px' }}>{b.weight_consumed.toFixed(1)}</td>
+                            <td style={{ padding: '6px 10px' }}><Pill tone={b.balance <= 0 ? 'warn' : 'ok'}>{b.balance.toFixed(1)} kg</Pill></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+              <RegisterPanel title="Inward Entries (from mill slips)" columns={COLUMNS.rawMaterialIn} rows={rawMaterialIn}
+                onUpdate={updateRow('rawMaterialIn')} onDelete={deleteRow('rawMaterialIn')} onExport={() => exportSheet('Raw_Material_In', rawMaterialIn, COLUMNS.rawMaterialIn)} />
+              <RegisterPanel title="Consumption Entries (from daily reports)" columns={COLUMNS.consumption} rows={consumption}
+                onUpdate={updateRow('consumption')} onDelete={deleteRow('consumption')} onExport={() => exportSheet('Consumption', consumption, COLUMNS.consumption)} />
+            </div>
+          )}
+          {loaded && activeTab === 'production' && (
+            <RegisterPanel title="Production Register" subtitle="From handwritten daily production sheets — covers both the shade/size/GSM style and the product-description style. Rows from the description style also feed the Customer Stock tab. Dispatch bills do NOT land here — see the Customer Dispatch Bills tab." columns={COLUMNS.production} rows={production}
+              onUpdate={updateRow('production')} onDelete={deleteRow('production')} onExport={() => exportSheet('Production_Register', production, COLUMNS.production)} />
+          )}
+          {loaded && activeTab === 'customerDispatch' && (
+            <RegisterPanel title="Customer Dispatch Bills" subtitle="From dispatch bills / tax invoices sent to customers (Bindal, Diamond, Anmol, or otherwise) — kept separate from the Production Register. Once confirmed on the Customer Stock tab, these reduce that customer's balance there and in the Order Availability Check." columns={COLUMNS.customerDispatch} rows={customerDispatch}
+              onUpdate={updateRow('customerDispatch')} onDelete={deleteRow('customerDispatch')} onExport={() => exportSheet('Customer_Dispatch_Bills', customerDispatch, COLUMNS.customerDispatch)} />
+          )}
+          {loaded && activeTab === 'orderCheck' && (
+            <div className="panel">
+              <h2 style={{ marginBottom: 6 }}>Order Availability Check</h2>
+              <p className="subtitle" style={{ marginBottom: 16 }}>Enter a party name (and optionally a size/GSM keyword) to see pieces produced (from the Production Register) vs. dispatched (from confirmed Customer Dispatch Bills), and what's still available. Note: the handwritten Production Register usually doesn't name a customer on the sheet itself — if "Party" is blank on those rows, click into the cell on the Production Register tab and fill it in manually so this check can find it.</p>
+              <div className="field-row">
+                <input className="text-input" placeholder="Party name (e.g. Anmol, Dabur, Ashoka)" value={checkParty} onChange={e => setCheckParty(e.target.value)} />
+                <input className="text-input" placeholder="Size / GSM keyword (optional)" value={checkKeyword} onChange={e => setCheckKeyword(e.target.value)} />
+                <button className="btn btn-primary" onClick={runCheck}><Search size={15} /> Check availability</button>
+              </div>
+              {checkResult && (
+                <div className="check-result">
+                  <div className="check-stats">
+                    <div className="stat-box"><div className="val">{checkResult.produced}</div><div className="lbl">Produced (pcs)</div></div>
+                    <div className="stat-box"><div className="val">{checkResult.dispatched}</div><div className="lbl">Dispatched (pcs)</div></div>
+                    <div className="stat-box" style={{ borderColor: checkResult.available > 0 ? 'var(--ok)' : 'var(--ledger-red)' }}>
+                      <div className="val" style={{ color: checkResult.available > 0 ? 'var(--ok)' : 'var(--ledger-red)' }}>{checkResult.available}</div>
+                      <div className="lbl">Available (pcs)</div>
+                    </div>
+                  </div>
+                  <div className="section-label">Matched production rows ({checkResult.matchProd.length})</div>
+                  <EditableTable columns={COLUMNS.production} rows={checkResult.matchProd} onUpdate={updateRow('production')} onDelete={deleteRow('production')} emptyLabel="No matching production rows." />
+                  <div className="section-label">Matched dispatch bill rows ({checkResult.matchDisp.length})</div>
+                  <EditableTable columns={COLUMNS.customerDispatch} rows={checkResult.matchDisp} onUpdate={updateRow('customerDispatch')} onDelete={deleteRow('customerDispatch')} emptyLabel="No matching dispatch bill rows." />
+                </div>
+              )}
+              {!checkResult && <p className="subtitle">No search run yet — results aren't guessed, only shown once you check.</p>}
+            </div>
+          )}
+          {loaded && activeTab === 'daburSpecs' && (
+            <RegisterPanel title="Dabur — Spec Master" subtitle="Replaces the manual diary — one row per box item, from printed PM Specification sheets." columns={COLUMNS.daburSpecs} rows={daburSpecs}
+              onUpdate={updateRow('daburSpecs')} onDelete={deleteRow('daburSpecs')} onExport={() => exportSheet('Dabur_Spec_Master', daburSpecs, COLUMNS.daburSpecs)} />
+          )}
+          {loaded && activeTab === 'daburPO' && (
+            <div className="panel">
+              <div className="panel-header">
+                <div><h2>Dabur — Pending PO</h2><p className="subtitle">Pending quantity is ordered qty minus dispatches matched by PO number, with a ±10% tolerance — a PO is marked Fulfilled once dispatches reach 90% of the ordered quantity. If one PO covers several different materials, double-check against the Dabur Dispatch Log tab.</p></div>
+                <button className="btn btn-ghost" onClick={() => exportSheet('Dabur_Pending_PO', daburPOWithPending.map(r => ({ ...r, status: r.fulfilled ? 'Fulfilled' : 'Pending' })), [...COLUMNS.daburPO, { key: 'dispatched_qty', label: 'Dispatched Qty' }, { key: 'pending_qty', label: 'Pending Qty' }, { key: 'status', label: 'Status' }])}><Download size={15} /> Export</button>
+              </div>
+              {!daburPOWithPending.length && <div className="empty-state">Upload a Dabur PO to start tracking pending quantities.</div>}
+              {!!daburPOWithPending.length && (
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>{COLUMNS.daburPO.map(c => <th key={c.key}>{c.label}</th>)}<th>Dispatched</th><th>Pending</th><th className="col-action"></th></tr>
+                    </thead>
+                    <tbody>
+                      {daburPOWithPending.map(row => (
+                        <tr key={row.id}>
+                          {COLUMNS.daburPO.map(c => (
+                            <td key={c.key}><input className="cell-input" value={row[c.key] ?? ''} onChange={e => updateRow('daburPO')(row.id, c.key, e.target.value)} /></td>
+                          ))}
+                          <td style={{ padding: '6px 10px' }}>{row.dispatched_qty}</td>
+                          <td style={{ padding: '6px 10px' }}>
+                            <Pill tone={row.fulfilled ? 'ok' : 'warn'}>{row.fulfilled ? 'Fulfilled' : row.pending_qty}</Pill>
+                          </td>
+                          <td className="col-action"><button className="icon-btn danger" onClick={() => deleteRow('daburPO')(row.id)}><Trash2 size={15} /></button></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+          {loaded && activeTab === 'daburDispatch' && (
+            <RegisterPanel title="Dabur — Dispatch Log" subtitle="From dispatch bills against Dabur POs. The PO Ref No column drives the pending-quantity calculation on the Pending PO tab." columns={COLUMNS.daburDispatch} rows={daburDispatch}
+              onUpdate={updateRow('daburDispatch')} onDelete={deleteRow('daburDispatch')} onExport={() => exportSheet('Dabur_Dispatch', daburDispatch, COLUMNS.daburDispatch)} />
+          )}
+          {loaded && activeTab === 'customerStock' && (
+            <div>
+              <div className="panel">
+                <h2 style={{ marginBottom: 6 }}>Customer Stock</h2>
+                <p className="subtitle" style={{ marginBottom: 4 }}>Combines confirmed Production Register entries (stock in) with confirmed Customer Dispatch Bill entries (stock out), grouped by customer and product variant, into a running opening/production/dispatch/closing balance — the same shape as your BINDAL_STOCK / DIAMOND / Anmol stock files.</p>
+                <p className="subtitle">Matching is done by the Customer Mapping tab, plus anything literally bracketed next to the item name. This is a flat sheet per variant rather than the exact side-by-side block layout your originals use — let me know if you need it to match that layout exactly.</p>
+              </div>
+              {pendingProductionRows.length > 0 && (
+                <div className="panel" style={{ borderColor: 'var(--accent)' }}>
+                  <div className="panel-header">
+                    <div><h2>Pending Production Review ({pendingProductionRows.length})</h2><p className="subtitle">New Production Register entries not yet reflected in the customer stock totals below. Check or fix the suggested customer, then confirm — nothing here counts toward balances until you do.</p></div>
+                    <button className="btn btn-primary" onClick={confirmAllPendingProduction}><CheckCircle2 size={15} /> Confirm all suggested</button>
+                  </div>
+                  <div className="table-wrap">
+                    <table>
+                      <thead><tr><th>Date</th><th>Description</th><th>Pieces</th><th>Suggested Customer</th><th className="col-action"></th></tr></thead>
+                      <tbody>
+                        {pendingProductionRows.map(row => (
+                          <tr key={row.id}>
+                            <td style={{ padding: '6px 10px' }}>{row.date}</td>
+                            <td style={{ padding: '6px 10px' }}>{row.description}</td>
+                            <td style={{ padding: '6px 10px' }}>{row.pieces || ''}</td>
+                            <td>
+                              <input className="cell-input" value={row.confirmedCustomer || matchCustomer(row)}
+                                onChange={e => updatePendingCustomer('production')(row.id, e.target.value)} />
+                            </td>
+                            <td className="col-action">
+                              <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm this row" onClick={() => confirmStockRow('production', row)}><CheckCircle2 size={16} /></button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+              {pendingDispatchRows.length > 0 && (
+                <div className="panel" style={{ borderColor: 'var(--ledger-red)' }}>
+                  <div className="panel-header">
+                    <div><h2>Pending Dispatch Bill Review ({pendingDispatchRows.length})</h2><p className="subtitle">New Customer Dispatch Bill entries not yet reflected in the customer stock totals below. Check or fix the suggested customer, then confirm — nothing here counts toward balances until you do.</p></div>
+                    <button className="btn btn-primary" onClick={confirmAllPendingDispatch}><CheckCircle2 size={15} /> Confirm all suggested</button>
+                  </div>
+                  <div className="table-wrap">
+                    <table>
+                      <thead><tr><th>Date</th><th>Invoice No</th><th>Description</th><th>Quantity</th><th>Suggested Customer</th><th className="col-action"></th></tr></thead>
+                      <tbody>
+                        {pendingDispatchRows.map(row => (
+                          <tr key={row.id}>
+                            <td style={{ padding: '6px 10px' }}>{row.date}</td>
+                            <td style={{ padding: '6px 10px' }}>{row.invoice_no}</td>
+                            <td style={{ padding: '6px 10px' }}>{row.description}</td>
+                            <td style={{ padding: '6px 10px' }}>{row.quantity || ''}</td>
+                            <td>
+                              <input className="cell-input" value={row.confirmedCustomer || matchCustomer(row)}
+                                onChange={e => updatePendingCustomer('customerDispatch')(row.id, e.target.value)} />
+                            </td>
+                            <td className="col-action">
+                              <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm this row" onClick={() => confirmStockRow('customerDispatch', row)}><CheckCircle2 size={16} /></button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+              {customerNames.map(customer => {
+                const groups = customerStockGroups.filter(g => g.customer === customer);
+                const totalProd = groups.reduce((s, g) => s + g.totalProduction, 0);
+                const totalDisp = groups.reduce((s, g) => s + g.totalDispatch, 0);
+                return (
+                  <div className="panel" key={customer}>
+                    <div className="panel-header">
+                      <div>
+                        <h2>{customer}{customer === 'Unassigned' && ' — needs a mapping rule'}</h2>
+                        <p className="subtitle">{groups.length} variant{groups.length === 1 ? '' : 's'} · {totalProd} produced · {totalDisp} dispatched</p>
+                      </div>
+                      <button className="btn btn-ghost" onClick={() => exportCustomerStock(customer)}><Download size={15} /> Export {customer}</button>
+                    </div>
+                    {customer === 'Unassigned' && groups.length > 0 && (
+                      <div className="error-box" style={{ marginBottom: 14 }}>
+                        <AlertCircle size={16} />
+                        <span>These descriptions didn't match any rule in Customer Mapping — add a keyword rule for them there so they route to the right customer.</span>
+                      </div>
+                    )}
+                    {groups.map(g => (
+                      <div key={g.id} style={{ marginBottom: 18 }}>
+                        <div className="section-label">{g.description} — closing balance: <Pill tone={g.closingBalance >= 0 ? 'ok' : 'warn'}>{g.closingBalance}</Pill></div>
+                        <div className="table-wrap">
+                          <table>
+                            <thead><tr><th>Date</th><th>Opening</th><th>Production</th><th>Dispatch</th><th>Closing</th></tr></thead>
+                            <tbody>
+                              {g.ledger.map((e, i) => (
+                                <tr key={i}>
+                                  <td style={{ padding: '6px 10px' }}>{e.date}</td><td style={{ padding: '6px 10px' }}>{e.opening}</td>
+                                  <td style={{ padding: '6px 10px' }}>{e.pieces || ''}</td><td style={{ padding: '6px 10px' }}>{e.dispatch || ''}</td>
+                                  <td style={{ padding: '6px 10px' }}>{e.closing}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+              {!customerNames.length && <div className="empty-state">Upload some Finished Goods Ledger pages to see customer stock here.</div>}
+            </div>
+          )}
+          {loaded && activeTab === 'customerMapping' && (
+            <div>
+              <div className="panel">
+                <div className="panel-header">
+                  <div><h2>Import / Update a Customer Sheet</h2><p className="subtitle">Upload a customer's stock .xlsx (like BINDAL_STOCK.xlsx, DIAMOND.xlsx, or a new one you haven't shared yet). It reads the "summary" sheet's item list — or falls back to sheet tab names if there's no summary sheet — and lets you review before adding anything.</p></div>
+                </div>
+                <label className="dropzone" htmlFor="catalogFileInput" style={{ padding: 18 }}>
+                  <Upload size={20} style={{ marginBottom: 4 }} />
+                  <div style={{ fontSize: 13.5, fontWeight: 600 }}>Click to upload a customer stock .xlsx</div>
+                  <div style={{ fontSize: 11.5, color: 'var(--ink-soft)', marginTop: 4 }}>Works for a brand-new customer, or a newer version of one you've already added.</div>
+                </label>
+                <input id="catalogFileInput" type="file" accept=".xlsx,.xls" style={{ display: 'none' }} onChange={e => handleCatalogFile(e.target.files?.[0])} />
+                {catalogImportBusy && <div className="doc-hint" style={{ marginTop: 10 }}><Loader2 size={13} className="spin" style={{ verticalAlign: 'middle', marginRight: 6 }} />Reading file…</div>}
+                {catalogImportError && <div className="error-box"><AlertCircle size={16} /><span>{catalogImportError}</span></div>}
+                {catalogReview && (
+                  <div className="review-box">
+                    <div className="field-row">
+                      <span style={{ fontSize: 13, fontWeight: 600 }}>Customer name:</span>
+                      <input className="text-input" value={catalogReview.customerName} onChange={e => setCatalogReview(prev => ({ ...prev, customerName: e.target.value }))} />
+                    </div>
+                    <p className="subtitle" style={{ marginBottom: 10 }}>{catalogReview.items.length} item(s) found in {catalogReview.fileName}. Uncheck anything that isn't really a product, fix any typos, then confirm.</p>
+                    <div className="table-wrap">
+                      <table>
+                        <thead><tr><th style={{ width: 34 }}></th><th>Item name</th></tr></thead>
+                        <tbody>
+                          {catalogReview.items.map(it => (
+                            <tr key={it.id}>
+                              <td style={{ textAlign: 'center' }}><input type="checkbox" checked={it.include} onChange={e => updateCatalogReviewItem(it.id, 'include', e.target.checked)} /></td>
+                              <td><input className="cell-input" value={it.item} onChange={e => updateCatalogReviewItem(it.id, 'item', e.target.value)} /></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="review-actions">
+                      <button className="btn btn-primary" onClick={confirmCatalogImport}><CheckCircle2 size={15} /> Add to catalog &amp; mapping</button>
+                      <button className="btn btn-ghost" onClick={() => setCatalogReview(null)}><XCircle size={15} /> Discard</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="panel">
+                <div className="panel-header">
+                  <div><h2>Customer Mapping</h2><p className="subtitle">Which keyword in a production-ledger item name routes to which customer. Checked top to bottom — the first match wins, so more specific keywords should sit above general ones. A bracketed customer name found right next to an item always overrides this list.</p></div>
+                  <button className="btn btn-primary" onClick={addMappingRow}><Plus size={15} /> Add rule</button>
+                </div>
+                <div className="table-wrap">
+                  <table>
+                    <thead><tr><th>Keyword (matches anywhere in item name, case-insensitive)</th><th>Customer</th><th className="col-action"></th></tr></thead>
+                    <tbody>
+                      {customerMapping.map(rule => (
+                        <tr key={rule.id}>
+                          <td><input className="cell-input" value={rule.keyword} onChange={e => updateMappingRow(rule.id, 'keyword', e.target.value)} /></td>
+                          <td><input className="cell-input" value={rule.customer} onChange={e => updateMappingRow(rule.id, 'customer', e.target.value)} /></td>
+                          <td className="col-action"><button className="icon-btn danger" onClick={() => deleteMappingRow(rule.id)}><Trash2 size={15} /></button></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div className="panel">
+                <h2 style={{ marginBottom: 6 }}>Known Product Catalog</h2>
+                <p className="subtitle" style={{ marginBottom: 14 }}>Exact item names used to correct handwriting misreads during extraction (e.g. "g" vs "9", "&" vs "8"). Built from the files you've imported above — delete anything that's wrong.</p>
+                {customerNames.length === 0 && !productCatalog.length && <div className="empty-state">No catalog items yet.</div>}
+                {Array.from(new Set(productCatalog.map(c => c.customer))).map(customer => (
+                  <div key={customer} style={{ marginBottom: 16 }}>
+                    <div className="section-label">{customer} ({productCatalog.filter(c => c.customer === customer).length} items)</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                      {productCatalog.filter(c => c.customer === customer).map(c => (
+                        <span key={c.id} className="pill pill-neutral" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                          {c.item}
+                          <button className="icon-btn danger" style={{ padding: 0 }} onClick={() => deleteCatalogItem(c.id)}><Trash2 size={12} /></button>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+    {copyModal && <CopyExportModal data={copyModal} onClose={() => setCopyModal(null)} />}
+    </>
+  );
+}
+/* ============================== login gate ============================== */
+// The whole app sits behind one shared team password (see server/lib/auth.js). This wrapper checks
+// /api/session on load, shows a plain login form if there's no valid session cookie yet, and renders
+// the real app once logged in. It also listens for the 'fims-unauthorized' event — dispatched by
+// callClaudeExtract/window.storage above whenever the backend returns a 401 (e.g. the session cookie
+// expired after 30 days, or the server restarted with a new SESSION_SECRET) — so an expired session
+// mid-use drops back to the login screen instead of the app silently failing every request.
+const LOGIN_PAGE_STYLE = {
+  minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
+  fontFamily: "'IBM Plex Sans', 'Segoe UI', sans-serif", background: '#ece8df', color: '#23262b',
+};
+function LoginScreen({ onLoggedIn }) {
+  const [password, setPassword] = useState('');
+  const [loggingIn, setLoggingIn] = useState(false);
+  const [error, setError] = useState('');
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!password) return;
+    setLoggingIn(true); setError('');
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ password }),
+      });
+      if (res.ok) { onLoggedIn(); return; }
+      const data = await res.json().catch(() => ({}));
+      setError(data.error || `Login failed (HTTP ${res.status}).`);
+    } catch (e) {
+      setError(e.message || 'Could not reach the server — check your connection and try again.');
+    } finally {
+      setLoggingIn(false);
+    }
+  };
+  return (
+    <div style={LOGIN_PAGE_STYLE}>
+      <form onSubmit={submit} style={{ background: '#f6f3ec', border: '1px solid #cfc9ba', borderRadius: 8, padding: 28, width: 320, boxShadow: '0 2px 10px rgba(0,0,0,0.08)' }}>
+        <h1 style={{ fontSize: 18, marginBottom: 4 }}>FIMS</h1>
+        <p style={{ fontSize: 12.5, color: '#5b5e63', marginBottom: 16 }}>Enter the shared team password to continue.</p>
+        <input
+          type="password" value={password} onChange={e => setPassword(e.target.value)}
+          placeholder="Password" autoFocus autoComplete="current-password"
+          style={{ width: '100%', padding: '9px 10px', borderRadius: 6, border: '1px solid #cfc9ba', fontSize: 14, marginBottom: 12, boxSizing: 'border-box' }}
+        />
+        <button type="submit" disabled={loggingIn || !password} style={{ width: '100%', padding: '9px 10px', borderRadius: 6, border: 'none', background: '#a97a2f', color: '#fff', fontSize: 14, fontWeight: 600, cursor: loggingIn ? 'default' : 'pointer', opacity: loggingIn ? 0.7 : 1 }}>
+          {loggingIn ? 'Checking…' : 'Log in'}
+        </button>
+        {error && <p style={{ fontSize: 12.5, color: '#a23b2e', marginTop: 12 }}>{error}</p>}
+      </form>
+    </div>
+  );
+}
+function LogoutButton({ onLoggedOut }) {
+  const doLogout = async () => {
+    try { await fetch('/api/logout', { method: 'POST', credentials: 'include' }); } catch (e) { /* noop */ }
+    onLoggedOut();
+  };
+  return (
+    <button
+      onClick={doLogout}
+      title="Log out"
+      style={{ position: 'fixed', top: 10, right: 12, zIndex: 1001, padding: '5px 10px', borderRadius: 6, border: '1px solid #cfc9ba', background: '#f6f3ec', color: '#5b5e63', fontSize: 11.5, cursor: 'pointer' }}
+    >
+      Log out
+    </button>
+  );
+}
+export default function App() {
+  const [authed, setAuthed] = useState(null); // null = still checking, then true/false
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/session', { credentials: 'include' });
+        const data = await res.json();
+        setAuthed(!!data.authed);
+      } catch (e) {
+        setAuthed(false);
+      }
+    })();
+    const onUnauthorized = () => setAuthed(false);
+    window.addEventListener('fims-unauthorized', onUnauthorized);
+    return () => window.removeEventListener('fims-unauthorized', onUnauthorized);
+  }, []);
+  if (authed === null) {
+    return <div style={LOGIN_PAGE_STYLE}>Loading…</div>;
+  }
+  if (!authed) {
+    return <LoginScreen onLoggedIn={() => setAuthed(true)} />;
+  }
+  return (
+    <>
+      <LogoutButton onLoggedOut={() => setAuthed(false)} />
+      <FIMSApp />
+    </>
+  );
+}
