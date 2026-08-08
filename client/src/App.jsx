@@ -843,9 +843,46 @@ function FIMSApp() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const persist = useCallback((registerKey, rows) => {
-    saveRegister(STORAGE_KEYS[registerKey], rows);
+  // Google Sheets allows only 60 write requests/minute per user (300/minute per project — see
+  // https://developers.google.com/workspace/sheets/api/limits). Saving on every single keystroke or
+  // row edit blows through that almost immediately — e.g. clicking "Confirm all" on a batch of
+  // pending stock rows used to fire one full-register rewrite PER ROW. This debounces every save: an
+  // edit schedules a write ~1.5s in the future, and each further edit to the same thing within that
+  // window just reschedules it, so a whole burst of edits collapses into exactly one network write
+  // of the latest state. flushPendingSaves forces any still-pending writes out immediately when the
+  // tab is about to be hidden or closed, so a save scheduled just before that isn't silently lost.
+  const SAVE_DEBOUNCE_MS = 1500;
+  const saveTimerRef = useRef({});
+  const pendingSaveRef = useRef({});
+  const scheduleSave = useCallback((key, fn) => {
+    pendingSaveRef.current[key] = fn;
+    if (saveTimerRef.current[key]) clearTimeout(saveTimerRef.current[key]);
+    saveTimerRef.current[key] = setTimeout(() => {
+      delete saveTimerRef.current[key];
+      const run = pendingSaveRef.current[key];
+      delete pendingSaveRef.current[key];
+      if (run) run();
+    }, SAVE_DEBOUNCE_MS);
   }, []);
+  const flushPendingSaves = useCallback(() => {
+    Object.values(saveTimerRef.current).forEach(t => clearTimeout(t));
+    saveTimerRef.current = {};
+    const pending = pendingSaveRef.current;
+    pendingSaveRef.current = {};
+    Object.values(pending).forEach(run => run());
+  }, []);
+  useEffect(() => {
+    const onVisibility = () => { if (document.visibilityState === 'hidden') flushPendingSaves(); };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pagehide', flushPendingSaves);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pagehide', flushPendingSaves);
+    };
+  }, [flushPendingSaves]);
+  const persist = useCallback((registerKey, rows) => {
+    scheduleSave(`register:${registerKey}`, () => saveRegister(STORAGE_KEYS[registerKey], rows));
+  }, [scheduleSave]);
   const updateRow = (registerKey) => (id, field, value) => {
     registerSetters[registerKey](prev => {
       const next = prev.map(r => r.id === id ? { ...r, [field]: value } : r);
@@ -1242,7 +1279,7 @@ function FIMSApp() {
   /* -------- customer mapping (editable) -------- */
   const persistCustomerMapping = (next) => {
     setCustomerMapping(next);
-    try { window.storage.set(CUSTOMER_MAPPING_KEY, JSON.stringify(next), false); } catch (e) { /* noop */ }
+    scheduleSave('customerMapping', () => window.storage.set(CUSTOMER_MAPPING_KEY, JSON.stringify(next), false).catch(() => {}));
   };
   const addMappingRow = () => persistCustomerMapping([...customerMapping, { id: genId(), keyword: '', customer: '' }]);
   const updateMappingRow = (id, field, value) => persistCustomerMapping(customerMapping.map(r => r.id === id ? { ...r, [field]: value } : r));
@@ -1250,7 +1287,7 @@ function FIMSApp() {
   /* -------- product catalog (editable + importable from a customer's stock .xlsx) -------- */
   const persistCatalog = (next) => {
     setProductCatalog(next);
-    try { window.storage.set(CATALOG_KEY, JSON.stringify(next), false); } catch (e) { /* noop */ }
+    scheduleSave('catalog', () => window.storage.set(CATALOG_KEY, JSON.stringify(next), false).catch(() => {}));
   };
   const deleteCatalogItem = (id) => persistCatalog(productCatalog.filter(c => c.id !== id));
   const [catalogImportBusy, setCatalogImportBusy] = useState(false);
@@ -1392,6 +1429,45 @@ function FIMSApp() {
     });
   })();
   const customerNames = Array.from(new Set(customerStockGroups.map(g => g.customer))).sort((a, b) => (a === 'Unassigned') - (b === 'Unassigned') || a.localeCompare(b));
+  /* -------- customer stock tabs: auto-created in Google Sheets, one tab per customer, kept in sync
+     automatically — the same "IT 500 Lid" / "Coconutty 36" style items-as-separate-tables layout as
+     the real BINDAL STOCK.xlsx / DIAMOND.xlsx / anmol stock files this app replaces. These tabs are
+     a write-only computed mirror (never read back into app state — the Production Register and
+     Customer Dispatch Bills are the actual source of truth), so this can safely just push the latest
+     computed ledger any time the underlying data changes, debounced so a burst of edits still only
+     costs one write per customer, not one per edit. Every catalog customer (Bindal, Diamond, Anmol
+     by default) gets a tab from the first load onward, even before anything's confirmed yet — it
+     just starts empty and fills in as stock gets confirmed. */
+  const allCustomerTabNames = Array.from(new Set([
+    ...productCatalog.map(c => c.customer),
+    ...customerNames,
+  ])).filter(Boolean);
+  const buildCustomerStockBlocks = (customer) => customerStockGroups
+    .filter(g => g.customer === customer)
+    .map(g => ({
+      title: g.description || 'Item',
+      header: ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
+      rows: g.ledger.map(e => [e.date || '', e.opening, e.pieces || 0, e.dispatch || 0, e.closing]),
+    }));
+  const saveCustomerStockTab = async (customer) => {
+    try {
+      const res = await fetch(`/api/sheets/${encodeURIComponent(customer)}/blocks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ blocks: buildCustomerStockBlocks(customer) }),
+      });
+      if (res.status === 401) window.dispatchEvent(new Event('fims-unauthorized'));
+    } catch (e) { /* best-effort mirror — the underlying registers are the real data, not this tab */ }
+  };
+  const customerTabNamesKey = allCustomerTabNames.join('|');
+  useEffect(() => {
+    if (!loaded || !allCustomerTabNames.length) return;
+    scheduleSave('customer-stock-tabs', () => {
+      allCustomerTabNames.forEach(customer => saveCustomerStockTab(customer));
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, production, customerDispatch, customerMapping, customerTabNamesKey]);
   /* -------- export --------
      Every export button below just packages the relevant rows/columns into a { title, sheets } object
      and hands it to the CopyExportModal — it does NOT build an .xlsx workbook or trigger a download

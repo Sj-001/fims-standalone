@@ -4,7 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const { requireEnv, login, logout, requireAuth } = require('./lib/auth');
 const { extract } = require('./lib/anthropic');
-const { getTab, putTab } = require('./lib/sheets');
+const { getTab, putTab, putBlocksTab } = require('./lib/sheets');
 
 // Fail fast and loud if required secrets are missing, instead of the app half-working with
 // confusing downstream errors — matches the "no guesses" standard this project was built to.
@@ -53,6 +53,9 @@ app.post('/api/extract', extract);
 // --- sheets-backed storage ---
 app.get('/api/sheets/:tab', getTab);
 app.post('/api/sheets/:tab', putTab);
+// Multi-item "titled table" tabs — used for the per-customer stock sheets (Bindal, Diamond,
+// Anmol, ...), which are write-only mirrors of computed data, never read back into the app.
+app.post('/api/sheets/:tab/blocks', putBlocksTab);
 
 // --- serve the built frontend (client/dist), if present, so this is a single deployable service ---
 const clientDist = path.join(__dirname, '..', 'client', 'dist');
