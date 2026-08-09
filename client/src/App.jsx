@@ -796,6 +796,7 @@ function FIMSApp() {
   const [productCatalog, setProductCatalog] = useState(DEFAULT_PRODUCT_CATALOG);
   const [customerSheetIds, setCustomerSheetIds] = useState([]); // [{id, customer, sheetId}]
   const [pushStatus, setPushStatus] = useState({}); // { [customer]: { state: 'idle'|'pushing'|'done'|'error', message, unmatched } }
+  const [serviceAccountEmail, setServiceAccountEmail] = useState('');
   const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
   const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch };
   useEffect(() => {
@@ -818,6 +819,10 @@ function FIMSApp() {
         const r3 = await window.storage.get(CUSTOMER_SHEET_IDS_KEY, false);
         if (r3 && r3.value) setCustomerSheetIds(JSON.parse(r3.value));
       } catch (e) { /* keep empty — nothing pushed yet */ }
+      try {
+        const r4 = await fetch('/api/service-account-email', { credentials: 'include' });
+        if (r4.ok) { const j = await r4.json(); setServiceAccountEmail(j.email || ''); }
+      } catch (e) { /* shown as blank below; the per-error messages still work without this */ }
       setLoaded(true);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2380,7 +2385,16 @@ function FIMSApp() {
                 <h2 style={{ marginBottom: 6 }}>Customer Sheets</h2>
                 <p className="subtitle" style={{ marginBottom: 4 }}>Push a customer's stock ledger out to THEIR OWN separate Google Sheet — not a tab on this app's main sheet — laid out the same way as your original BINDAL STOCK.xlsx / DIAMOND.xlsx / anmol stock files: one tab per base item, every variant of that item as its own side-by-side table within that tab, plus a "summary" tab listing every variant's current balance.</p>
                 <p className="subtitle" style={{ marginBottom: 4 }}>Pushing only happens when you click "Push to Sheet" below — nothing is pushed automatically. A push fully overwrites that customer's sheet with the latest computed data, so if anyone hand-edits it directly, those edits will be lost on the next push.</p>
-                <p className="subtitle">Setup per customer, once: create or open their Google Sheet, share it with your service account's email (the same one you shared your main FIMS sheet with) as an Editor, then paste that sheet's ID below — the long ID in its URL, between <code>/d/</code> and <code>/edit</code>.</p>
+                <p className="subtitle">Setup per customer, once: create or open their Google Sheet, share it with the service account email below as an Editor, then paste that sheet's ID below — the long ID in its URL, between <code>/d/</code> and <code>/edit</code>. Skipping this share step is the #1 cause of "the caller does not have permission" errors.</p>
+                <div className="field-row" style={{ marginTop: 10 }}>
+                  <span style={{ fontSize: 13, fontWeight: 600 }}>Share every customer Sheet with:</span>
+                  {serviceAccountEmail
+                    ? <code style={{ background: 'var(--accent-soft)', padding: '4px 8px', borderRadius: 4, fontSize: 12.5 }}>{serviceAccountEmail}</code>
+                    : <span className="doc-hint">(couldn't read it — check GOOGLE_SERVICE_ACCOUNT_JSON on the server)</span>}
+                  {serviceAccountEmail && (
+                    <button className="btn btn-ghost" onClick={() => navigator.clipboard?.writeText(serviceAccountEmail)}><FileSpreadsheet size={14} /> Copy</button>
+                  )}
+                </div>
               </div>
               <div className="panel">
                 <div className="panel-header">

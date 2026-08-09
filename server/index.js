@@ -4,7 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const { requireEnv, login, logout, requireAuth } = require('./lib/auth');
 const { extract } = require('./lib/anthropic');
-const { getTab, putTab, putBlocksTab, pushCustomerSheetHandler, importCustomerSheetHandler } = require('./lib/sheets');
+const { getTab, putTab, putBlocksTab, pushCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler } = require('./lib/sheets');
 
 // Fail fast and loud if required secrets are missing, instead of the app half-working with
 // confusing downstream errors — matches the "no guesses" standard this project was built to.
@@ -63,6 +63,10 @@ app.post('/api/customer-sheets/push', pushCustomerSheetHandler);
 // Reads an existing customer's own Google Sheet (any spreadsheet ID) and returns its item list with
 // which tab each item belongs to, for review before adding to the Product Catalog / Customer Mapping.
 app.post('/api/customer-sheets/import', importCustomerSheetHandler);
+// The service account's own email — the frontend shows this directly in the Customer Sheets tab so
+// there's a one-click answer to "what do I share the customer's Sheet with," instead of making
+// someone dig it out of a Render env var or a downloaded JSON key file.
+app.get('/api/service-account-email', getServiceAccountEmailHandler);
 
 // --- serve the built frontend (client/dist), if present, so this is a single deployable service ---
 const clientDist = path.join(__dirname, '..', 'client', 'dist');

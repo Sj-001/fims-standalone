@@ -54,6 +54,35 @@ function getSpreadsheetId() {
   return id;
 }
 
+// The service account's own email — this is what every customer's Google Sheet needs to be shared
+// with (as at least Viewer, Editor if it'll also be pushed to) before this app can read or write it.
+// Surfaced via /api/service-account-email so the frontend can show it directly in the Customer Sheets
+// tab, instead of making someone go dig it out of a Render env var or a downloaded JSON key file.
+function getServiceAccountEmail() {
+  try { return getCredentials().client_email || ''; } catch (e) { return ''; }
+}
+
+// Turns a raw Google API error into something a non-engineer can actually act on. By far the most
+// common failure here — for BOTH import and push — is pasting a Sheet ID that simply hasn't been
+// shared with the service account yet. Google's own error for that case is just "The caller does not
+// have permission" with a 403, which gives no hint of what to actually do about it. This detects that
+// specific case (and the "wrong ID" 404 case) and rewrites the message into the exact fix, including
+// the real service account email pulled from this app's own credentials — not a placeholder.
+function friendlyGoogleError(e) {
+  const raw = (e && e.message) || 'unknown error';
+  const code = e && (e.code || (e.response && e.response.status));
+  const isPermission = code === 403 || /does not have permission|permission_denied/i.test(raw);
+  if (isPermission) {
+    const email = getServiceAccountEmail();
+    return `That Google Sheet hasn't been shared with this app yet. Open the Sheet → Share → add ${email || "this app's service account (its email is in your GOOGLE_SERVICE_ACCOUNT_JSON's \"client_email\" field)"} as an Editor → try again.`;
+  }
+  const isNotFound = code === 404 || /requested entity was not found/i.test(raw);
+  if (isNotFound) {
+    return `No Google Sheet found with that ID. Double-check you copied the full ID from the Sheet's URL — the part between "/d/" and "/edit".`;
+  }
+  return raw;
+}
+
 // Sheet tab names have the same restrictions as Excel (no \/?*[] , 31 char max) — reuse the same
 // sanitizing approach the artifact version used for .xlsx export, so register keys map predictably.
 function sanitizeTabName(name) {
@@ -266,7 +295,7 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, summary) {
       await writeValuesClearingStale(sheets, spreadsheetId, plan.tabName, plan.grid, gridSize);
       results.push({ tab: plan.tabName, ok: true });
     } catch (e) {
-      results.push({ tab: plan.tabName, ok: false, error: e.message || 'unknown error' });
+      results.push({ tab: plan.tabName, ok: false, error: friendlyGoogleError(e) });
     }
   }
   return results;
@@ -337,6 +366,10 @@ async function importCustomerSheet(spreadsheetId) {
 }
 
 // --- HTTP handlers ---
+async function getServiceAccountEmailHandler(req, res) {
+  res.json({ email: getServiceAccountEmail() });
+}
+
 async function importCustomerSheetHandler(req, res) {
   try {
     const { spreadsheetId } = req.body || {};
@@ -347,7 +380,7 @@ async function importCustomerSheetHandler(req, res) {
     res.json({ ok: true, ...result });
   } catch (e) {
     console.error('Customer sheet import error:', e);
-    res.status(502).json({ error: `Could not read from Google Sheets: ${e.message || 'unknown error'}` });
+    res.status(502).json({ error: friendlyGoogleError(e) });
   }
 }
 
@@ -365,7 +398,7 @@ async function pushCustomerSheetHandler(req, res) {
     res.status(failed.length ? 502 : 200).json({ ok: failed.length === 0, results });
   } catch (e) {
     console.error('Customer sheet push error:', e);
-    res.status(502).json({ error: `Could not push to Google Sheets: ${e.message || 'unknown error'}` });
+    res.status(502).json({ error: friendlyGoogleError(e) });
   }
 }
 
@@ -375,7 +408,7 @@ async function getTab(req, res) {
     res.json({ rows });
   } catch (e) {
     console.error(`Sheets read error [${req.params.tab}]:`, e);
-    res.status(502).json({ error: `Could not read from Google Sheets: ${e.message || 'unknown error'}` });
+    res.status(502).json({ error: friendlyGoogleError(e) });
   }
 }
 
@@ -386,7 +419,7 @@ async function putTab(req, res) {
     res.json({ ok: true, count: rows.length });
   } catch (e) {
     console.error(`Sheets write error [${req.params.tab}]:`, e);
-    res.status(502).json({ error: `Could not write to Google Sheets: ${e.message || 'unknown error'}` });
+    res.status(502).json({ error: friendlyGoogleError(e) });
   }
 }
 
@@ -397,8 +430,8 @@ async function putBlocksTab(req, res) {
     res.json({ ok: true, count: blocks.length });
   } catch (e) {
     console.error(`Sheets blocks-write error [${req.params.tab}]:`, e);
-    res.status(502).json({ error: `Could not write to Google Sheets: ${e.message || 'unknown error'}` });
+    res.status(502).json({ error: friendlyGoogleError(e) });
   }
 }
 
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, importCustomerSheetHandler };
+module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler };
