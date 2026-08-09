@@ -325,17 +325,45 @@ function buildHighlightRequestsForTab(sheetId, grid, prevGrid) {
 // manually-triggered action, comfortably inside Google's 60 writes/minute/user quota.
 // itemGroups: [{ tabName, variants: [{ title, header, rows }] }]
 // summary: { rows: [{ item, quantity }] } (optional)
+// Real customer spreadsheets routinely have tab names with trailing spaces or inconsistent casing
+// ("hit & run ", "summary ", "SUMMARY", "T GEL ") — verified directly against BINDAL STOCK.xlsx,
+// DIAMOND.xlsx, and anmol stock dec 22.xlsx, where MOST category tabs have a trailing space. Matching
+// tab names with plain exact-string equality against a trimmed/sanitized proposed name misses those
+// real tabs entirely, so the app used to think they didn't exist and created a second, near-identical
+// tab (e.g. "hit & run" alongside the real "hit & run ") instead of writing into the one already
+// there. This normalizes for comparison ONLY — the real tab's exact original name/spacing is always
+// what gets written to and returned, never a normalized or re-cased version of it.
+const normalizeTabKey = (name) => String(name || '').trim().toLowerCase();
+
+// Resolves each tabPlan's proposed name against tabs that already exist in the target spreadsheet:
+// if a tab already exists whose name matches case/whitespace-insensitively, the plan is rewritten to
+// point at that tab's REAL name (so nothing new gets created and nothing pre-existing is duplicated).
+// Only a genuinely new category (no match at all — a brand-new item, or a truly blank spreadsheet)
+// gets a freshly created tab, using the sanitized proposed name.
+function resolveTabPlansAgainstExisting(tabPlans, existingMeta) {
+  const existingByKey = {};
+  Object.keys(existingMeta).forEach(realName => { existingByKey[normalizeTabKey(realName)] = realName; });
+  const resolved = tabPlans.map(p => {
+    const key = normalizeTabKey(p.tabName);
+    const realExistingName = existingByKey[key];
+    return { ...p, tabName: realExistingName || sanitizeTabName(p.tabName) };
+  });
+  const missing = Array.from(new Set(resolved.filter(p => !existingMeta[p.tabName]).map(p => p.tabName)));
+  return { resolved, missing };
+}
+
 async function pushCustomerSheet(spreadsheetId, itemGroups, summary) {
   const sheets = getSheetsClient();
-  const tabPlans = (Array.isArray(itemGroups) ? itemGroups : []).map(g => ({
-    tabName: sanitizeTabName(g.tabName || 'Sheet'),
+  let tabPlans = (Array.isArray(itemGroups) ? itemGroups : []).map(g => ({
+    tabName: g.tabName || 'Sheet',
     grid: buildSideBySideGrid(g.variants || []),
   }));
   if (summary && Array.isArray(summary.rows)) {
     tabPlans.push({ tabName: 'summary', grid: buildSummaryGrid(summary.rows) });
   }
   const existingMeta = await getSheetMeta(sheets, spreadsheetId);
-  const missing = Array.from(new Set(tabPlans.filter(p => !existingMeta[p.tabName]).map(p => p.tabName)));
+  let { resolved, missing } = resolveTabPlansAgainstExisting(tabPlans, existingMeta);
+  tabPlans = resolved;
   if (missing.length) {
     const createResp = await sheets.spreadsheets.batchUpdate({
       spreadsheetId,

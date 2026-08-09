@@ -1454,20 +1454,27 @@ function FIMSApp() {
     });
     const unmatched = [];
     const tabsMap = {};
+    const matchedGroups = [];
     groups.forEach(g => {
       const key = normalizeForCatalogMatch(g.description);
       const sheetGroup = sheetGroupByItem[key];
-      const tabName = sheetGroup || (g.description || 'Item').trim();
-      if (!sheetGroup) unmatched.push(g.description || '(blank description)');
-      if (!tabsMap[tabName]) tabsMap[tabName] = [];
-      tabsMap[tabName].push({
+      // An item with no catalog match must NEVER get pushed under its own improvised tab — that's
+      // exactly what fragmented real customer sheets into one tab per pack-size variant instead of
+      // one tab per product category. It's reported in `unmatched` so it's visible and fixable, but
+      // it's excluded from itemGroups AND the summary tab entirely: nothing gets written to the
+      // Sheet for it until it's deliberately mapped in the Known Product Catalog with the exact
+      // wording that customer's own Sheet uses for that variant's shared tab.
+      if (!sheetGroup) { unmatched.push(g.description || '(blank description)'); return; }
+      matchedGroups.push(g);
+      if (!tabsMap[sheetGroup]) tabsMap[sheetGroup] = [];
+      tabsMap[sheetGroup].push({
         title: g.description || 'Item',
         header: ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
         rows: g.ledger.map(e => [e.date || '', e.opening, e.pieces || 0, e.dispatch || 0, e.closing]),
       });
     });
     const itemGroups = Object.entries(tabsMap).map(([tabName, variants]) => ({ tabName, variants }));
-    const summaryRows = groups
+    const summaryRows = matchedGroups
       .map(g => ({ item: g.description || 'Item', quantity: g.closingBalance }))
       .sort((a, b) => a.item.localeCompare(b.item));
     return { itemGroups, summary: { rows: summaryRows }, unmatched: Array.from(new Set(unmatched)) };
@@ -2476,7 +2483,7 @@ function FIMSApp() {
                     {(unmatched.length > 0 && sheetId.trim()) && (
                       <div className="info-box" style={{ marginTop: 10 }}>
                         <Info size={16} />
-                        <span>{unmatched.length} item{unmatched.length === 1 ? '' : 's'} in your Production/Dispatch records don't exactly match a known item name for {customer}, so pushing will give them their own tab instead of grouping into an existing one: {unmatched.join(', ')}. If these are real products, add them to the Known Product Catalog (Customer Mapping tab) with the exact wording your ledger uses. Safe to ignore otherwise — nothing breaks, they just land in their own tab.</span>
+                        <span>{unmatched.length} item{unmatched.length === 1 ? '' : 's'} in your Production/Dispatch records don't exactly match a known item name for {customer}, so they will NOT be pushed to their Sheet at all (nothing gets written for them, and no new tab gets created): {unmatched.join(', ')}. If these are real products, add them to the Known Product Catalog (Customer Mapping tab) with the exact wording that customer's Sheet uses, then push again.</span>
                       </div>
                     )}
                     {status.state === 'done' && <div className="doc-hint" style={{ color: 'var(--ok)', marginTop: 10 }}>✓ {status.message}</div>}
