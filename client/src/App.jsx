@@ -3,7 +3,7 @@ import * as XLSX from 'xlsx';
 import {
   Upload, Image as ImageIcon, Package, Boxes, Search, Truck, ClipboardList,
   FileSpreadsheet, Download, CheckCircle2, XCircle, Trash2, Loader2,
-  AlertCircle, LayoutDashboard, FileText, Archive, ListChecks, Plus, RefreshCw, Link2
+  AlertCircle, LayoutDashboard, FileText, Archive, ListChecks, Plus, RefreshCw, Link2, Info
 } from 'lucide-react';
 /* ============================== helpers ============================== */
 const num = (v) => {
@@ -1862,6 +1862,7 @@ function FIMSApp() {
         .dropzone:hover { background: var(--accent-soft); border-color: var(--accent); }
         .preview-img { max-width: 100%; max-height: 260px; border-radius: 6px; border: 1px solid var(--rule); margin-top: 12px; }
         .error-box { display: flex; gap: 8px; align-items: flex-start; background: var(--warn-soft); border: 1px solid var(--ledger-red); color: #6b241a; padding: 10px 12px; border-radius: 5px; font-size: 12.5px; margin: 10px 0; }
+        .info-box { display: flex; gap: 8px; align-items: flex-start; background: var(--accent-soft); border: 1px solid var(--rule); color: var(--ink); padding: 10px 12px; border-radius: 5px; font-size: 12.5px; margin: 10px 0; }
         .field-row { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
         .text-input { padding: 8px 10px; border-radius: 5px; border: 1px solid var(--rule); font: inherit; font-size: 13px; }
         .check-result { margin-top: 16px; }
@@ -2472,10 +2473,10 @@ function FIMSApp() {
                         </button>
                       )}
                     </div>
-                    {(unmatched.length > 0) && (
-                      <div className="error-box" style={{ marginTop: 10 }}>
-                        <AlertCircle size={16} />
-                        <span>{unmatched.length} item{unmatched.length === 1 ? '' : 's'} didn't match any catalog entry for {customer}, so they'll be pushed under their own tab instead of grouped correctly: {unmatched.join(', ')}. Fix this in Customer Mapping / Known Product Catalog before pushing, or ignore if that's intended.</span>
+                    {(unmatched.length > 0 && sheetId.trim()) && (
+                      <div className="info-box" style={{ marginTop: 10 }}>
+                        <Info size={16} />
+                        <span>{unmatched.length} item{unmatched.length === 1 ? '' : 's'} in your Production/Dispatch records don't exactly match a known item name for {customer}, so pushing will give them their own tab instead of grouping into an existing one: {unmatched.join(', ')}. If these are real products, add them to the Known Product Catalog (Customer Mapping tab) with the exact wording your ledger uses. Safe to ignore otherwise — nothing breaks, they just land in their own tab.</span>
                       </div>
                     )}
                     {status.state === 'done' && <div className="doc-hint" style={{ color: 'var(--ok)', marginTop: 10 }}>✓ {status.message}</div>}
