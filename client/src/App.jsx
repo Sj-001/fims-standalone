@@ -3,7 +3,7 @@ import * as XLSX from 'xlsx';
 import {
   Upload, Image as ImageIcon, Package, Boxes, Search, Truck, ClipboardList,
   FileSpreadsheet, Download, CheckCircle2, XCircle, Trash2, Loader2,
-  AlertCircle, LayoutDashboard, FileText, Archive, ListChecks, Plus
+  AlertCircle, LayoutDashboard, FileText, Archive, ListChecks, Plus, RefreshCw, Link2
 } from 'lucide-react';
 /* ============================== helpers ============================== */
 const num = (v) => {
@@ -262,95 +262,25 @@ const STORAGE_KEYS = {
   daburDispatch: 'fims_dabur_dispatch',
 };
 const CATALOG_KEY = 'fims_product_catalog';
-// Exact item names pulled from the "summary" sheet of each customer's stock file — used to correct
-// handwriting misreads during extraction (e.g. "g" vs "9", "&" vs "8"). Extendable via the Customer
-// Mapping tab by uploading more customer stock files, or editing directly.
-// `sheetGroup` is the tab name this item lands under in that customer's own Google Sheet (see the
-// "Customer Sheets" tab) — several variants of the same base item (e.g. "IT 500 Lid" and "IT 500
-// Container") share one tab, exactly matching how BINDAL_STOCK.xlsx / DIAMOND.xlsx / anmol stock
-// dec 22.xlsx are actually laid out (verified by opening those real files directly, not guessed).
+// Exact item names, one per customer — used to correct handwriting misreads during extraction (e.g.
+// "g" vs "9", "&" vs "8"). Starts EMPTY on purpose: every customer's items get added by importing
+// their Google Sheet ID (see the Customer Sheets tab) rather than being hardcoded here, so this app
+// works for whichever customers you actually have, not just the three it happened to be built
+// against. `sheetGroup` is the tab name this item lands under in that customer's own Google Sheet —
+// several variants of the same base item (e.g. "IT 500 Lid" and "IT 500 Container") share one tab.
 const catalogEntries = (customer, pairs) => pairs.map(([item, sheetGroup]) => ({ id: genId(), customer, item, sheetGroup }));
-const DEFAULT_PRODUCT_CATALOG = [
-  ...catalogEntries('Bindal', [
-    ['IT 500 Lid', 'IT 500'], ['IT 500 Container', 'IT 500'], ['IT 500 Jumbo Container', 'IT 500'],
-    ['N 100 Jumbo Lid', 'N 100'], ['N 100 Jumbo Container', 'N 100'], ['N100 MF Container', 'N 100'], ['N 100 J XL Container', 'N 100'],
-    ['E 130 Container', 'E 130'], ['E 130 Lid', 'E 130'],
-    ['E 900 Container', 'E900'],
-    ['T Gel Container', 'T GEL'],
-    ['N200 Jumbo Container', 'N200'], ['N200 Jumbo Lid', 'N200'],
-    ['N150 Lid', 'N150'],
-    ['Tijori Handle', 'TIJORI HANDLE'],
-  ]),
-  ...catalogEntries('Diamond', [
-    ['Cream Burst 30g*140pkt', 'CREAM'], ['Cream Burst 30g*144pkt', 'CREAM'], ['Cream Burst 60g*70pkt', 'CREAM'],
-    ['Cashew Cookies 30g*140pkt', 'CASHEW'],
-    ['Coconut Dreamz 31g', 'COCONUT'], ['Coconut Dreamz 60g', 'COCONUT'], ['Coconut Plus 68g*60pkt', 'COCONUT'],
-    ['Blacko 32g', 'BLACKO'],
-    ['T50 64g*60pkt', 'T 50'], ['T50 32g*120pkt', 'T 50'],
-    ['Butter Plus 28g*140pkt', 'BUTTER'], ['Butter Plus 56g*70pkt', 'BUTTER'], ['Butter Plus 110g*36pkt', 'BUTTER'],
-    ['Kaju Cookies 28g*120pkt', 'KAJU'],
-    ['Jeera 35g*120pkt', 'JEERA'],
-    ['Doodh Power 35g*120pkt', 'DOODH'], ['Doodh Power 35g*200pkt', 'DOODH'], ['Doodh Power 68g*80pkt', 'DOODH'],
-    ['Love At First Bite', 'LOVE AT'],
-    ['Tooti Fruti 28g*120pkt', 'TOOTI FRUTI'],
-  ]),
-  ...catalogEntries('Anmol', [
-    ['Coconutty 36', 'coconutty'], ['Coconutty 72', 'coconutty'],
-    ['Coconut Cookies 35g', 'COCONUT COOKIES'], ['Coconut Cookies 70g', 'COCONUT COOKIES'],
-    ['Coconut Premium 100g', 'coconut premium cookies'], ['Coconut Premium 156g', 'coconut premium cookies'],
-    ['Butter Bake 65g*60pkt', 'BUTTER BAKE'], ['Butter Bake 36.5g*144pkt', 'BUTTER BAKE'], ['Butter Bake 64g', 'BUTTER BAKE'], ['Butter Bake 130g', 'BUTTER BAKE'], ['Butter Bake 32g', 'BUTTER BAKE'], ['Butter Bake 73g', 'BUTTER BAKE'],
-    ['Digestive 57g', 'Digestive'], ['Digestive 120g', 'Digestive'],
-    ['Hit & Run 120g', 'hit & run'], ['Hit & Run 64g', 'hit & run'], ['Hit & Run 30g', 'hit & run'], ['Hit & Run 65g', 'hit & run'], ['Hit & Run 128g', 'hit & run'], ['Hit & Run 32g', 'hit & run'],
-    ['Milk Made 75g*40pkt', 'MILK MADE'], ['Milk Made 150g*30pkt', 'MILK MADE'], ['Milk Made 75g*60pkt', 'MILK MADE'], ['Milk Made 35g*144pkt', 'MILK MADE'], ['Milk Made 70g*60pkt', 'MILK MADE'],
-    ['Kaju Bake 30g', 'kaju bake'], ['Kaju Bake 130g', 'kaju bake'], ['Kaju Bake 65g', 'kaju bake'], ['Kaju Bake 202g', 'kaju bake'], ['Kaju Bake 120g', 'kaju bake'],
-    ['Jeera Dhamal 70g', 'jeera'], ['Jeera Dhamal 35g', 'jeera'],
-    ['Bakerbix', 'bakerbix'],
-    ['Nice', 'NICE'],
-    ['Diwali Gift', 'DIWALI.GIFT'],
-  ]),
-];
+const DEFAULT_PRODUCT_CATALOG = [];
 const CUSTOMER_MAPPING_KEY = 'fims_customer_mapping';
 // Which external Google Sheet ID each customer's own stock sheet lives at (see the "Customer
-// Sheets" tab) — a separate, customer-owned spreadsheet, never a tab on the main FIMS sheet.
+// Sheets" tab) — a separate, customer-owned spreadsheet, never a tab on the main FIMS sheet. Also
+// doubles as the "already imported" registry for the Customer Sheets CRUD workflow (tracks when
+// each customer's sheet was last imported from / pushed to).
 const CUSTOMER_SHEET_IDS_KEY = 'fims_customer_sheet_ids';
 // Lower-priority fallback keywords — only used when a ledger entry doesn't exactly match one of the
-// catalog's known item names above (e.g. a pack-size variant that isn't in the catalog yet).
-const FALLBACK_CUSTOMER_MAPPING = [
-  { id: genId(), keyword: 'tijori handle', customer: 'Bindal' },
-  { id: genId(), keyword: 'n-200', customer: 'Bindal' }, { id: genId(), keyword: 'n200', customer: 'Bindal' },
-  { id: genId(), keyword: 'e-130', customer: 'Bindal' }, { id: genId(), keyword: 'e130', customer: 'Bindal' }, { id: genId(), keyword: 'e 130', customer: 'Bindal' },
-  { id: genId(), keyword: 'e900', customer: 'Bindal' }, { id: genId(), keyword: 'e 900', customer: 'Bindal' },
-  { id: genId(), keyword: 't gel', customer: 'Bindal' }, { id: genId(), keyword: 't-gel', customer: 'Bindal' },
-  { id: genId(), keyword: 'n-100', customer: 'Bindal' }, { id: genId(), keyword: 'n100', customer: 'Bindal' }, { id: genId(), keyword: 'n 100', customer: 'Bindal' },
-  { id: genId(), keyword: 'it 500', customer: 'Bindal' }, { id: genId(), keyword: 'it500', customer: 'Bindal' }, { id: genId(), keyword: 'it-500', customer: 'Bindal' },
-  { id: genId(), keyword: 'n150', customer: 'Bindal' }, { id: genId(), keyword: 'n-150', customer: 'Bindal' }, { id: genId(), keyword: 'n 150', customer: 'Bindal' },
-  { id: genId(), keyword: 'box no', customer: 'Bindal' },
-  { id: genId(), keyword: 'coconut dreamz', customer: 'Diamond' }, { id: genId(), keyword: 'coconut dream', customer: 'Diamond' },
-  { id: genId(), keyword: 'coconut plus', customer: 'Diamond' },
-  { id: genId(), keyword: 'butter plus', customer: 'Diamond' },
-  { id: genId(), keyword: 'kaju cookies', customer: 'Diamond' },
-  { id: genId(), keyword: 'doodh', customer: 'Diamond' },
-  { id: genId(), keyword: 'blacko', customer: 'Diamond' },
-  { id: genId(), keyword: 'tooti fruti', customer: 'Diamond' }, { id: genId(), keyword: 'tooti frooti', customer: 'Diamond' },
-  { id: genId(), keyword: 'cashew', customer: 'Diamond' },
-  { id: genId(), keyword: 'love at', customer: 'Diamond' },
-  { id: genId(), keyword: 't-50', customer: 'Diamond' }, { id: genId(), keyword: 't 50', customer: 'Diamond' }, { id: genId(), keyword: 't50', customer: 'Diamond' }, { id: genId(), keyword: 't-so', customer: 'Diamond' },
-  { id: genId(), keyword: 'cream', customer: 'Diamond' },
-  { id: genId(), keyword: 'digestive', customer: 'Anmol' },
-  { id: genId(), keyword: 'milk made', customer: 'Anmol' },
-  { id: genId(), keyword: 'butter smiley', customer: 'Anmol' },
-  { id: genId(), keyword: 'butter bake', customer: 'Anmol' },
-  { id: genId(), keyword: 'nice', customer: 'Anmol' },
-  { id: genId(), keyword: 'kaju bake', customer: 'Anmol' },
-  { id: genId(), keyword: 'coconut cookies', customer: 'Anmol' },
-  { id: genId(), keyword: 'coconut premium', customer: 'Anmol' },
-  { id: genId(), keyword: 'coconutty', customer: 'Anmol' },
-  { id: genId(), keyword: 'jeera dhamal', customer: 'Anmol' }, { id: genId(), keyword: 'jeera dhamaal', customer: 'Anmol' }, { id: genId(), keyword: 'jeera dhamel', customer: 'Anmol' },
-  { id: genId(), keyword: 'jeera', customer: 'Diamond' },
-  { id: genId(), keyword: 'bakerbix', customer: 'Anmol' }, { id: genId(), keyword: 'bakers bix', customer: 'Anmol' }, { id: genId(), keyword: 'baker bix', customer: 'Anmol' },
-  { id: genId(), keyword: 'hit & run', customer: 'Anmol' }, { id: genId(), keyword: 'hit8 run', customer: 'Anmol' }, { id: genId(), keyword: 'hit & rum', customer: 'Anmol' }, { id: genId(), keyword: 'hit8 rum', customer: 'Anmol' }, { id: genId(), keyword: 'hits rum', customer: 'Anmol' }, { id: genId(), keyword: 'hit 8 rum', customer: 'Anmol' },
-  { id: genId(), keyword: 'diwali', customer: 'Anmol' },
-];
+// catalog's known item names above (e.g. a pack-size variant that isn't in the catalog yet). Starts
+// empty along with the catalog above; importing a customer sheet adds both an exact-name rule per
+// item and a broader fallback rule automatically (see confirmSheetImport).
+const FALLBACK_CUSTOMER_MAPPING = [];
 // The mapping actually used: one EXACT-item-name rule per catalog entry (checked first, most reliable),
 // then the broader fallback keywords above for anything that doesn't hit an exact match.
 const DEFAULT_CUSTOMER_MAPPING = [
@@ -1549,6 +1479,150 @@ function FIMSApp() {
     persistCustomerSheetIds(next);
   };
   const getCustomerSheetId = (customer) => (customerSheetIds.find(c => c.customer === customer) || {}).sheetId || '';
+  // Merges any fields (sheetId, lastImportedAt, lastPushedAt, itemCount) into a customer's tracked-sheet
+  // registry entry, creating it if it doesn't exist yet. This registry entry IS the "already imported"
+  // record the CRUD workflow below needs — it's the same array that already backed the manual Sheet ID
+  // field for Push, just extended with tracking metadata.
+  const patchCustomerSheetEntry = (customer, patch) => {
+    const exists = customerSheetIds.some(c => c.customer === customer);
+    const next = exists
+      ? customerSheetIds.map(c => c.customer === customer ? { ...c, ...patch } : c)
+      : [...customerSheetIds, { id: genId(), customer, sheetId: '', ...patch }];
+    persistCustomerSheetIds(next);
+  };
+  // Delete: stops tracking a customer's Sheet ID (so it's no longer counted as "already imported" and
+  // the manual Push field for it clears). Deliberately does NOT touch productCatalog/customerMapping —
+  // those items were confirmed by a human at import time and stay until removed one-by-one from the
+  // Known Product Catalog table, exactly like any other catalog edit.
+  const removeCustomerSheetEntry = (customer) => {
+    persistCustomerSheetIds(customerSheetIds.filter(c => c.customer !== customer));
+  };
+  /* -------- Customer Sheets: IMPORT direction (Create + Update/re-sync of the CRUD workflow) --------
+     Reads an arbitrary customer's own Google Sheet by ID (no hardcoded per-customer identity — any
+     Sheet ID can be pasted in) via the backend's /api/customer-sheets/import, and turns its item list
+     into a review screen before anything is actually added — same "review before confirm" pattern as
+     the existing .xlsx upload import above, just sourced from a live Sheet instead of a file.
+     mode: 'create' treats every returned item as a candidate to add for a NEW (or existing) customer,
+     whose name is suggested from the sheet's own title. mode: 'resync' is the "Update" half of CRUD:
+     it's scoped to one already-tracked customer and keeps ONLY items that aren't already in that
+     customer's catalog — additive-only, so it can never silently overwrite a sheetGroup someone edited
+     by hand in the Known Product Catalog table. */
+  const [sheetImportBusy, setSheetImportBusy] = useState(false);
+  const [sheetImportError, setSheetImportError] = useState('');
+  const [newSheetId, setNewSheetId] = useState('');
+  const [sheetReview, setSheetReview] = useState(null); // { spreadsheetId, spreadsheetTitle, customerName, mode, resyncCustomer, items, skippedExisting }
+  const [importResultMessage, setImportResultMessage] = useState('');
+  const importSheetById = async (spreadsheetId, { mode = 'create', resyncCustomer = '' } = {}) => {
+    const id = (spreadsheetId || '').trim();
+    if (!id) { setSheetImportError('Paste a Google Sheet ID first.'); return; }
+    setSheetImportError(''); setImportResultMessage(''); setSheetReview(null); setSheetImportBusy(true);
+    try {
+      const res = await fetch('/api/customer-sheets/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ spreadsheetId: id }),
+      });
+      if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return; }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        setSheetImportError(data.error || `Could not read that sheet (HTTP ${res.status}). Make sure it's been shared with the service account's email, same as your main FIMS sheet.`);
+        return;
+      }
+      if (!data.items || !data.items.length) {
+        setSheetImportError(`No items found (checked ${data.tabCount || 0} tab${data.tabCount === 1 ? '' : 's'}, excluding "summary"). Nothing to import.`);
+        return;
+      }
+      const customerName = mode === 'resync' ? resyncCustomer : (data.spreadsheetTitle || '').trim();
+      const existingItemNames = new Set(productCatalog.filter(c => c.customer === customerName).map(c => c.item.toLowerCase().trim()));
+      let items = data.items.map(it => ({
+        id: genId(), item: it.item, sheetGroup: it.sheetGroup || it.item, include: true,
+        isNew: !existingItemNames.has(String(it.item || '').toLowerCase().trim()),
+      }));
+      let skippedExisting = 0;
+      if (mode === 'resync') {
+        skippedExisting = items.filter(it => !it.isNew).length;
+        items = items.filter(it => it.isNew); // additive-only re-sync — never re-offer/overwrite items already in the catalog
+      }
+      if (mode === 'resync' && !items.length) {
+        setImportResultMessage(`${customerName}: re-synced — no new items found (${skippedExisting} already in the catalog).`);
+        patchCustomerSheetEntry(customerName, { sheetId: id, lastImportedAt: new Date().toISOString() });
+        return;
+      }
+      setSheetReview({ spreadsheetId: id, spreadsheetTitle: data.spreadsheetTitle || '', customerName, mode, resyncCustomer, items, skippedExisting });
+    } catch (e) {
+      setSheetImportError(e.message || 'Network error — could not reach the server.');
+    } finally {
+      setSheetImportBusy(false);
+    }
+  };
+  const updateSheetReviewItem = (id, field, value) => {
+    setSheetReview(prev => ({ ...prev, items: prev.items.map(it => it.id === id ? { ...it, [field]: value } : it) }));
+  };
+  // Same catalog-then-mapping confirm logic as confirmCatalogImport (exact-name rule per item, checked
+  // first, plus a broader fallback keyword), then registers/updates this Sheet ID in the tracked-sheet
+  // registry, then re-checks every confirmed-but-Unassigned production/dispatch row against the newly
+  // widened mapping — the "if you find anything that matches in unassigned, add it to the respective
+  // customer sheet" half of the request.
+  const confirmSheetImport = () => {
+    if (!sheetReview || !sheetReview.customerName.trim()) return;
+    const customer = sheetReview.customerName.trim();
+    const included = sheetReview.items.filter(it => it.include && it.item.trim());
+    const existingItems = new Set(productCatalog.map(c => `${c.customer.toLowerCase()}||${c.item.toLowerCase()}`));
+    const newCatalogEntries = included
+      .filter(it => !existingItems.has(`${customer.toLowerCase()}||${it.item.trim().toLowerCase()}`))
+      .map(it => ({ id: genId(), customer, item: it.item.trim(), sheetGroup: (it.sheetGroup || it.item).trim() }));
+    const nextCatalog = [...productCatalog, ...newCatalogEntries];
+    persistCatalog(nextCatalog);
+    const existingKeywords = new Set(customerMapping.map(r => r.keyword.toLowerCase()));
+    const exactRules = [];
+    const fallbackRules = [];
+    included.forEach(it => {
+      const exact = it.item.trim().toLowerCase();
+      if (exact && !existingKeywords.has(exact)) { exactRules.push({ id: genId(), keyword: exact, customer }); existingKeywords.add(exact); }
+      const fallback = exact.replace(/[\d].*$/, '').trim();
+      if (fallback && fallback.length > 2 && !existingKeywords.has(fallback)) { fallbackRules.push({ id: genId(), keyword: fallback, customer }); existingKeywords.add(fallback); }
+    });
+    persistCustomerMapping([...exactRules, ...customerMapping, ...fallbackRules]);
+    patchCustomerSheetEntry(customer, {
+      sheetId: sheetReview.spreadsheetId,
+      lastImportedAt: new Date().toISOString(),
+      itemCount: nextCatalog.filter(c => c.customer === customer).length,
+    });
+    const reassignedCount = reassignUnassignedRows();
+    const verb = sheetReview.mode === 'resync' ? 'Re-synced' : 'Imported';
+    setImportResultMessage(
+      `${verb} ${customer}: added ${newCatalogEntries.length} new catalog item${newCatalogEntries.length === 1 ? '' : 's'}` +
+      (sheetReview.skippedExisting ? ` (${sheetReview.skippedExisting} already known, skipped)` : '') +
+      (reassignedCount ? `, reassigned ${reassignedCount} previously-Unassigned row${reassignedCount === 1 ? '' : 's'} to ${customer}` : '') + '.'
+    );
+    setSheetReview(null);
+    setNewSheetId('');
+  };
+  // Re-check every already-confirmed production/dispatch row still sitting as Unassigned against the
+  // (possibly just-widened) customer mapping. Only PENDING rows re-evaluate matchCustomer live on every
+  // render — a CONFIRMED row's confirmedCustomer is locked in at confirm-time, so a new customer's
+  // rules added after that row was confirmed would never reach it without this explicit re-pass.
+  // Returns the number of rows it moved off Unassigned, for the confirmation message above.
+  const reassignUnassignedRows = () => {
+    const reassignInRegister = (rows) => {
+      let count = 0;
+      const next = rows.map(r => {
+        if (!r.stockConfirmed) return r;
+        const current = (r.confirmedCustomer || '').trim();
+        if (current && current !== 'Unassigned') return r;
+        const match = matchCustomer(r);
+        if (match && match !== 'Unassigned') { count++; return { ...r, confirmedCustomer: match }; }
+        return r;
+      });
+      return { next, count };
+    };
+    const p = reassignInRegister(production);
+    const d = reassignInRegister(customerDispatch);
+    if (p.count) { setProduction(p.next); persist('production', p.next); }
+    if (d.count) { setCustomerDispatch(d.next); persist('customerDispatch', d.next); }
+    return p.count + d.count;
+  };
   const pushCustomerSheetNow = async (customer) => {
     const sheetId = getCustomerSheetId(customer).trim();
     if (!sheetId) {
@@ -1568,6 +1642,7 @@ function FIMSApp() {
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.ok) {
         setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Pushed ${itemGroups.length} item tab${itemGroups.length === 1 ? '' : 's'} + summary just now.`, unmatched } }));
+        patchCustomerSheetEntry(customer, { sheetId, lastPushedAt: new Date().toISOString() });
       } else {
         const failedTabs = (data.results || []).filter(r => !r.ok).map(r => `${r.tab}: ${r.error}`).join(' · ');
         setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: failedTabs || data.error || `Push failed (HTTP ${res.status}).`, unmatched } }));
@@ -2304,27 +2379,84 @@ function FIMSApp() {
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Customer Sheets</h2>
                 <p className="subtitle" style={{ marginBottom: 4 }}>Push a customer's stock ledger out to THEIR OWN separate Google Sheet — not a tab on this app's main sheet — laid out the same way as your original BINDAL STOCK.xlsx / DIAMOND.xlsx / anmol stock files: one tab per base item, every variant of that item as its own side-by-side table within that tab, plus a "summary" tab listing every variant's current balance.</p>
-                <p className="subtitle" style={{ marginBottom: 4 }}>This only happens when you click "Push to Sheet" below — nothing is pushed automatically. A push fully overwrites that customer's sheet with the latest computed data, so if anyone hand-edits it directly, those edits will be lost on the next push.</p>
+                <p className="subtitle" style={{ marginBottom: 4 }}>Pushing only happens when you click "Push to Sheet" below — nothing is pushed automatically. A push fully overwrites that customer's sheet with the latest computed data, so if anyone hand-edits it directly, those edits will be lost on the next push.</p>
                 <p className="subtitle">Setup per customer, once: create or open their Google Sheet, share it with your service account's email (the same one you shared your main FIMS sheet with) as an Editor, then paste that sheet's ID below — the long ID in its URL, between <code>/d/</code> and <code>/edit</code>.</p>
               </div>
-              {allCustomerTabNames.length === 0 && <div className="panel"><div className="empty-state">No customers yet — add one via Customer Mapping first.</div></div>}
+              <div className="panel">
+                <div className="panel-header">
+                  <div><h2>Add a Customer Sheet</h2><p className="subtitle">Works for any customer — paste any Google Sheet ID (shared with the service account first) and it's read back to fill in the item catalog and mapping, same as before, without needing to know the customer's name ahead of time. Also tracks which Sheet IDs you've already imported.</p></div>
+                </div>
+                <div className="field-row">
+                  <input className="text-input" style={{ minWidth: 340, flex: 1 }} placeholder="Paste a Google Sheet ID" value={newSheetId} onChange={e => setNewSheetId(e.target.value)} autoComplete="off" spellCheck={false} />
+                  <button className="btn btn-primary" onClick={() => importSheetById(newSheetId, { mode: 'create' })} disabled={sheetImportBusy || !newSheetId.trim()}>
+                    {sheetImportBusy ? <Loader2 size={15} className="spin" /> : <Link2 size={15} />} Fetch &amp; Import
+                  </button>
+                </div>
+                {sheetImportError && <div className="error-box" style={{ marginTop: 10 }}><AlertCircle size={16} /><span>{sheetImportError}</span></div>}
+                {importResultMessage && !sheetReview && <div className="doc-hint" style={{ color: 'var(--ok)', marginTop: 10 }}>✓ {importResultMessage}</div>}
+                {sheetReview && (
+                  <div className="review-box">
+                    <p className="subtitle" style={{ marginBottom: 6 }}>
+                      {sheetReview.mode === 'resync' ? `Re-syncing ${sheetReview.customerName} — showing only items not already in the catalog.` : `Imported from "${sheetReview.spreadsheetTitle || sheetReview.spreadsheetId}".`}
+                    </p>
+                    <div className="field-row">
+                      <span style={{ fontSize: 13, fontWeight: 600 }}>Customer name:</span>
+                      <input className="text-input" value={sheetReview.customerName} disabled={sheetReview.mode === 'resync'} onChange={e => setSheetReview(prev => ({ ...prev, customerName: e.target.value }))} />
+                    </div>
+                    <p className="subtitle" style={{ marginBottom: 10 }}>{sheetReview.items.length} new item{sheetReview.items.length === 1 ? '' : 's'} found{sheetReview.skippedExisting ? ` (${sheetReview.skippedExisting} already known, not shown)` : ''}. Uncheck anything that isn't really a product, fix any typos, adjust which Sheet Tab each lands under, then confirm.</p>
+                    <div className="table-wrap">
+                      <table>
+                        <thead><tr><th style={{ width: 34 }}></th><th>Item name</th><th>Sheet Tab (item group)</th></tr></thead>
+                        <tbody>
+                          {sheetReview.items.map(it => (
+                            <tr key={it.id}>
+                              <td style={{ textAlign: 'center' }}><input type="checkbox" checked={it.include} onChange={e => updateSheetReviewItem(it.id, 'include', e.target.checked)} /></td>
+                              <td><input className="cell-input" value={it.item} onChange={e => updateSheetReviewItem(it.id, 'item', e.target.value)} /></td>
+                              <td><input className="cell-input" value={it.sheetGroup} onChange={e => updateSheetReviewItem(it.id, 'sheetGroup', e.target.value)} /></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="review-actions">
+                      <button className="btn btn-primary" onClick={confirmSheetImport} disabled={!sheetReview.customerName.trim()}><CheckCircle2 size={15} /> Add to catalog &amp; mapping</button>
+                      <button className="btn btn-ghost" onClick={() => setSheetReview(null)}><XCircle size={15} /> Discard</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+              {allCustomerTabNames.length === 0 && <div className="panel"><div className="empty-state">No customers yet — add one above.</div></div>}
               {allCustomerTabNames.map(customer => {
                 const status = pushStatus[customer] || {};
                 const { itemGroups, summary, unmatched } = buildCustomerSheetPayload(customer);
                 const sheetId = getCustomerSheetId(customer);
+                const registryEntry = customerSheetIds.find(c => c.customer === customer);
                 return (
                   <div className="panel" key={customer}>
                     <div className="panel-header">
                       <div>
                         <h2>{customer}</h2>
-                        <p className="subtitle">{itemGroups.length} item tab{itemGroups.length === 1 ? '' : 's'} · {summary.rows.length} variant{summary.rows.length === 1 ? '' : 's'} ready to push</p>
+                        <p className="subtitle">{itemGroups.length} item tab{itemGroups.length === 1 ? '' : 's'} · {summary.rows.length} variant{summary.rows.length === 1 ? '' : 's'} ready to push
+                          {registryEntry?.lastImportedAt && <> · last imported {new Date(registryEntry.lastImportedAt).toLocaleString()}</>}
+                          {registryEntry?.lastPushedAt && <> · last pushed {new Date(registryEntry.lastPushedAt).toLocaleString()}</>}
+                        </p>
                       </div>
-                      <button className="btn btn-primary" onClick={() => pushCustomerSheetNow(customer)} disabled={status.state === 'pushing' || !sheetId.trim()}>
-                        {status.state === 'pushing' ? <Loader2 size={15} className="spin" /> : <FileSpreadsheet size={15} />} Push to Sheet
-                      </button>
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <button className="btn btn-ghost" onClick={() => importSheetById(sheetId, { mode: 'resync', resyncCustomer: customer })} disabled={sheetImportBusy || !sheetId.trim()} title="Re-check this customer's Sheet for newly added items and add them to the catalog">
+                          <RefreshCw size={15} /> Re-sync
+                        </button>
+                        <button className="btn btn-primary" onClick={() => pushCustomerSheetNow(customer)} disabled={status.state === 'pushing' || !sheetId.trim()}>
+                          {status.state === 'pushing' ? <Loader2 size={15} className="spin" /> : <FileSpreadsheet size={15} />} Push to Sheet
+                        </button>
+                      </div>
                     </div>
                     <div className="field-row">
                       <input className="text-input" style={{ minWidth: 340, flex: 1 }} placeholder="Google Sheet ID for this customer" value={sheetId} onChange={e => updateCustomerSheetId(customer, e.target.value)} autoComplete="off" spellCheck={false} />
+                      {registryEntry && (
+                        <button className="btn btn-ghost" onClick={() => { if (window.confirm(`Stop tracking ${customer}'s Sheet ID? This only removes the tracking record — nothing is deleted from the Known Product Catalog or Customer Mapping.`)) removeCustomerSheetEntry(customer); }} title="Stop tracking this Sheet ID (catalog items stay)">
+                          <Trash2 size={15} /> Remove tracking
+                        </button>
+                      )}
                     </div>
                     {(unmatched.length > 0) && (
                       <div className="error-box" style={{ marginTop: 10 }}>
@@ -2334,7 +2466,7 @@ function FIMSApp() {
                     )}
                     {status.state === 'done' && <div className="doc-hint" style={{ color: 'var(--ok)', marginTop: 10 }}>✓ {status.message}</div>}
                     {status.state === 'error' && <div className="error-box" style={{ marginTop: 10 }}><AlertCircle size={16} /><span>{status.message}</span></div>}
-                    {!sheetId.trim() && <div className="doc-hint" style={{ marginTop: 10 }}>Add a Sheet ID above to enable pushing.</div>}
+                    {!sheetId.trim() && <div className="doc-hint" style={{ marginTop: 10 }}>Add a Sheet ID above to enable pushing or re-syncing.</div>}
                   </div>
                 );
               })}

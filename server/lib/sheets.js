@@ -272,7 +272,85 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, summary) {
   return results;
 }
 
+// --- Customer Sheets: IMPORT direction — read an existing customer's own Google Sheet (any
+// spreadsheet ID the user pastes in, not just ones this app created) and derive its item list, with
+// which tab each item belongs to, so it can be added to the Product Catalog and Customer Mapping.
+// This is the read-side counterpart to pushCustomerSheet above; it's only ever used to populate the
+// catalog, never to overwrite anything in this app's own data automatically.
+//
+// The extraction heuristic was verified by hand against the three real customer files this app was
+// built to replace (BINDAL STOCK.xlsx, DIAMOND.xlsx, anmol stock dec 22.xlsx — every one of their
+// ~35 item tabs, side by side variant blocks included) before being written as code: within a tab,
+// find the row containing a cell that reads exactly "date" (case-insensitive) — every real file uses
+// that as the ledger header, however differently the rest of the tab is labeled ("balance" vs.
+// "CLOSING BAL.", different starting rows/columns, etc.). Each column in that row that says "date"
+// marks the start of one variant's block; that variant's title sits in the row(s) directly above
+// (searched upward a few rows to tolerate an occasional blank spacer row).
+function extractItemsFromTabGrid(tabName, grid) {
+  let headerRowIdx = -1;
+  for (let r = 0; r < grid.length; r++) {
+    if ((grid[r] || []).some(c => String(c || '').trim().toLowerCase() === 'date')) { headerRowIdx = r; break; }
+  }
+  if (headerRowIdx === -1) {
+    // No recognizable ledger header in this tab — fall back to treating the whole tab as one item,
+    // named after the tab itself, rather than silently skipping it.
+    return [{ item: tabName, sheetGroup: tabName }];
+  }
+  const headerRow = grid[headerRowIdx] || [];
+  const items = [];
+  headerRow.forEach((cell, c) => {
+    if (String(cell || '').trim().toLowerCase() !== 'date') return;
+    let title = '';
+    for (let back = 1; back <= 3 && headerRowIdx - back >= 0; back++) {
+      const v = (grid[headerRowIdx - back] || [])[c];
+      if (v !== undefined && v !== null && String(v).trim()) { title = String(v).trim(); break; }
+    }
+    if (title) items.push({ item: title, sheetGroup: tabName });
+  });
+  if (!items.length) return [{ item: tabName, sheetGroup: tabName }];
+  return items;
+}
+
+// Reads every non-"summary" tab of the given spreadsheet and returns the full item list, plus the
+// spreadsheet's own title (used as a suggested customer name — editable by the person importing it,
+// same as the existing file-upload import flow already lets them edit the suggested name).
+async function importCustomerSheet(spreadsheetId) {
+  const sheets = getSheetsClient();
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: 'properties.title,sheets.properties.title',
+  });
+  const spreadsheetTitle = (meta.data.properties && meta.data.properties.title) || '';
+  const allTabTitles = (meta.data.sheets || []).map(s => s.properties.title);
+  const dataTabTitles = allTabTitles.filter(t => !/summary/i.test(t));
+  if (!dataTabTitles.length) {
+    return { spreadsheetTitle, tabCount: allTabTitles.length, items: [] };
+  }
+  const resp = await sheets.spreadsheets.values.batchGet({ spreadsheetId, ranges: dataTabTitles });
+  const items = [];
+  (resp.data.valueRanges || []).forEach((vr, idx) => {
+    const tabName = dataTabTitles[idx];
+    const grid = vr.values || [];
+    extractItemsFromTabGrid(tabName, grid).forEach(it => items.push(it));
+  });
+  return { spreadsheetTitle, tabCount: allTabTitles.length, items };
+}
+
 // --- HTTP handlers ---
+async function importCustomerSheetHandler(req, res) {
+  try {
+    const { spreadsheetId } = req.body || {};
+    if (!spreadsheetId || !String(spreadsheetId).trim()) {
+      return res.status(400).json({ error: 'spreadsheetId is required.' });
+    }
+    const result = await importCustomerSheet(String(spreadsheetId).trim());
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('Customer sheet import error:', e);
+    res.status(502).json({ error: `Could not read from Google Sheets: ${e.message || 'unknown error'}` });
+  }
+}
+
 async function pushCustomerSheetHandler(req, res) {
   try {
     const { spreadsheetId, itemGroups, summary } = req.body || {};
@@ -323,4 +401,4 @@ async function putBlocksTab(req, res) {
   }
 }
 
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler };
+module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, importCustomerSheetHandler };

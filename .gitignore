@@ -2,6 +2,7 @@ node_modules/
 client/dist/
 client/build_check/
 client/build_check2/
+client/build_check3/
 *.log
 .env
 .DS_Store
