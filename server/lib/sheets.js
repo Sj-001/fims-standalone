@@ -98,11 +98,12 @@ function sanitizeTabName(name) {
 async function getSheetMeta(sheets, spreadsheetId) {
   const meta = await sheets.spreadsheets.get({
     spreadsheetId,
-    fields: 'sheets.properties(title,gridProperties(rowCount,columnCount))',
+    fields: 'sheets.properties(sheetId,title,gridProperties(rowCount,columnCount))',
   });
   const byTitle = {};
   (meta.data.sheets || []).forEach(s => {
     byTitle[s.properties.title] = {
+      sheetId: s.properties.sheetId,
       rowCount: (s.properties.gridProperties && s.properties.gridProperties.rowCount) || 1000,
       columnCount: (s.properties.gridProperties && s.properties.gridProperties.columnCount) || 26,
     };
@@ -265,10 +266,63 @@ function buildSummaryGrid(rows) {
   return grid;
 }
 
-// Pushes every item-group tab plus a summary tab to an external spreadsheet in one go. Reads tab
-// metadata once, creates any missing tabs in a single batchUpdate, then writes each tab — so a
-// 15-tab customer costs about 1 read + 1 batchUpdate + 15 writes, comfortably inside Google's
-// 60 writes/minute/user quota for what's an infrequent, manually-triggered action.
+// Highlight colors for the "what changed since last push" formatting below. HIGHLIGHT is a warm
+// tint (matches this app's own accent color, so it doesn't look like a jarring alert) applied to
+// any cell whose value is new or different from what was in the sheet before this push; NORMAL is
+// plain white, applied to everything else FIRST so last push's highlights don't linger forever.
+const HIGHLIGHT_COLOR = { red: 0.941, green: 0.886, blue: 0.769 };
+const NORMAL_COLOR = { red: 1, green: 1, blue: 1 };
+
+// Diffs a tab's about-to-be-written grid against what was actually in that tab before this push,
+// and returns the batchUpdate sub-requests that (a) reset the tab's whole used range back to plain
+// white, then (b) highlight only the cells that are new or changed. Cells that are blank in the new
+// grid are never highlighted even if they differ from before (a value being removed isn't "new
+// data" — in practice ledgers only ever grow, they don't retroactively blank out old rows). Adjacent
+// changed cells in the same row are merged into one range instead of one request per cell, so a
+// freshly appended ledger row (the overwhelmingly common case) costs one highlight request, not five.
+function buildHighlightRequestsForTab(sheetId, grid, prevGrid) {
+  if (sheetId === undefined || sheetId === null) return [];
+  const rows = Array.isArray(grid) ? grid : [];
+  const prev = Array.isArray(prevGrid) ? prevGrid : [];
+  const totalRows = Math.max(rows.length, prev.length, 1);
+  const totalCols = Math.max(1, ...rows.map(r => (r || []).length), ...prev.map(r => (r || []).length));
+  const requests = [{
+    repeatCell: {
+      range: { sheetId, startRowIndex: 0, endRowIndex: totalRows, startColumnIndex: 0, endColumnIndex: totalCols },
+      cell: { userEnteredFormat: { backgroundColor: NORMAL_COLOR } },
+      fields: 'userEnteredFormat.backgroundColor',
+    },
+  }];
+  const cellStr = (v) => (v === undefined || v === null) ? '' : String(v);
+  for (let r = 0; r < totalRows; r++) {
+    const oldRow = prev[r] || [];
+    const newRow = rows[r] || [];
+    let runStart = -1;
+    for (let c = 0; c <= totalCols; c++) {
+      const changed = c < totalCols && cellStr(newRow[c]) !== '' && cellStr(newRow[c]) !== cellStr(oldRow[c]);
+      if (changed && runStart === -1) runStart = c;
+      if (!changed && runStart !== -1) {
+        requests.push({
+          repeatCell: {
+            range: { sheetId, startRowIndex: r, endRowIndex: r + 1, startColumnIndex: runStart, endColumnIndex: c },
+            cell: { userEnteredFormat: { backgroundColor: HIGHLIGHT_COLOR } },
+            fields: 'userEnteredFormat.backgroundColor',
+          },
+        });
+        runStart = -1;
+      }
+    }
+  }
+  return requests;
+}
+
+// Pushes every item-group tab plus a summary tab to an external spreadsheet in one go, then
+// highlights whatever changed. Sequence: read tab metadata once, create any missing tabs in a single
+// batchUpdate (capturing their new numeric sheetId from the response), read every EXISTING tab's
+// current values in one batchGet (this is the "before" snapshot the highlight diff needs), write
+// each tab's new values, then apply ALL tabs' highlight formatting in one final batchUpdate. That's
+// 4 API calls total plus one values.update per tab — still just a handful of calls for an infrequent,
+// manually-triggered action, comfortably inside Google's 60 writes/minute/user quota.
 // itemGroups: [{ tabName, variants: [{ title, header, rows }] }]
 // summary: { rows: [{ item, quantity }] } (optional)
 async function pushCustomerSheet(spreadsheetId, itemGroups, summary) {
@@ -283,19 +337,54 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, summary) {
   const existingMeta = await getSheetMeta(sheets, spreadsheetId);
   const missing = Array.from(new Set(tabPlans.filter(p => !existingMeta[p.tabName]).map(p => p.tabName)));
   if (missing.length) {
-    await sheets.spreadsheets.batchUpdate({
+    const createResp = await sheets.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: { requests: missing.map(title => ({ addSheet: { properties: { title } } })) },
     });
+    (createResp.data.replies || []).forEach(reply => {
+      if (reply.addSheet) {
+        const p = reply.addSheet.properties;
+        existingMeta[p.title] = { sheetId: p.sheetId, rowCount: 1000, columnCount: 26 };
+      }
+    });
+  }
+  // "Before" snapshot for the highlight diff — only tabs that already had data are worth reading;
+  // a tab we just created above is empty, so its previous grid is simply []. UNFORMATTED_VALUE
+  // matters here: with the default FORMATTED_VALUE, a cell showing "1,220" wouldn't string-match the
+  // raw new value "1220" and would be wrongly flagged as changed every single push.
+  const preExistingTabNames = tabPlans.map(p => p.tabName).filter(t => existingMeta[t] && !missing.includes(t));
+  const previousValuesByTab = {};
+  if (preExistingTabNames.length) {
+    try {
+      const readResp = await sheets.spreadsheets.values.batchGet({
+        spreadsheetId, ranges: preExistingTabNames, valueRenderOption: 'UNFORMATTED_VALUE',
+      });
+      (readResp.data.valueRanges || []).forEach((vr, i) => { previousValuesByTab[preExistingTabNames[i]] = vr.values || []; });
+    } catch (e) {
+      console.error('Customer sheet pre-push read (for highlight diff) failed — pushing without highlights:', e);
+    }
   }
   const results = [];
+  const formatRequests = [];
   for (const plan of tabPlans) {
     try {
       const gridSize = existingMeta[plan.tabName] || { rowCount: 1000, columnCount: 26 };
       await writeValuesClearingStale(sheets, spreadsheetId, plan.tabName, plan.grid, gridSize);
       results.push({ tab: plan.tabName, ok: true });
+      const sheetId = existingMeta[plan.tabName] && existingMeta[plan.tabName].sheetId;
+      formatRequests.push(...buildHighlightRequestsForTab(sheetId, plan.grid, previousValuesByTab[plan.tabName] || []));
     } catch (e) {
       results.push({ tab: plan.tabName, ok: false, error: friendlyGoogleError(e) });
+    }
+  }
+  if (formatRequests.length) {
+    try {
+      await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: formatRequests } });
+    } catch (e) {
+      // Highlighting is cosmetic on top of a push that already succeeded — surface it as a per-tab
+      // warning rather than failing results that already reported ok:true above.
+      console.error('Customer sheet highlight formatting error:', e);
+      results.push({ tab: '(highlighting)', ok: false, error: `Data pushed fine, but highlighting changed cells failed: ${friendlyGoogleError(e)}` });
     }
   }
   return results;
