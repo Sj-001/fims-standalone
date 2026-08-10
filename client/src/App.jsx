@@ -1483,7 +1483,17 @@ function FIMSApp() {
     setCustomerSheetIds(next);
     scheduleSave('customer-sheet-ids', () => window.storage.set(CUSTOMER_SHEET_IDS_KEY, JSON.stringify(next), false).catch(() => {}));
   };
-  const updateCustomerSheetId = (customer, sheetId) => {
+  // Lets every Sheet ID field accept either the raw ID or the full URL you'd copy straight out of the
+  // browser's address bar (https://docs.google.com/spreadsheets/d/<ID>/edit#gid=0) — pulls just the ID
+  // out of the URL so what's actually stored/sent to the backend is always the plain ID either way.
+  // If it doesn't look like a Sheets URL, the input is trusted as-is (already a raw ID).
+  const extractSheetIdFromInput = (raw) => {
+    const s = (raw || '').trim();
+    const m = s.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    return m ? m[1] : s;
+  };
+  const updateCustomerSheetId = (customer, rawInput) => {
+    const sheetId = extractSheetIdFromInput(rawInput);
     const exists = customerSheetIds.some(c => c.customer === customer);
     const next = exists
       ? customerSheetIds.map(c => c.customer === customer ? { ...c, sheetId } : c)
@@ -2393,7 +2403,7 @@ function FIMSApp() {
                 <h2 style={{ marginBottom: 6 }}>Customer Sheets</h2>
                 <p className="subtitle" style={{ marginBottom: 4 }}>Push a customer's stock ledger out to THEIR OWN separate Google Sheet — not a tab on this app's main sheet — laid out the same way as your original BINDAL STOCK.xlsx / DIAMOND.xlsx / anmol stock files: one tab per base item, every variant of that item as its own side-by-side table within that tab, plus a "summary" tab listing every variant's current balance.</p>
                 <p className="subtitle" style={{ marginBottom: 4 }}>Pushing only happens when you click "Push to Sheet" below — nothing is pushed automatically. A push fully overwrites that customer's sheet with the latest computed data, so if anyone hand-edits it directly, those edits will be lost on the next push.</p>
-                <p className="subtitle">Setup per customer, once: create or open their Google Sheet, share it with the service account email below as an Editor, then paste that sheet's ID below — the long ID in its URL, between <code>/d/</code> and <code>/edit</code>. Skipping this share step is the #1 cause of "the caller does not have permission" errors.</p>
+                <p className="subtitle">Setup per customer, once: create or open their Google Sheet, share it with the service account email below as an Editor, then paste that sheet's link below — you can paste the whole browser address bar URL, no need to dig out just the ID. Skipping the share step is the #1 cause of "the caller does not have permission" errors.</p>
                 <div className="field-row" style={{ marginTop: 10 }}>
                   <span style={{ fontSize: 13, fontWeight: 600 }}>Share every customer Sheet with:</span>
                   {serviceAccountEmail
@@ -2409,7 +2419,7 @@ function FIMSApp() {
                   <div><h2>Add a Customer Sheet</h2><p className="subtitle">Works for any customer — paste any Google Sheet ID (shared with the service account first) and it's read back to fill in the item catalog and mapping, same as before, without needing to know the customer's name ahead of time. Also tracks which Sheet IDs you've already imported.</p></div>
                 </div>
                 <div className="field-row">
-                  <input className="text-input" style={{ minWidth: 340, flex: 1 }} placeholder="Paste a Google Sheet ID" value={newSheetId} onChange={e => setNewSheetId(e.target.value)} autoComplete="off" spellCheck={false} />
+                  <input className="text-input" style={{ minWidth: 340, flex: 1 }} placeholder="Paste the Google Sheet link or ID" value={newSheetId} onChange={e => setNewSheetId(extractSheetIdFromInput(e.target.value))} autoComplete="off" spellCheck={false} />
                   <button className="btn btn-primary" onClick={() => importSheetById(newSheetId, { mode: 'create' })} disabled={sheetImportBusy || !newSheetId.trim()}>
                     {sheetImportBusy ? <Loader2 size={15} className="spin" /> : <Link2 size={15} />} Fetch &amp; Import
                   </button>
@@ -2473,7 +2483,7 @@ function FIMSApp() {
                       </div>
                     </div>
                     <div className="field-row">
-                      <input className="text-input" style={{ minWidth: 340, flex: 1 }} placeholder="Google Sheet ID for this customer" value={sheetId} onChange={e => updateCustomerSheetId(customer, e.target.value)} autoComplete="off" spellCheck={false} />
+                      <input className="text-input" style={{ minWidth: 340, flex: 1 }} placeholder="Paste this customer's Google Sheet link or ID" value={sheetId} onChange={e => updateCustomerSheetId(customer, e.target.value)} autoComplete="off" spellCheck={false} />
                       {registryEntry && (
                         <button className="btn btn-ghost" onClick={() => { if (window.confirm(`Stop tracking ${customer}'s Sheet ID? This only removes the tracking record — nothing is deleted from the Known Product Catalog or Customer Mapping.`)) removeCustomerSheetEntry(customer); }} title="Stop tracking this Sheet ID (catalog items stay)">
                           <Trash2 size={15} /> Remove tracking
