@@ -1317,19 +1317,27 @@ function FIMSApp() {
   const updateCatalogReviewItem = (id, field, value) => {
     setCatalogReview(prev => ({ ...prev, items: prev.items.map(it => it.id === id ? { ...it, [field]: value } : it) }));
   };
+  // Shared dedup keys for both import flows below (file-upload AND Sheet-ID import) — trims BOTH
+  // sides before comparing. Catalog items imported from a Sheet are always already trimmed at
+  // extraction time, but a row added by hand through the UI might have stray leading/trailing
+  // whitespace; without trimming both sides symmetrically, a manually-entered "Hit & Run 120g " with
+  // a trailing space wouldn't match an incoming "Hit & Run 120g" and would get silently re-added as a
+  // duplicate. Same reasoning for mapping keywords.
+  const catalogDedupKey = (customer, item) => `${(customer || '').trim().toLowerCase()}||${(item || '').trim().toLowerCase()}`;
+  const mappingDedupKey = (keyword) => (keyword || '').trim().toLowerCase();
   const confirmCatalogImport = () => {
     if (!catalogReview || !catalogReview.customerName.trim()) return;
     const customer = catalogReview.customerName.trim();
     const included = catalogReview.items.filter(it => it.include && it.item.trim());
-    const existingItems = new Set(productCatalog.map(c => `${c.customer.toLowerCase()}||${c.item.toLowerCase()}`));
+    const existingItems = new Set(productCatalog.map(c => catalogDedupKey(c.customer, c.item)));
     const newCatalogEntries = included
-      .filter(it => !existingItems.has(`${customer.toLowerCase()}||${it.item.trim().toLowerCase()}`))
+      .filter(it => !existingItems.has(catalogDedupKey(customer, it.item)))
       // sheetGroup defaults to the item's own name (its own tab in that customer's Sheet) — edit it
       // in the Known Product Catalog table below to group several variants under one shared tab,
       // matching however that customer's real file actually groups them.
       .map(it => ({ id: genId(), customer, item: it.item.trim(), sheetGroup: it.item.trim() }));
     persistCatalog([...productCatalog, ...newCatalogEntries]);
-    const existingKeywords = new Set(customerMapping.map(r => r.keyword.toLowerCase()));
+    const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
     const exactRules = []; // high priority: the full exact item name
     const fallbackRules = []; // low priority: broader family keyword, in case ledger has an unlisted pack size
     included.forEach(it => {
@@ -1423,9 +1431,12 @@ function FIMSApp() {
      with every variant of that item as its own side-by-side table within that tab, plus a "summary"
      tab listing every variant's current closing balance. This is a write-only computed mirror (the
      Production Register and Customer Dispatch Bills stay the real source of truth) and is pushed
-     ONLY when you click "Push to Sheet" for that customer below — never automatically — because a
-     push always fully overwrites that tab's contents, and you should be the one deciding when a
-     customer-facing sheet gets overwritten, not a background timer. */
+     ONLY when you click "Push to Sheet" for that customer below — never automatically. The item/
+     variant tabs are MERGED, not overwritten: the backend reads what's already in each tab first and
+     only appends rows for dates it doesn't already have there — anything already in the sheet, pushed
+     by the app before or typed in by hand, is left completely untouched, so re-pushing never creates
+     duplicate rows. The summary tab is the one exception: it's a live snapshot of current balances,
+     so it's always fully refreshed on every push (there's nothing to "merge" in a running total). */
   const allCustomerTabNames = Array.from(new Set([
     ...productCatalog.map(c => c.customer),
     ...customerNames,
@@ -1590,13 +1601,13 @@ function FIMSApp() {
     if (!sheetReview || !sheetReview.customerName.trim()) return;
     const customer = sheetReview.customerName.trim();
     const included = sheetReview.items.filter(it => it.include && it.item.trim());
-    const existingItems = new Set(productCatalog.map(c => `${c.customer.toLowerCase()}||${c.item.toLowerCase()}`));
+    const existingItems = new Set(productCatalog.map(c => catalogDedupKey(c.customer, c.item)));
     const newCatalogEntries = included
-      .filter(it => !existingItems.has(`${customer.toLowerCase()}||${it.item.trim().toLowerCase()}`))
+      .filter(it => !existingItems.has(catalogDedupKey(customer, it.item)))
       .map(it => ({ id: genId(), customer, item: it.item.trim(), sheetGroup: (it.sheetGroup || it.item).trim() }));
     const nextCatalog = [...productCatalog, ...newCatalogEntries];
     persistCatalog(nextCatalog);
-    const existingKeywords = new Set(customerMapping.map(r => r.keyword.toLowerCase()));
+    const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
     const exactRules = [];
     const fallbackRules = [];
     included.forEach(it => {
@@ -2402,7 +2413,7 @@ function FIMSApp() {
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Customer Sheets</h2>
                 <p className="subtitle" style={{ marginBottom: 4 }}>Push a customer's stock ledger out to THEIR OWN separate Google Sheet — not a tab on this app's main sheet — laid out the same way as your original BINDAL STOCK.xlsx / DIAMOND.xlsx / anmol stock files: one tab per base item, every variant of that item as its own side-by-side table within that tab, plus a "summary" tab listing every variant's current balance.</p>
-                <p className="subtitle" style={{ marginBottom: 4 }}>Pushing only happens when you click "Push to Sheet" below — nothing is pushed automatically. A push fully overwrites that customer's sheet with the latest computed data, so if anyone hand-edits it directly, those edits will be lost on the next push.</p>
+                <p className="subtitle" style={{ marginBottom: 4 }}>Pushing only happens when you click "Push to Sheet" below — nothing is pushed automatically. Pushing MERGES: it never touches or duplicates a row that's already in the sheet, whether it got there from a previous push or someone typed it in by hand — it only adds rows for dates it doesn't already have. The summary tab is the exception; it's always refreshed to show current totals, since there's nothing to merge in a running total.</p>
                 <p className="subtitle">Setup per customer, once: create or open their Google Sheet, share it with the service account email below as an Editor, then paste that sheet's link below — you can paste the whole browser address bar URL, no need to dig out just the ID. Skipping the share step is the #1 cause of "the caller does not have permission" errors.</p>
                 <div className="field-row" style={{ marginTop: 10 }}>
                   <span style={{ fontSize: 13, fontWeight: 600 }}>Share every customer Sheet with:</span>

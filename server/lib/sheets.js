@@ -252,6 +252,120 @@ function buildSideBySideGrid(variants) {
   return grid;
 }
 
+const normalizeCellStr = (v) => (v === undefined || v === null) ? '' : String(v).trim();
+
+// Parses an EXISTING tab's grid into its variant blocks, using the same "find the row containing a
+// 'date' cell" heuristic used for import — so a merge-push can tell, per variant, exactly which dates
+// already have a row (whether the app put it there on a previous push, or a person typed it in by
+// hand) and exactly where that block's data currently ends, without touching any of it.
+function parseExistingBlocks(grid) {
+  const rows = Array.isArray(grid) ? grid : [];
+  let headerRowIdx = -1;
+  for (let r = 0; r < rows.length; r++) {
+    if ((rows[r] || []).some(c => normalizeCellStr(c).toLowerCase() === 'date')) { headerRowIdx = r; break; }
+  }
+  if (headerRowIdx === -1) return { headerRowIdx: -1, blocks: [] };
+  const headerRow = rows[headerRowIdx] || [];
+  const dateColIdxs = [];
+  headerRow.forEach((cell, c) => { if (normalizeCellStr(cell).toLowerCase() === 'date') dateColIdxs.push(c); });
+  const blocks = dateColIdxs.map((startCol, i) => {
+    const nextStart = dateColIdxs[i + 1] !== undefined ? dateColIdxs[i + 1] : Math.max(headerRow.length, startCol + 1);
+    let width = 1;
+    for (let c = startCol + 1; c < nextStart; c++) {
+      if (normalizeCellStr(headerRow[c])) width = c - startCol + 1; else break;
+    }
+    let title = '';
+    for (let back = 1; back <= 3 && headerRowIdx - back >= 0; back++) {
+      const v = (rows[headerRowIdx - back] || [])[startCol];
+      if (normalizeCellStr(v)) { title = normalizeCellStr(v); break; }
+    }
+    const existingDates = new Set();
+    let nextRowIdx = headerRowIdx + 1;
+    let lastRowValues = null;
+    for (let r = headerRowIdx + 1; r < rows.length; r++) {
+      const dateStr = normalizeCellStr((rows[r] || [])[startCol]);
+      if (!dateStr) break; // first blank date cell ends this block's existing data
+      existingDates.add(dateStr);
+      nextRowIdx = r + 1;
+      lastRowValues = [];
+      for (let c = startCol; c < startCol + width; c++) lastRowValues.push((rows[r] || [])[c]);
+    }
+    return { title, startCol, width, nextRowIdx, existingDates, lastRowValues };
+  });
+  return { headerRowIdx, blocks };
+}
+
+// Grows an EXISTING tab's grid instead of replacing it — this is the "merge, never touch existing
+// rows, no duplicates" push mode. For each variant being pushed:
+//   - if a block with that exact title already exists: every row already there (whether the app put
+//     it there before, or someone typed it in directly) is copied through completely unchanged; only
+//     rows for dates NOT already present get appended directly below the block's last existing row.
+//   - if no block with that title exists yet: a brand new block is appended to the right of every
+//     other block in the tab, aligned to the tab's own title/header row convention — identical to a
+//     first-ever push for that variant.
+// If the tab has no parseable blocks at all (first-ever push to a blank tab), every variant falls
+// into the "no existing block" case, which reproduces buildSideBySideGrid's layout exactly.
+//
+// Balance carry-forward: a variant's incoming rows carry the app's own from-scratch opening/closing
+// balance (computed purely from what's in this app's Production Register + Dispatch Bills). That's
+// only correct if the app's register covers a customer's ENTIRE history — for a customer sheet with
+// years of prior manual entries the app never saw, trusting that absolute number would silently
+// disagree with the real balance already sitting in the sheet. So for existing blocks, only the
+// PRODUCTION and DISPATCH quantities from the incoming rows are trusted as-is (they come straight
+// from confirmed register entries); the opening/closing balance is recomputed to continue seamlessly
+// from whatever this block's actual last existing closing balance is, read straight from the sheet.
+function buildMergedGrid(existingGrid, variants) {
+  const rows = (Array.isArray(existingGrid) ? existingGrid : []).map(r => (r || []).slice());
+  const { headerRowIdx, blocks } = parseExistingBlocks(rows);
+  const usedHeaderRowIdx = headerRowIdx === -1 ? 1 : headerRowIdx; // title row 0, header row 1 by default
+  let rightmostCol = blocks.reduce((max, b) => Math.max(max, b.startCol + b.width), -1);
+  const ensureCell = (r, c) => {
+    while (rows.length <= r) rows.push([]);
+    while (rows[r].length <= c) rows[r].push('');
+  };
+  const setCell = (r, c, val) => { ensureCell(r, c); rows[r][c] = (val === undefined || val === null) ? '' : val; };
+
+  (Array.isArray(variants) ? variants : []).forEach(v => {
+    const key = normalizeTabKey(v.title);
+    const match = blocks.find(b => normalizeTabKey(b.title) === key);
+    const header = (v.header && v.header.length) ? v.header : ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'];
+    const incomingRows = Array.isArray(v.rows) ? v.rows : [];
+    if (match) {
+      const newRows = incomingRows.filter(r => !match.existingDates.has(normalizeCellStr((r || [])[0])));
+      if (!newRows.length) return;
+      const closingColOffset = match.width - 1;
+      let runningBalance = match.lastRowValues ? (Number(match.lastRowValues[closingColOffset]) || 0) : 0;
+      newRows.forEach((r, i) => {
+        const row = r || [];
+        const production = Number(row[2]) || 0;
+        const dispatch = Number(row[3]) || 0;
+        const opening = runningBalance;
+        runningBalance = opening + production - dispatch;
+        const rowIdx = match.nextRowIdx + i;
+        setCell(rowIdx, match.startCol + 0, row[0] || '');
+        setCell(rowIdx, match.startCol + 1, opening);
+        setCell(rowIdx, match.startCol + 2, row[2] || 0);
+        setCell(rowIdx, match.startCol + 3, row[3] || 0);
+        setCell(rowIdx, match.startCol + 4, runningBalance);
+        for (let ci = 5; ci < row.length; ci++) setCell(rowIdx, match.startCol + ci, row[ci]); // any extra columns, copied as-is
+      });
+    } else {
+      const startCol = rightmostCol === -1 ? 0 : rightmostCol + 1;
+      const width = Math.max(header.length, ...incomingRows.map(r => (r || []).length), 1);
+      setCell(usedHeaderRowIdx - 1, startCol, v.title || '');
+      header.forEach((h, ci) => setCell(usedHeaderRowIdx, startCol + ci, h));
+      incomingRows.forEach((r, ri) => { (r || []).forEach((val, ci) => setCell(usedHeaderRowIdx + 1 + ri, startCol + ci, val)); });
+      rightmostCol = startCol + width;
+      blocks.push({
+        title: v.title, startCol, width, nextRowIdx: usedHeaderRowIdx + 1 + incomingRows.length,
+        existingDates: new Set(incomingRows.map(r => normalizeCellStr((r || [])[0]))),
+        lastRowValues: incomingRows.length ? incomingRows[incomingRows.length - 1] : null,
+      });
+    }
+  });
+  return rows;
+}
+
 // Builds the "summary" tab: S.No / Item Name / Quantity, one row per variant, plus a TOTAL row —
 // matching the summary sheet found in every one of the real customer files (verified directly).
 function buildSummaryGrid(rows) {
@@ -356,10 +470,14 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, summary) {
   const sheets = getSheetsClient();
   let tabPlans = (Array.isArray(itemGroups) ? itemGroups : []).map(g => ({
     tabName: g.tabName || 'Sheet',
-    grid: buildSideBySideGrid(g.variants || []),
+    variants: g.variants || [],
+    isSummary: false,
   }));
   if (summary && Array.isArray(summary.rows)) {
-    tabPlans.push({ tabName: 'summary', grid: buildSummaryGrid(summary.rows) });
+    // The summary tab is a live snapshot (current balance per item), not a dated ledger — there's
+    // nothing to "merge," it should always just show the latest computed totals, so it stays a full
+    // refresh every push. The item/variant tabs below are the ones that get the merge treatment.
+    tabPlans.push({ tabName: 'summary', isSummary: true, summaryRows: summary.rows });
   }
   const existingMeta = await getSheetMeta(sheets, spreadsheetId);
   let { resolved, missing } = resolveTabPlansAgainstExisting(tabPlans, existingMeta);
@@ -376,10 +494,11 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, summary) {
       }
     });
   }
-  // "Before" snapshot for the highlight diff — only tabs that already had data are worth reading;
-  // a tab we just created above is empty, so its previous grid is simply []. UNFORMATTED_VALUE
-  // matters here: with the default FORMATTED_VALUE, a cell showing "1,220" wouldn't string-match the
-  // raw new value "1220" and would be wrongly flagged as changed every single push.
+  // "Before" snapshot — needed for BOTH the merge (to know which rows already exist and where to
+  // append) and the highlight diff (to know what's actually new). Only tabs that already had data are
+  // worth reading; a tab just created above is empty, so its previous grid is simply []. UNFORMATTED_
+  // VALUE matters here: with the default FORMATTED_VALUE, a cell showing "1,220" wouldn't string-match
+  // the raw new value "1220" and would be wrongly flagged as changed/re-parsed every single push.
   const preExistingTabNames = tabPlans.map(p => p.tabName).filter(t => existingMeta[t] && !missing.includes(t));
   const previousValuesByTab = {};
   if (preExistingTabNames.length) {
@@ -397,10 +516,12 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, summary) {
   for (const plan of tabPlans) {
     try {
       const gridSize = existingMeta[plan.tabName] || { rowCount: 1000, columnCount: 26 };
-      await writeValuesClearingStale(sheets, spreadsheetId, plan.tabName, plan.grid, gridSize);
+      const previousGrid = previousValuesByTab[plan.tabName] || [];
+      const grid = plan.isSummary ? buildSummaryGrid(plan.summaryRows) : buildMergedGrid(previousGrid, plan.variants);
+      await writeValuesClearingStale(sheets, spreadsheetId, plan.tabName, grid, gridSize);
       results.push({ tab: plan.tabName, ok: true });
       const sheetId = existingMeta[plan.tabName] && existingMeta[plan.tabName].sheetId;
-      formatRequests.push(...buildHighlightRequestsForTab(sheetId, plan.grid, previousValuesByTab[plan.tabName] || []));
+      formatRequests.push(...buildHighlightRequestsForTab(sheetId, grid, previousGrid));
     } catch (e) {
       results.push({ tab: plan.tabName, ok: false, error: friendlyGoogleError(e) });
     }
