@@ -515,7 +515,7 @@ const TAB_KEY_ALIASES = [
   [/\bj\s*container\b/gi, 'jumbo container'],
   // Bindal's E900 tab abbreviates "Container" as "CONT." (e.g. "E900 CONT." vs. the Production
   // Register's "E 900 Container"). Confirmed directly against the real Sheet.
-  [/\bcont\.?(?=\s|$)/gi, 'container'],
+  [/\bcont\.?\b/gi, 'container'],
   // Diamond's real Sheet only says "Burst" on one of the four Cream blocks ("CREAM BURST
   // 30G*140PKT") — the 60G*70PKT and 60G*60PKT blocks are just "CREAM ...", no "Burst" — while the
   // Production Register calls all Cream items "Cream Burst ...". Stripping the word (rather than
@@ -855,4 +855,4 @@ async function putBlocksTab(req, res) {
   }
 }
 
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler };
+module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, normalizeTabKey };
