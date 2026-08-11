@@ -890,4 +890,33 @@ async function debugRawTabHandler(req, res) {
   }
 }
 
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, debugRawTabHandler };
+// TEMP DEBUG #2 — reproduces the exact multi-range batchGet the real import/preview code uses, to
+// check whether a batch that mixes ambiguous bare-name ranges (N200/E900/N150, which the API reads as
+// cell refs on the default sheet — confirmed via debugRawTabHandler above) with normal sheet-name
+// ranges causes the RESPONSE array to misalign with the REQUEST array by index. REMOVE with the above.
+async function debugBatchTabsHandler(req, res) {
+  try {
+    const { spreadsheetId, tabNames } = req.body || {};
+    if (!spreadsheetId || !Array.isArray(tabNames)) return res.status(400).json({ error: 'spreadsheetId and tabNames[] are required.' });
+    const sheets = getSheetsClient();
+    const resp = await sheets.spreadsheets.values.batchGet({
+      spreadsheetId, ranges: tabNames, valueRenderOption: 'UNFORMATTED_VALUE',
+    });
+    const valueRanges = resp.data.valueRanges || [];
+    res.json({
+      requestedTabNames: tabNames,
+      responseCount: valueRanges.length,
+      perIndex: valueRanges.map((vr, i) => ({
+        requestedAtThisIndex: tabNames[i],
+        returnedRange: vr.range,
+        rowCount: (vr.values || []).length,
+        firstCell: vr.values && vr.values[0] ? vr.values[0][0] : null,
+      })),
+    });
+  } catch (e) {
+    console.error('debugBatchTabsHandler error:', e);
+    res.status(500).json({ error: String(e && e.message || e), stack: e && e.stack });
+  }
+}
+
+module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, debugRawTabHandler, debugBatchTabsHandler };

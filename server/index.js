@@ -4,7 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const { requireEnv, login, logout, requireAuth } = require('./lib/auth');
 const { extract } = require('./lib/anthropic');
-const { getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, debugRawTabHandler } = require('./lib/sheets');
+const { getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, debugRawTabHandler, debugBatchTabsHandler } = require('./lib/sheets');
 
 // Fail fast and loud if required secrets are missing, instead of the app half-working with
 // confusing downstream errors — matches the "no guesses" standard this project was built to.
@@ -72,6 +72,7 @@ app.post('/api/customer-sheets/import', importCustomerSheetHandler);
 app.get('/api/service-account-email', getServiceAccountEmailHandler);
 // TEMP DEBUG — see matching comment in lib/sheets.js. REMOVE after root cause is found.
 app.post('/api/debug/raw-tab', debugRawTabHandler);
+app.post('/api/debug/batch-tabs', debugBatchTabsHandler);
 
 // --- serve the built frontend (client/dist), if present, so this is a single deployable service ---
 const clientDist = path.join(__dirname, '..', 'client', 'dist');
