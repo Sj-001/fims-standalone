@@ -2689,11 +2689,16 @@ function FIMSApp() {
                                   const tabNameValue = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) ?? tab.tabName;
                                   // Fixed-width inputs clip long real tab names (e.g. "coconut premium
                                   // cookies") with no ellipsis, making it look like the tab is blank or
-                                  // wrong. Size the box to the actual text instead, within sane bounds.
+                                  // wrong. A first attempt sized the box in px using an 8px/char average,
+                                  // which undersized real ALL-CAPS tab names like "COCONUT COOKIES" —
+                                  // caps letters are wider per character than lowercase. Using `ch`
+                                  // units (the width of "0" in the current font) at a smaller font size
+                                  // scales correctly with the font itself instead of guessing pixels, and
+                                  // a generous +4ch margin covers the extra width of all-caps text.
                                   return (
                                     <input
                                       className="cell-input"
-                                      style={{ width: `${Math.min(260, Math.max(90, tabNameValue.length * 8 + 24))}px` }}
+                                      style={{ width: `${Math.min(40, Math.max(8, tabNameValue.length + 4))}ch`, fontSize: 12 }}
                                       title={tabNameValue}
                                       list={`review-tabs-${customer}`}
                                       value={tabNameValue}

@@ -498,8 +498,18 @@ function buildHighlightRequestsForPatches(sheetId, patches) {
 // real block titles also vary in whitespace ("64 g" vs "64g") and unit spelling ("65GM" vs "65g").
 // None of these differences represent a different physical item, so all of them have to be normalized
 // away or matching silently fails and a real existing block gets reported as "new".
+// Known word-level naming differences between what the Production Register calls an item and what
+// the real Sheet calls it — confirmed directly by the customer, not guessed. Unlike the pack-count/
+// spacing cleanup below, these are genuine different words (not formatting variants), so they can't be
+// inferred automatically; each entry here was explicitly confirmed. E.g. the customer confirmed
+// "Jeera Dhamal 70g"/"35g" in the register is the same item as the "jeera 70g"/"35g" block in the real
+// sheet — the Sheet never uses the word "Dhamal" at all.
+const TAB_KEY_ALIASES = [
+  [/\bdhamal\b/gi, ''],
+];
 const normalizeTabKey = (name) => {
   let s = String(name || '').trim().toLowerCase();
+  TAB_KEY_ALIASES.forEach(([pattern, replacement]) => { s = s.replace(pattern, replacement); });
   // Trailing "x60ppkt" / "×60 pkt" / "*60" style pack-count marker: an explicit multiplier symbol
   // (x/×/*) is an unambiguous signal that whatever follows is a pack/carton count, never part of a
   // real product code — so strip the whole tail regardless of exactly how the unit word after the
