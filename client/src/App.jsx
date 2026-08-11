@@ -2683,8 +2683,8 @@ function FIMSApp() {
                           <div key={`${tab.tabName}::${v.title}`} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
                               <strong>{v.title}</strong>
-                              <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-                                <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>Sheet tab:</span>
+                              <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'nowrap', flexShrink: 0 }}>
+                                <span className="doc-hint" style={{ whiteSpace: 'nowrap', flexShrink: 0 }}>Sheet tab:</span>
                                 {(() => {
                                   const tabNameValue = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) ?? tab.tabName;
                                   // Fixed-width inputs clip long real tab names (e.g. "coconut premium
@@ -2693,12 +2693,17 @@ function FIMSApp() {
                                   // which undersized real ALL-CAPS tab names like "COCONUT COOKIES" —
                                   // caps letters are wider per character than lowercase. Using `ch`
                                   // units (the width of "0" in the current font) at a smaller font size
-                                  // scales correctly with the font itself instead of guessing pixels, and
-                                  // a generous +4ch margin covers the extra width of all-caps text.
+                                  // scales correctly with the font itself instead of guessing pixels.
+                                  // flexWrap:'nowrap' + flexShrink:0 on this whole row (not just the
+                                  // input) keeps the "Sheet tab:" label and its input glued together on
+                                  // one line — previously the label and input could wrap independently,
+                                  // stranding the (still-clipped) value on its own line far from its
+                                  // label. A smaller font and tighter cap keep the pair narrow enough to
+                                  // usually avoid the outer row wrapping at all.
                                   return (
                                     <input
                                       className="cell-input"
-                                      style={{ width: `${Math.min(40, Math.max(8, tabNameValue.length + 4))}ch`, fontSize: 12 }}
+                                      style={{ width: `${Math.min(26, Math.max(8, tabNameValue.length + 2))}ch`, fontSize: 11, textOverflow: 'ellipsis', flexShrink: 0 }}
                                       title={tabNameValue}
                                       list={`review-tabs-${customer}`}
                                       value={tabNameValue}
