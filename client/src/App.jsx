@@ -2681,42 +2681,37 @@ function FIMSApp() {
                         {!review.error && !hasAnyNewRows && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet.</div>}
                         {reviewTabs.map(tab => (tab.variants || []).filter(v => v.rows.length > 0).map(v => (
                           <div key={`${tab.tabName}::${v.title}`} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
                               <strong>{v.title}</strong>
-                              <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'nowrap', flexShrink: 0 }}>
-                                <span className="doc-hint" style={{ whiteSpace: 'nowrap', flexShrink: 0 }}>Sheet tab:</span>
-                                {(() => {
-                                  const tabNameValue = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) ?? tab.tabName;
-                                  // Fixed-width inputs clip long real tab names (e.g. "coconut premium
-                                  // cookies") with no ellipsis, making it look like the tab is blank or
-                                  // wrong. A first attempt sized the box in px using an 8px/char average,
-                                  // which undersized real ALL-CAPS tab names like "COCONUT COOKIES" —
-                                  // caps letters are wider per character than lowercase. Using `ch`
-                                  // units (the width of "0" in the current font) at a smaller font size
-                                  // scales correctly with the font itself instead of guessing pixels.
-                                  // flexWrap:'nowrap' + flexShrink:0 on this whole row (not just the
-                                  // input) keeps the "Sheet tab:" label and its input glued together on
-                                  // one line — previously the label and input could wrap independently,
-                                  // stranding the (still-clipped) value on its own line far from its
-                                  // label. A smaller font and tighter cap keep the pair narrow enough to
-                                  // usually avoid the outer row wrapping at all.
-                                  return (
-                                    <input
-                                      className="cell-input"
-                                      style={{ width: `${Math.min(26, Math.max(8, tabNameValue.length + 2))}ch`, fontSize: 11, textOverflow: 'ellipsis', flexShrink: 0 }}
-                                      title={tabNameValue}
-                                      list={`review-tabs-${customer}`}
-                                      value={tabNameValue}
-                                      onChange={e => setTabOverride(customer, v.title, e.target.value)}
-                                      disabled={approved}
-                                    />
-                                  );
-                                })()}
-                                <datalist id={`review-tabs-${customer}`}>
-                                  {(review.existingTabNames || []).map(t => <option value={t} key={t} />)}
-                                </datalist>
-                                {v.isNewBlock && <span className="doc-hint">(new — this tab/block doesn't exist yet)</span>}
-                              </div>
+                              <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>— Sheet tab:</span>
+                              {(() => {
+                                const tabNameValue = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) ?? tab.tabName;
+                                // Sits directly after the item name now (no more floating it to the far
+                                // right of the row, which is what caused the label and box to separate
+                                // onto different lines). Width is one flat, generous fixed value rather
+                                // than a per-character estimate — character-counting approaches (px/char,
+                                // then `ch` units) both undersized real lowercase tab names because
+                                // neither actually measures the font's real glyph widths. 200px comfortably
+                                // fits the longest real tab name across all three customers ("coconut
+                                // premium cookies") with room to spare, so nothing truncates — no ellipsis
+                                // needed.
+                                return (
+                                  <input
+                                    className="cell-input"
+                                    style={{ width: 200, fontSize: 12 }}
+                                    list={`review-tabs-${customer}`}
+                                    value={tabNameValue}
+                                    onChange={e => setTabOverride(customer, v.title, e.target.value)}
+                                    disabled={approved}
+                                  />
+                                );
+                              })()}
+                              <datalist id={`review-tabs-${customer}`}>
+                                {(review.existingTabNames || []).map(t => <option value={t} key={t} />)}
+                              </datalist>
+                              {tab.isNewTab
+                                ? <span className="doc-hint">(new — this tab doesn't exist yet)</span>
+                                : v.isNewBlock && <span className="doc-hint">(new — this block doesn't exist yet)</span>}
                             </div>
                             <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
                               <thead>
