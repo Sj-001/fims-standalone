@@ -406,6 +406,43 @@ function buildPromptWithTraining(basePrompt, examples) {
 LEARNED CORRECTIONS — a person has corrected real extraction mistakes on this exact document type before. Each pair below shows a row as it was first extracted (with a mistake) and how a human corrected it. Study the pattern behind each correction — what kind of value was misread, which field it belongs in, how it should be formatted — and apply that same fix logic to this new document. Do not copy these exact values into unrelated rows; only apply the underlying pattern.
 ${examplesText}`;
 }
+// Every date the app touches should end up in the Sheet's own dot-separated D.M.YY convention
+// (e.g. "16.7.26") — extraction sources disagree though: Production Register OCR tends to read as
+// "02/01/2026" (slash), Customer Dispatch Bill extraction reads as "16-Jul-26" (dash + month
+// abbreviation), and manually-typed rows are already dot-formatted. Fixing this only at push time
+// let three different formats sit mixed together in a live sheet (confirmed directly in Bindal's
+// N200 tab) and let same-day duplicate rows slip past the "already in the sheet" check, since a
+// duplicate check that compares raw strings never sees "18.07.26" and "18-Jul-26" as the same date.
+// This normalizer now runs immediately when a row is shaped from a fresh extraction — see each
+// DOCUMENT_TYPES `shape()` below — so a mismatched format is never even created in the first place.
+// It's also still called again right before a push (see buildCustomerSheetPayload) as a safety net
+// for anything that entered the ledger some other way (a manually typed/edited row, for instance).
+// Anything unrecognized is left exactly as-is rather than guessed at, so a genuinely new format
+// shows up untouched (and visibly odd) instead of silently mangled.
+const MONTH_ABBR_TO_NUM = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+function normalizeDateToDots(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return s;
+  // Already dot-separated ("5.1.24", "13.08.24") — leave as-is, that's the target format.
+  if (/^\d{1,2}\.\d{1,2}\.\d{2,4}$/.test(s)) return s;
+  // Slash-separated DD/MM/YYYY or D/M/YY (what the Production Register's OCR tends to produce).
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (m) {
+    const yy = m[3].length > 2 ? m[3].slice(-2) : m[3];
+    return `${Number(m[1])}.${Number(m[2])}.${yy}`;
+  }
+  // Dash + month-abbreviation ("16-Jul-26", what Customer Dispatch Bill extraction produces).
+  m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})$/);
+  if (m) {
+    const monthNum = MONTH_ABBR_TO_NUM[m[2].toLowerCase()];
+    if (monthNum) {
+      const yy = m[3].length > 2 ? m[3].slice(-2) : m[3];
+      return `${Number(m[1])}.${monthNum}.${yy}`;
+    }
+  }
+  // Unrecognized format — don't guess, leave untouched.
+  return s;
+}
 /* ============================== document type configs ============================== */
 const DOCUMENT_TYPES = [
   {
@@ -421,7 +458,7 @@ IMPORTANT — column format varies between mills, read carefully:
 - SHADE: some slips have their own dedicated "Shade" column (e.g. values like GY, NS) — use that value directly. Other slips have no separate shade column, but the GSM value has a letter code stuck to the end of it, e.g. "120NS" — in that case the number is the GSM (120) and the letters are the shade (NS); split them into "gsm":"120" and "shade":"NS". A third pattern: some slips group reels under bold section headings instead of a shade column — sometimes the heading directly names a shade code as one of its parts (e.g. "Kraft Paper - 25 - GY" means every row under it is shade GY, and the "25" there is the BF, not a separate thing to worry about if BF already has its own column), and sometimes the heading only names a paper type/colour with no explicit code (e.g. "BR Golden Yellow" or "Golden Yellow" means shade GY, "Kraft Paper" alone with no code means shade NS/Natural Shade). Either way, apply the heading's shade to every row listed under it until the next heading appears. Only do this when you are confident in the mapping — if a heading is unfamiliar or ambiguous, leave "shade" as an empty string rather than guessing. If there is genuinely no shade information anywhere for a row (no column, no code, no heading), also leave "shade" as an empty string.`,
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
-      return raw.items.map(it => ({ id: genId(), date: raw.date || '', mill: raw.mill || '', reel_no: it.reel_no || '', size: it.size || '', unit: it.unit || '', gsm: it.gsm || '', bf: it.bf || '', shade: it.shade || '', weight_kg: num(it.weight_kg) }));
+      return raw.items.map(it => ({ id: genId(), date: normalizeDateToDots(raw.date || ''), mill: raw.mill || '', reel_no: it.reel_no || '', size: it.size || '', unit: it.unit || '', gsm: it.gsm || '', bf: it.bf || '', shade: it.shade || '', weight_kg: num(it.weight_kg) }));
     },
   },
   {
@@ -438,7 +475,7 @@ IMPORTANT:
 - Interpret unclear handwriting as best you can; if a value is genuinely illegible leave it as an empty string rather than guessing wildly.`,
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
-      return raw.items.map(it => ({ id: genId(), date: it.date_override || raw.date || '', shade: it.shade || '', size: it.size || '', gsm: it.gsm || '', weight_consumed: num(it.weight_consumed), balance_left: it.balance_left === '' || it.balance_left == null ? '' : num(it.balance_left) }));
+      return raw.items.map(it => ({ id: genId(), date: normalizeDateToDots(it.date_override || raw.date || ''), shade: it.shade || '', size: it.size || '', gsm: it.gsm || '', weight_consumed: num(it.weight_consumed), balance_left: it.balance_left === '' || it.balance_left == null ? '' : num(it.balance_left) }));
     },
   },
   {
@@ -462,7 +499,7 @@ Return ONLY one JSON object: {"date":"shared header date if Style A, DD/MM/YYYY,
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
       return raw.items.map(it => ({
-        id: genId(), date: it.date_override || raw.date || it.date || '', party: it.party || '', shade: it.shade || '',
+        id: genId(), date: normalizeDateToDots(it.date_override || raw.date || it.date || ''), party: it.party || '', shade: it.shade || '',
         size: it.size || '', gsm: it.gsm || '', weight: num(it.weight), description: it.description || '',
         customerHint: it.customer_hint || '', pieces: num(it.pieces), dispatch: num(it.dispatch),
         stockConfirmed: false, confirmedCustomer: '',
@@ -488,7 +525,7 @@ Return ONLY one JSON object: {"invoice_no":"","date":"","party":"","buyer_order_
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
       return raw.items.map(it => ({
-        id: genId(), date: raw.date || '', party: raw.party || '', description: it.description || '',
+        id: genId(), date: normalizeDateToDots(raw.date || ''), party: raw.party || '', description: it.description || '',
         customerHint: raw.party || '', invoice_no: raw.invoice_no || '', buyer_order_no: raw.buyer_order_no || '',
         quantity: num(it.quantity), rate: num(it.rate), amount: num(it.amount),
         stockConfirmed: false, confirmedCustomer: '',
@@ -514,8 +551,8 @@ Return ONLY one JSON object: {"invoice_no":"","date":"","party":"","buyer_order_
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
       return raw.items.map(it => ({
-        id: genId(), po_number: raw.po_number || '', date: raw.date || '', material_desc: it.material_desc || '',
-        hsn: it.hsn || '', quantity: num(it.quantity), rate: num(it.rate), delivery_date: it.delivery_date || ''
+        id: genId(), po_number: raw.po_number || '', date: normalizeDateToDots(raw.date || ''), material_desc: it.material_desc || '',
+        hsn: it.hsn || '', quantity: num(it.quantity), rate: num(it.rate), delivery_date: normalizeDateToDots(it.delivery_date || '')
       }));
     },
   },
@@ -534,7 +571,7 @@ If multiple buyer order numbers are listed, use the first one and mention any ot
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
       return raw.items.map(it => ({
-        id: genId(), date: raw.date || '', invoice_no: raw.invoice_no || '', party: raw.party || '',
+        id: genId(), date: normalizeDateToDots(raw.date || ''), invoice_no: raw.invoice_no || '', party: raw.party || '',
         buyer_order_no: raw.buyer_order_no || '', description: it.description || '', quantity: num(it.quantity), rate: num(it.rate), amount: num(it.amount)
       }));
     },
@@ -1532,39 +1569,9 @@ function FIMSApp() {
     .replace(/\bcont\.?\b/g, 'container')
     .replace(/[^a-z0-9]/g, '');
   // Every real customer Sheet writes dates as dot-separated D.M.YY ("5.1.24", "26.1.24") — never with
-  // slashes or month names. Rows we push come from several different sources with their own native
-  // formats though: Production Register OCR tends to read as "02/01/2026" (slash), Customer Dispatch
-  // Bills extraction reads as "16-Jul-26" (dash + month abbreviation), and manually-typed rows are
-  // already dot-formatted. Pushing whatever format a row happened to arrive in — as the app did before
-  // this — makes the same block end up with three different date styles mixed together (confirmed
-  // directly in Bindal's N200 tab). This normalizes any of those known formats to the Sheet's own dot
-  // convention right before a row is sent; anything unrecognized is left exactly as-is rather than
-  // guessed at, so a genuinely new format shows up untouched (and visibly odd) instead of silently
-  // mangled.
-  const MONTH_ABBR_TO_NUM = { jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9, oct:10, nov:11, dec:12 };
-  const formatDateForPush = (raw) => {
-    const s = String(raw || '').trim();
-    if (!s) return s;
-    // Already dot-separated ("5.1.24", "13.08.24") — leave as-is, that's the target format.
-    if (/^\d{1,2}\.\d{1,2}\.\d{2,4}$/.test(s)) return s;
-    // Slash-separated DD/MM/YYYY or D/M/YY (what the Production Register's OCR tends to produce).
-    let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-    if (m) {
-      const yy = m[3].length > 2 ? m[3].slice(-2) : m[3];
-      return `${Number(m[1])}.${Number(m[2])}.${yy}`;
-    }
-    // Dash + month-abbreviation ("16-Jul-26", what Customer Dispatch Bill extraction produces).
-    m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})$/);
-    if (m) {
-      const monthNum = MONTH_ABBR_TO_NUM[m[2].toLowerCase()];
-      if (monthNum) {
-        const yy = m[3].length > 2 ? m[3].slice(-2) : m[3];
-        return `${Number(m[1])}.${monthNum}.${yy}`;
-      }
-    }
-    // Unrecognized format — don't guess, leave untouched.
-    return s;
-  };
+  // Rows land in the ledger already dot-formatted now (normalizeDateToDots runs at extraction time,
+  // see DOCUMENT_TYPES above) — this second call right before push is a safety net for anything that
+  // reached the ledger some other way (a manually typed/edited row), not the primary defense anymore.
   const buildCustomerSheetPayload = (customer) => {
     const groups = customerStockGroups.filter(g => g.customer === customer);
     const sheetGroupByItem = {};
@@ -1587,7 +1594,7 @@ function FIMSApp() {
       tabsMap[sheetGroup].push({
         title: g.description || 'Item',
         header: ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
-        rows: g.ledger.map(e => [formatDateForPush(e.date), e.opening, e.pieces || 0, e.dispatch || 0, e.closing]),
+        rows: g.ledger.map(e => [normalizeDateToDots(e.date), e.opening, e.pieces || 0, e.dispatch || 0, e.closing]),
       });
     });
     const itemGroups = Object.entries(tabsMap).map(([tabName, variants]) => ({ tabName, variants }));
