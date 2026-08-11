@@ -467,12 +467,31 @@ function buildHighlightRequestsForPatches(sheetId, patches) {
 // what gets written to and returned, never a normalized or re-cased version of it.
 // This is used for BOTH levels of matching: the top-level category tab name, AND (inside
 // parseExistingBlocks/computeMergePatches) a variant's title against an existing side-by-side block's
-// title within that tab. The second use is why this also strips a trailing "x<digits>"/"×<digits>"
-// pack count — a real block is titled just "Kaju Bake 65g", but the incoming variant's title is
+// title within that tab. The second use is why this also strips a trailing pack/carton-count
+// annotation — a real block is titled just "Kaju Bake 65g", but the incoming variant's title is
 // whatever the Production Register wrote that day, e.g. "Kaju Bake 65g x60". Without stripping it
 // here too, the block match would fail even though the block genuinely exists, wrongly treating it as
 // a brand-new item and creating a duplicate block right next to the real one on push.
-const normalizeTabKey = (name) => String(name || '').trim().toLowerCase().replace(/\s*[x×]\s*\d+\s*$/i, '').trim();
+//
+// Verified directly against the real Anmol sheet (2026-08-11): the same pack-count annotation shows
+// up in several different handwritten conventions across real block titles — "x60", "×60", "* 60pkt",
+// "60 PKT", "60pkt" — and real block titles also vary in whitespace ("64 g" vs "64g") and unit
+// spelling ("65GM" vs "65g"). None of these differences represent a different physical item, so all of
+// them have to be normalized away or matching silently fails and a real existing block gets reported
+// as "new".
+const normalizeTabKey = (name) => {
+  let s = String(name || '').trim().toLowerCase();
+  // Trailing "x60" / "×60" / "*60pkt" style pack-count marker (multiplier symbol + digits, optional
+  // trailing unit word).
+  s = s.replace(/[x×*]\s*\d+\s*(pkt|pkts|pcs|nos)?\s*$/i, '').trim();
+  // Trailing "60 PKT" / "60pkt" style pack-count with no multiplier symbol at all.
+  s = s.replace(/\d+\s*(pkt|pkts|pcs|nos)\s*$/i, '').trim();
+  // Unit spelling: "65GM" and "65g" mean the same thing.
+  s = s.replace(/(\d)\s*gm\b/gi, '$1g');
+  // Collapse all remaining whitespace so "64 g" and "64g" compare equal.
+  s = s.replace(/\s+/g, '');
+  return s;
+};
 
 // Resolves each tabPlan's proposed name against tabs that already exist in the target spreadsheet:
 // if a tab already exists whose name matches case/whitespace-insensitively, the plan is rewritten to
