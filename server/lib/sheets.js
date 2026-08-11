@@ -254,6 +254,22 @@ function buildSideBySideGrid(variants) {
 
 const normalizeCellStr = (v) => (v === undefined || v === null) ? '' : String(v).trim();
 
+// Google Sheets serial date (epoch 1899-12-30) -> "DD/MM/YYYY". Most real date cells in the customer
+// sheets are typed as literal text ("20-Dec", "6.1.23", etc.), but verified directly against the real
+// Anmol sheet: some blocks (e.g. Butter Bake 130g) store the date column as an actual Sheets date
+// value instead. Read with UNFORMATTED_VALUE that comes back as a bare number like 44920 — without
+// converting it, that number leaks straight into the review screen instead of a date.
+const serialToDateStr = (n) => {
+  const ms = Math.round((n - 25569) * 86400 * 1000); // 25569 = days between 1899-12-30 and 1970-01-01
+  const d = new Date(ms);
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  return `${dd}/${mm}/${d.getUTCFullYear()}`;
+};
+// Same as normalizeCellStr, but for a date-column cell specifically: converts a numeric date serial
+// to a readable date string first, instead of stringifying the raw number.
+const normalizeDateCell = (v) => (typeof v === 'number' && isFinite(v)) ? serialToDateStr(v) : normalizeCellStr(v);
+
 // Parses an EXISTING tab's grid into its variant blocks, using the same "find the row containing a
 // 'date' cell" heuristic used for import — so a merge-push can tell, per variant, exactly which dates
 // already have a row (whether the app put it there on a previous push, or a person typed it in by
@@ -283,12 +299,15 @@ function parseExistingBlocks(grid) {
     let nextRowIdx = headerRowIdx + 1;
     let lastRowValues = null;
     for (let r = headerRowIdx + 1; r < rows.length; r++) {
-      const dateStr = normalizeCellStr((rows[r] || [])[startCol]);
+      const dateStr = normalizeDateCell((rows[r] || [])[startCol]);
       if (!dateStr) break; // first blank date cell ends this block's existing data
       existingDates.add(dateStr);
       nextRowIdx = r + 1;
       lastRowValues = [];
-      for (let c = startCol; c < startCol + width; c++) lastRowValues.push((rows[r] || [])[c]);
+      for (let c = startCol; c < startCol + width; c++) {
+        const raw = (rows[r] || [])[c];
+        lastRowValues.push(c === startCol ? dateStr : raw);
+      }
     }
     return { title, startCol, width, nextRowIdx, existingDates, lastRowValues };
   });
@@ -474,18 +493,22 @@ function buildHighlightRequestsForPatches(sheetId, patches) {
 // a brand-new item and creating a duplicate block right next to the real one on push.
 //
 // Verified directly against the real Anmol sheet (2026-08-11): the same pack-count annotation shows
-// up in several different handwritten conventions across real block titles — "x60", "×60", "* 60pkt",
-// "60 PKT", "60pkt" — and real block titles also vary in whitespace ("64 g" vs "64g") and unit
-// spelling ("65GM" vs "65g"). None of these differences represent a different physical item, so all of
-// them have to be normalized away or matching silently fails and a real existing block gets reported
-// as "new".
+// up in a growing list of different handwritten conventions across real block titles — "x60", "×60",
+// "* 60pkt", "60 PKT", "60pkt", "x 60 PPKT" (note the double P — a typo, not a different unit) — and
+// real block titles also vary in whitespace ("64 g" vs "64g") and unit spelling ("65GM" vs "65g").
+// None of these differences represent a different physical item, so all of them have to be normalized
+// away or matching silently fails and a real existing block gets reported as "new".
 const normalizeTabKey = (name) => {
   let s = String(name || '').trim().toLowerCase();
-  // Trailing "x60" / "×60" / "*60pkt" style pack-count marker (multiplier symbol + digits, optional
-  // trailing unit word).
-  s = s.replace(/[x×*]\s*\d+\s*(pkt|pkts|pcs|nos)?\s*$/i, '').trim();
-  // Trailing "60 PKT" / "60pkt" style pack-count with no multiplier symbol at all.
-  s = s.replace(/\d+\s*(pkt|pkts|pcs|nos)\s*$/i, '').trim();
+  // Trailing "x60ppkt" / "×60 pkt" / "*60" style pack-count marker: an explicit multiplier symbol
+  // (x/×/*) is an unambiguous signal that whatever follows is a pack/carton count, never part of a
+  // real product code — so strip the whole tail regardless of exactly how the unit word after the
+  // digits is spelled (pkt/ppkt/pcs/nos/ctn/etc. all show up in the real sheets, with typos).
+  s = s.replace(/[x×*]\s*\d+\s*[a-z]{0,8}\.?\s*$/i, '').trim();
+  // Trailing "60 PKT" / "60pkt" style pack-count with NO multiplier symbol — ambiguous in general (a
+  // bare number+word could be a real product code, e.g. "N200 Jumbo"), so only strip a known list of
+  // packaging-unit words here rather than any word.
+  s = s.replace(/\d+\s*(pkt|pkts|ppkt|ppkts|pcs|nos|ctn|ctns|box|boxes|bag|bags|unit|units)\.?\s*$/i, '').trim();
   // Unit spelling: "65GM" and "65g" mean the same thing.
   s = s.replace(/(\d)\s*gm\b/gi, '$1g');
   // Collapse all remaining whitespace so "64 g" and "64g" compare equal.

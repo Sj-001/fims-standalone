@@ -2683,14 +2683,25 @@ function FIMSApp() {
                           <div key={`${tab.tabName}::${v.title}`} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
                               <strong>{v.title}</strong>
-                              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                                <span className="doc-hint">Sheet tab:</span>
-                                <input
-                                  className="cell-input" style={{ width: 150 }} list={`review-tabs-${customer}`}
-                                  value={(reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) ?? tab.tabName}
-                                  onChange={e => setTabOverride(customer, v.title, e.target.value)}
-                                  disabled={approved}
-                                />
+                              <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+                                <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>Sheet tab:</span>
+                                {(() => {
+                                  const tabNameValue = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) ?? tab.tabName;
+                                  // Fixed-width inputs clip long real tab names (e.g. "coconut premium
+                                  // cookies") with no ellipsis, making it look like the tab is blank or
+                                  // wrong. Size the box to the actual text instead, within sane bounds.
+                                  return (
+                                    <input
+                                      className="cell-input"
+                                      style={{ width: `${Math.min(260, Math.max(90, tabNameValue.length * 8 + 24))}px` }}
+                                      title={tabNameValue}
+                                      list={`review-tabs-${customer}`}
+                                      value={tabNameValue}
+                                      onChange={e => setTabOverride(customer, v.title, e.target.value)}
+                                      disabled={approved}
+                                    />
+                                  );
+                                })()}
                                 <datalist id={`review-tabs-${customer}`}>
                                   {(review.existingTabNames || []).map(t => <option value={t} key={t} />)}
                                 </datalist>
