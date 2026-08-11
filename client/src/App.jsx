@@ -1377,11 +1377,28 @@ function FIMSApp() {
     }
     return 'Unassigned';
   };
+  // Strips a trailing "x<digits>"/"×<digits>" pack-count — e.g. "Kaju Bake 65g x60" -> "Kaju Bake
+  // 65g" — the SAME pattern normalizeForCatalogMatch strips below. That day's carton count isn't part
+  // of the item's identity: the same physical item shows up with a different count on every
+  // production day, and without stripping it here too, "Kaju Bake 65g x60" and "Kaju Bake 65g x40"
+  // (or a day with no count at all, just "Kaju Bake 65g") would each become a SEPARATE stock group —
+  // fragmenting one item's ledger into several, each looking like its own new, disconnected variant.
+  const stripPackCount = (s) => (s || '').replace(/\s*[x×]\s*\d+\s*$/i, '').trim();
+  // NOTE: this used to also strip "container"/"lid"/"jumbo"/"j" as noise words — found while testing
+  // the fix above that this silently merges GENUINELY DIFFERENT real items into one stock group,
+  // because both words normalize to nothing: "IT 500 Lid" and "IT 500 Container" both became "it500";
+  // "IT 500 Container" and "IT 500 Jumbo Container" (two separate real rows in Bindal's own summary
+  // sheet) both became "it500" too. That's a silent-data-merging bug — production/dispatch quantities
+  // for two different physical items would get added into one blended ledger. Fixed the same way
+  // normalizeForCatalogMatch already handles this below: FOLD the "cont" abbreviation into "container"
+  // instead of erasing it, and only strip words that are genuinely never part of an item's identity
+  // (pure packaging/count units).
   const normalizeVariant = (description) => {
-    let s = (description || '').toLowerCase();
+    let s = stripPackCount(description).toLowerCase();
     s = s.replace(/\(diamond\)/g, '');
     s = s.replace(/\bcorrugated box\b/g, '');
-    s = s.replace(/\b(container|cont|jumbo|box|lid|pkt|pkts|pcs|nos|j)\b/g, '');
+    s = s.replace(/\bcont\.?\b/g, 'container');
+    s = s.replace(/\b(pkt|pkts|pcs|nos)\b/g, '');
     s = s.replace(/[^a-z0-9]/g, '');
     return s.trim();
   };
@@ -1417,7 +1434,11 @@ function FIMSApp() {
       const customer = row.confirmedCustomer || matchCustomer(row);
       const variantKey = normalizeVariant(row.description);
       const key = `${customer}||${variantKey}`;
-      if (!groups[key]) groups[key] = { id: key, customer, description: row.description, entries: [] };
+      // Display description is the pack-count-stripped, clean item name — not whichever day's raw
+      // register wording happened to create this group first. Without this, the group's permanent
+      // label (and the Sheet tab this pushes to) would be whatever pack count was on THAT entry,
+      // e.g. "Kaju Bake 65g x60" forever, even on a day production ran a batch of 40 instead.
+      if (!groups[key]) groups[key] = { id: key, customer, description: stripPackCount(row.description) || row.description, entries: [] };
       groups[key].entries.push({ id: row.id, date: row.date, pieces, dispatch: dispatchQty });
     };
     confirmedProductionRows.forEach(row => addEntry(row, num(row.pieces), num(row.dispatch)));
@@ -1450,10 +1471,15 @@ function FIMSApp() {
      unchanged. The "summary" tab is never read or written at all: it's a handful of formulas that
      already point at each item's block's own last row, so it keeps calculating itself correctly for
      as long as a block only ever grows downward. */
+  // "Unassigned" is deliberately excluded here — it's not a real customer with a Sheet to push to, so
+  // it should never get a Sheet-ID field, a Push button, or a preview/review panel. It's just the
+  // holding pen for register/dispatch rows that didn't match any customer at all (a DIFFERENT,
+  // earlier problem than an item not matching a customer's catalog) — those get resolved by fixing
+  // Customer Mapping and re-syncing, not by pushing anything for "Unassigned" itself.
   const allCustomerTabNames = Array.from(new Set([
     ...productCatalog.map(c => c.customer),
     ...customerNames,
-  ])).filter(Boolean);
+  ])).filter(c => c && c !== 'Unassigned');
   // Groups this customer's variant ledgers under the tab name (sheetGroup) their catalog entry
   // says they belong to. A variant whose description doesn't exactly match any catalog item for
   // this customer falls back to using its own description as the tab name AND is flagged in
@@ -2355,8 +2381,7 @@ function FIMSApp() {
             <div>
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Customer Stock</h2>
-                <p className="subtitle" style={{ marginBottom: 4 }}>Combines confirmed Production Register entries (stock in) with confirmed Customer Dispatch Bill entries (stock out), grouped by customer and product variant, into a running opening/production/dispatch/closing balance — the same shape as your BINDAL_STOCK / DIAMOND / Anmol stock files.</p>
-                <p className="subtitle">Matching is done by the Customer Mapping tab, plus anything literally bracketed next to the item name. This in-app view is a flat list per variant — to push this data out to that customer's own Google Sheet in the exact side-by-side, tab-per-item layout your original files use, go to the Customer Sheets tab.</p>
+                <p className="subtitle">Review new Production Register and Customer Dispatch Bill entries here and confirm which customer they belong to — that's the only thing that still lives on this tab. Once confirmed, matching is done by the Customer Mapping tab, plus anything literally bracketed next to the item name. The actual per-customer ledger, the diff against each customer's real Sheet, and pushing now all live in the Customer Sheets tab.</p>
               </div>
               {pendingProductionRows.length > 0 && (
                 <div className="panel" style={{ borderColor: 'var(--accent)' }}>
@@ -2417,48 +2442,19 @@ function FIMSApp() {
                   </div>
                 </div>
               )}
-              {customerNames.map(customer => {
-                const groups = customerStockGroups.filter(g => g.customer === customer);
-                const totalProd = groups.reduce((s, g) => s + g.totalProduction, 0);
-                const totalDisp = groups.reduce((s, g) => s + g.totalDispatch, 0);
+              {(() => {
+                const unassignedGroups = customerStockGroups.filter(g => g.customer === 'Unassigned');
+                if (!unassignedGroups.length) return null;
                 return (
-                  <div className="panel" key={customer}>
-                    <div className="panel-header">
-                      <div>
-                        <h2>{customer}{customer === 'Unassigned' && ' — needs a mapping rule'}</h2>
-                        <p className="subtitle">{groups.length} variant{groups.length === 1 ? '' : 's'} · {totalProd} produced · {totalDisp} dispatched</p>
-                      </div>
-                      <button className="btn btn-ghost" onClick={() => exportCustomerStock(customer)}><Download size={15} /> Export {customer}</button>
-                    </div>
-                    {customer === 'Unassigned' && groups.length > 0 && (
-                      <div className="error-box" style={{ marginBottom: 14 }}>
-                        <AlertCircle size={16} />
-                        <span>These descriptions didn't match any rule in Customer Mapping — add a keyword rule for them there so they route to the right customer.</span>
-                      </div>
-                    )}
-                    {groups.map(g => (
-                      <div key={g.id} style={{ marginBottom: 18 }}>
-                        <div className="section-label">{g.description} — closing balance: <Pill tone={g.closingBalance >= 0 ? 'ok' : 'warn'}>{g.closingBalance}</Pill></div>
-                        <div className="table-wrap">
-                          <table>
-                            <thead><tr><th>Date</th><th>Opening</th><th>Production</th><th>Dispatch</th><th>Closing</th></tr></thead>
-                            <tbody>
-                              {g.ledger.map((e, i) => (
-                                <tr key={i}>
-                                  <td style={{ padding: '6px 10px' }}>{e.date}</td><td style={{ padding: '6px 10px' }}>{e.opening}</td>
-                                  <td style={{ padding: '6px 10px' }}>{e.pieces || ''}</td><td style={{ padding: '6px 10px' }}>{e.dispatch || ''}</td>
-                                  <td style={{ padding: '6px 10px' }}>{e.closing}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      </div>
-                    ))}
+                  <div className="error-box">
+                    <AlertCircle size={16} />
+                    <span>{unassignedGroups.length} description{unassignedGroups.length === 1 ? '' : 's'} didn't match any rule in Customer Mapping, so they're not attributed to any customer yet: {unassignedGroups.map(g => g.description).join(', ')}. Add a keyword rule for them in Customer Mapping so they route to the right customer.</span>
                   </div>
                 );
-              })}
-              {!customerNames.length && <div className="empty-state">Upload some Finished Goods Ledger pages to see customer stock here.</div>}
+              })()}
+              {!pendingProductionRows.length && !pendingDispatchRows.length && !customerStockGroups.filter(g => g.customer === 'Unassigned').length && (
+                <div className="empty-state">Nothing pending review right now. Per-customer stock and the diff before pushing now live in the Customer Sheets tab.</div>
+              )}
             </div>
           )}
           {loaded && activeTab === 'customerMapping' && (
@@ -2608,6 +2604,16 @@ function FIMSApp() {
                   </div>
                 )}
               </div>
+              {(() => {
+                const unassignedGroups = customerStockGroups.filter(g => g.customer === 'Unassigned');
+                if (!unassignedGroups.length) return null;
+                return (
+                  <div className="info-box">
+                    <Info size={16} />
+                    <span>{unassignedGroups.length} item{unassignedGroups.length === 1 ? '' : 's'} didn't match any customer at all, so they're not shown here: {unassignedGroups.map(g => g.description).join(', ')}. Fix this in Customer Mapping (add a keyword rule), then it'll route to the right customer automatically — nothing to push here for "Unassigned" itself.</span>
+                  </div>
+                );
+              })()}
               {allCustomerTabNames.length === 0 && <div className="panel"><div className="empty-state">No customers yet — add one above.</div></div>}
               {allCustomerTabNames.map(customer => {
                 const status = pushStatus[customer] || {};

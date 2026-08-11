@@ -388,6 +388,13 @@ function computeMergePatches(existingGrid, variants) {
         return out;
       });
       patches.push({ startRow0: match.nextRowIdx, startCol0: match.startCol, values });
+      // If a SECOND variant in this same push also resolves to this block (two catalog entries
+      // mapped to the same real block, or two differently-worded register lines for the same item),
+      // it must continue appending after THESE rows, not start over at the same spot and overwrite
+      // them. Advancing the block's own bookkeeping here — same object `blocks.find` will return next
+      // time — is what makes that safe.
+      match.nextRowIdx += newRows.length;
+      newRows.forEach(r => match.existingDates.add(normalizeCellStr((r || [])[0])));
     } else {
       const startCol = rightmostCol === -1 ? 0 : rightmostCol + 1;
       const width = Math.max(header.length, ...incomingRows.map(r => (r || []).length), 1);
@@ -458,7 +465,14 @@ function buildHighlightRequestsForPatches(sheetId, patches) {
 // tab (e.g. "hit & run" alongside the real "hit & run ") instead of writing into the one already
 // there. This normalizes for comparison ONLY — the real tab's exact original name/spacing is always
 // what gets written to and returned, never a normalized or re-cased version of it.
-const normalizeTabKey = (name) => String(name || '').trim().toLowerCase();
+// This is used for BOTH levels of matching: the top-level category tab name, AND (inside
+// parseExistingBlocks/computeMergePatches) a variant's title against an existing side-by-side block's
+// title within that tab. The second use is why this also strips a trailing "x<digits>"/"×<digits>"
+// pack count — a real block is titled just "Kaju Bake 65g", but the incoming variant's title is
+// whatever the Production Register wrote that day, e.g. "Kaju Bake 65g x60". Without stripping it
+// here too, the block match would fail even though the block genuinely exists, wrongly treating it as
+// a brand-new item and creating a duplicate block right next to the real one on push.
+const normalizeTabKey = (name) => String(name || '').trim().toLowerCase().replace(/\s*[x×]\s*\d+\s*$/i, '').trim();
 
 // Resolves each tabPlan's proposed name against tabs that already exist in the target spreadsheet:
 // if a tab already exists whose name matches case/whitespace-insensitively, the plan is rewritten to
@@ -565,7 +579,10 @@ function previewCustomerSheet(previousValuesByTab, tabPlans, missing) {
       const match = blocks.find(b => normalizeTabKey(b.title) === key);
       const incomingRows = Array.isArray(v.rows) ? v.rows : [];
       const newRows = match ? incomingRows.filter(r => !match.existingDates.has(normalizeCellStr((r || [])[0]))) : incomingRows;
-      let running = (match && match.lastRowValues) ? (Number(match.lastRowValues[match.width - 1]) || 0) : 0;
+      const lastExisting = (match && match.lastRowValues)
+        ? { date: match.lastRowValues[0], closing: Number(match.lastRowValues[match.width - 1]) || 0 }
+        : null;
+      let running = lastExisting ? lastExisting.closing : 0;
       const rows = newRows.map(r => {
         const row = r || [];
         const opening = running;
@@ -574,14 +591,18 @@ function previewCustomerSheet(previousValuesByTab, tabPlans, missing) {
         running = opening + production - dispatch;
         return { date: row[0] || '', opening, production, dispatch, closing: running };
       });
-      return {
-        title: v.title,
-        isNewBlock: !match,
-        lastExisting: (match && match.lastRowValues)
-          ? { date: match.lastRowValues[0], closing: Number(match.lastRowValues[match.width - 1]) || 0 }
-          : null,
-        rows,
-      };
+      // Same reasoning as computeMergePatches: if another variant in this same customer's payload
+      // also resolves to this block, it needs to see these rows as already staged — both so its own
+      // running balance continues from here instead of the real sheet's last row, and so it doesn't
+      // re-offer the same dates as "new".
+      if (match && rows.length) {
+        newRows.forEach(r => match.existingDates.add(normalizeCellStr((r || [])[0])));
+        const synthesized = new Array(match.width).fill(null);
+        synthesized[0] = rows[rows.length - 1].date;
+        synthesized[match.width - 1] = rows[rows.length - 1].closing;
+        match.lastRowValues = synthesized;
+      }
+      return { title: v.title, isNewBlock: !match, lastExisting, rows };
     });
     return { tabName: plan.tabName, isNewTab: missing.includes(plan.tabName), variants };
   });
