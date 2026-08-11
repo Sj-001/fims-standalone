@@ -857,4 +857,37 @@ async function putBlocksTab(req, res) {
   }
 }
 
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler };
+// TEMP DEBUG — added to track down why parseExistingBlocks/extractItemsFromTabGrid report "no date
+// header found" on N200/N150/E900/T GEL/TIJORI HANDLE while structurally-identical tabs (E130/N100/
+// IT500) parse fine. Returns exactly what sheets.spreadsheets.values.get hands back for one tab, raw,
+// so the real API response can be inspected instead of guessed at. REMOVE after root cause is found.
+async function debugRawTabHandler(req, res) {
+  try {
+    const { spreadsheetId, tabName } = req.body || {};
+    if (!spreadsheetId || !tabName) return res.status(400).json({ error: 'spreadsheetId and tabName are required.' });
+    const sheets = getSheetsClient();
+    const meta = await sheets.spreadsheets.get({
+      spreadsheetId,
+      fields: 'sheets.properties(sheetId,title,index,gridProperties,hidden)',
+    });
+    const sheetMetaEntry = (meta.data.sheets || []).find(s => s.properties.title === tabName);
+    const resp = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: tabName,
+      valueRenderOption: 'UNFORMATTED_VALUE',
+    });
+    const values = resp.data.values || [];
+    res.json({
+      requestedRange: resp.data.range,
+      sheetProperties: sheetMetaEntry ? sheetMetaEntry.properties : null,
+      rowCount: values.length,
+      rowLengths: values.map(r => r.length),
+      first6Rows: values.slice(0, 6).map(r => r.map(c => ({ value: c, type: typeof c, jsonEscaped: JSON.stringify(c) }))),
+    });
+  } catch (e) {
+    console.error('debugRawTabHandler error:', e);
+    res.status(500).json({ error: String(e && e.message || e), stack: e && e.stack });
+  }
+}
+
+module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, debugRawTabHandler };
