@@ -314,131 +314,142 @@ function parseExistingBlocks(grid) {
 // PRODUCTION and DISPATCH quantities from the incoming rows are trusted as-is (they come straight
 // from confirmed register entries); the opening/closing balance is recomputed to continue seamlessly
 // from whatever this block's actual last existing closing balance is, read straight from the sheet.
-function buildMergedGrid(existingGrid, variants) {
-  const rows = (Array.isArray(existingGrid) ? existingGrid : []).map(r => (r || []).slice());
-  const { headerRowIdx, blocks } = parseExistingBlocks(rows);
+// Converts a 0-indexed column number into its A1 letter(s) — 0->A, 25->Z, 26->AA, etc.
+function colLetter(colIdx0) {
+  let n = colIdx0 + 1;
+  let s = '';
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+// Wrapping a date string in a leading apostrophe is the standard Sheets convention for "store this
+// exactly as typed, never auto-detect it as a number or date" — needed because the write below uses
+// valueInputOption USER_ENTERED (required so the Opening/Closing formula strings actually become live
+// formulas instead of literal text), and USER_ENTERED otherwise applies the same auto-parsing Sheets
+// would to anything a person types. Every real customer file's date column is already plain text
+// (verified: reading it back via UNFORMATTED_VALUE returns strings like "5.1.24", not date serial
+// numbers, which is what a real auto-converted date cell would return) — this keeps new rows
+// byte-for-byte consistent with that existing convention.
+const forceTextValue = (v) => `'${v === undefined || v === null ? '' : v}`;
+
+// Computes the MINIMAL set of targeted range writes needed to append new rows to each variant's
+// block — this never reads-then-rewrites a single pre-existing cell, which matters for two reasons a
+// full-tab overwrite would silently break: (1) a pre-existing row's Opening/Closing formulas would
+// get flattened into their computed static value the instant this app pushed to that tab even once,
+// permanently breaking the "edit an old row, everything below it recalculates" behavior the real
+// files depend on; (2) any fixed cell reference elsewhere in the sheet (most importantly the summary
+// tab's own formulas, e.g. ='N200'!E109) would keep working, since the cell it points at is never
+// touched, only ever grown into.
+// New rows link into the chain purely by REFERENCE — Opening = "=<previous row's Closing cell>",
+// Closing = "=Opening+Production-Dispatch" — matching the exact convention already used throughout
+// every real customer file, so the app's own rows are indistinguishable from ones a person typed by
+// hand. A brand-new block (no existing block with this title) gets the same convention from its very
+// first row, seeded with a literal 0 opening balance since there's no prior row to reference yet.
+// Returns an array of { startRow0, startCol0, values } — 0-indexed, one entry per contiguous range
+// that needs writing (title/header/data are separate ranges for a new block; just data for an
+// existing one). The caller turns each into an A1 range and, separately, a highlight request — same
+// structured data drives both, so there's no risk of the two ever disagreeing about what's "new".
+function computeMergePatches(existingGrid, variants) {
+  const { headerRowIdx, blocks } = parseExistingBlocks(existingGrid);
   const usedHeaderRowIdx = headerRowIdx === -1 ? 1 : headerRowIdx; // title row 0, header row 1 by default
   let rightmostCol = blocks.reduce((max, b) => Math.max(max, b.startCol + b.width), -1);
-  const ensureCell = (r, c) => {
-    while (rows.length <= r) rows.push([]);
-    while (rows[r].length <= c) rows[r].push('');
-  };
-  const setCell = (r, c, val) => { ensureCell(r, c); rows[r][c] = (val === undefined || val === null) ? '' : val; };
+  const patches = [];
 
   (Array.isArray(variants) ? variants : []).forEach(v => {
     const key = normalizeTabKey(v.title);
     const match = blocks.find(b => normalizeTabKey(b.title) === key);
     const header = (v.header && v.header.length) ? v.header : ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'];
     const incomingRows = Array.isArray(v.rows) ? v.rows : [];
+
     if (match) {
       const newRows = incomingRows.filter(r => !match.existingDates.has(normalizeCellStr((r || [])[0])));
       if (!newRows.length) return;
-      const closingColOffset = match.width - 1;
-      let runningBalance = match.lastRowValues ? (Number(match.lastRowValues[closingColOffset]) || 0) : 0;
-      newRows.forEach((r, i) => {
+      const openingCol = colLetter(match.startCol + 1);
+      const prodCol = colLetter(match.startCol + 2);
+      const dispCol = colLetter(match.startCol + 3);
+      const closingCol = colLetter(match.startCol + match.width - 1);
+      let prevRow1 = match.nextRowIdx; // 0-indexed row (match.nextRowIdx - 1) -> 1-indexed = match.nextRowIdx
+      const values = newRows.map((r, i) => {
         const row = r || [];
-        const production = Number(row[2]) || 0;
-        const dispatch = Number(row[3]) || 0;
-        const opening = runningBalance;
-        runningBalance = opening + production - dispatch;
-        const rowIdx = match.nextRowIdx + i;
-        setCell(rowIdx, match.startCol + 0, row[0] || '');
-        setCell(rowIdx, match.startCol + 1, opening);
-        setCell(rowIdx, match.startCol + 2, row[2] || 0);
-        setCell(rowIdx, match.startCol + 3, row[3] || 0);
-        setCell(rowIdx, match.startCol + 4, runningBalance);
-        for (let ci = 5; ci < row.length; ci++) setCell(rowIdx, match.startCol + ci, row[ci]); // any extra columns, copied as-is
+        const thisRow1 = match.nextRowIdx + i + 1;
+        const out = [
+          forceTextValue(row[0] || ''),
+          `=${closingCol}${prevRow1}`,
+          Number(row[2]) || 0,
+          Number(row[3]) || 0,
+          `=${openingCol}${thisRow1}+${prodCol}${thisRow1}-${dispCol}${thisRow1}`,
+        ];
+        for (let ci = 5; ci < row.length; ci++) out.push(row[ci]);
+        prevRow1 = thisRow1;
+        return out;
       });
+      patches.push({ startRow0: match.nextRowIdx, startCol0: match.startCol, values });
     } else {
       const startCol = rightmostCol === -1 ? 0 : rightmostCol + 1;
       const width = Math.max(header.length, ...incomingRows.map(r => (r || []).length), 1);
-      setCell(usedHeaderRowIdx - 1, startCol, v.title || '');
-      header.forEach((h, ci) => setCell(usedHeaderRowIdx, startCol + ci, h));
-      incomingRows.forEach((r, ri) => { (r || []).forEach((val, ci) => setCell(usedHeaderRowIdx + 1 + ri, startCol + ci, val)); });
-      rightmostCol = startCol + width;
-      blocks.push({
-        title: v.title, startCol, width, nextRowIdx: usedHeaderRowIdx + 1 + incomingRows.length,
-        existingDates: new Set(incomingRows.map(r => normalizeCellStr((r || [])[0]))),
-        lastRowValues: incomingRows.length ? incomingRows[incomingRows.length - 1] : null,
+      const openingCol = colLetter(startCol + 1);
+      const prodCol = colLetter(startCol + 2);
+      const dispCol = colLetter(startCol + 3);
+      const closingCol = colLetter(startCol + width - 1);
+      const dataStartRow0 = usedHeaderRowIdx + 1;
+      patches.push({ startRow0: usedHeaderRowIdx - 1, startCol0: startCol, values: [[v.title || '']] });
+      patches.push({ startRow0: usedHeaderRowIdx, startCol0: startCol, values: [header] });
+      let prevRow1 = null;
+      const values = incomingRows.map((r, i) => {
+        const row = r || [];
+        const thisRow1 = dataStartRow0 + i + 1;
+        const out = [
+          forceTextValue(row[0] || ''),
+          i === 0 ? 0 : `=${closingCol}${prevRow1}`,
+          Number(row[2]) || 0,
+          Number(row[3]) || 0,
+          `=${openingCol}${thisRow1}+${prodCol}${thisRow1}-${dispCol}${thisRow1}`,
+        ];
+        for (let ci = 5; ci < row.length; ci++) out.push(row[ci]);
+        prevRow1 = thisRow1;
+        return out;
       });
+      if (values.length) patches.push({ startRow0: dataStartRow0, startCol0: startCol, values });
+      rightmostCol = startCol + width;
+      blocks.push({ title: v.title, startCol, width, nextRowIdx: dataStartRow0 + values.length, existingDates: new Set(), lastRowValues: null });
     }
   });
-  return rows;
+  return patches;
 }
 
-// Builds the "summary" tab: S.No / Item Name / Quantity, one row per variant, plus a TOTAL row —
-// matching the summary sheet found in every one of the real customer files (verified directly).
-function buildSummaryGrid(rows) {
-  const grid = [['S. No.', 'Item Name', 'Quantity']];
-  let total = 0;
-  (Array.isArray(rows) ? rows : []).forEach((r, i) => {
-    const qty = Number(r.quantity) || 0;
-    grid.push([i + 1, r.item || '', qty]);
-    total += qty;
-  });
-  grid.push(['', 'TOTAL', total]);
-  return grid;
-}
-
-// Highlight colors for the "what changed since last push" formatting below. HIGHLIGHT is a warm
-// tint (matches this app's own accent color, so it doesn't look like a jarring alert) applied to
-// any cell whose value is new or different from what was in the sheet before this push; NORMAL is
-// plain white, applied to everything else FIRST so last push's highlights don't linger forever.
+// Highlight color for the "what's new since last push" formatting below — a warm tint matching this
+// app's own accent color, applied ONLY to the exact cells a patch just wrote. There's no more "reset
+// everything to white first" step: since a push never touches a pre-existing cell anymore, there's
+// nothing to fade — a cell keeps its highlight from whichever push actually last wrote it, and a
+// person can always clear formatting by hand for a cell they've since confirmed/reviewed.
 const HIGHLIGHT_COLOR = { red: 0.941, green: 0.886, blue: 0.769 };
-const NORMAL_COLOR = { red: 1, green: 1, blue: 1 };
 
-// Diffs a tab's about-to-be-written grid against what was actually in that tab before this push,
-// and returns the batchUpdate sub-requests that (a) reset the tab's whole used range back to plain
-// white, then (b) highlight only the cells that are new or changed. Cells that are blank in the new
-// grid are never highlighted even if they differ from before (a value being removed isn't "new
-// data" — in practice ledgers only ever grow, they don't retroactively blank out old rows). Adjacent
-// changed cells in the same row are merged into one range instead of one request per cell, so a
-// freshly appended ledger row (the overwhelmingly common case) costs one highlight request, not five.
-function buildHighlightRequestsForTab(sheetId, grid, prevGrid) {
+// Turns the same patches that were just written into the matching repeatCell highlight requests —
+// built from the identical structured data (startRow0/startCol0/values), so the highlighted range can
+// never disagree with what was actually written.
+function buildHighlightRequestsForPatches(sheetId, patches) {
   if (sheetId === undefined || sheetId === null) return [];
-  const rows = Array.isArray(grid) ? grid : [];
-  const prev = Array.isArray(prevGrid) ? prevGrid : [];
-  const totalRows = Math.max(rows.length, prev.length, 1);
-  const totalCols = Math.max(1, ...rows.map(r => (r || []).length), ...prev.map(r => (r || []).length));
-  const requests = [{
-    repeatCell: {
-      range: { sheetId, startRowIndex: 0, endRowIndex: totalRows, startColumnIndex: 0, endColumnIndex: totalCols },
-      cell: { userEnteredFormat: { backgroundColor: NORMAL_COLOR } },
-      fields: 'userEnteredFormat.backgroundColor',
-    },
-  }];
-  const cellStr = (v) => (v === undefined || v === null) ? '' : String(v);
-  for (let r = 0; r < totalRows; r++) {
-    const oldRow = prev[r] || [];
-    const newRow = rows[r] || [];
-    let runStart = -1;
-    for (let c = 0; c <= totalCols; c++) {
-      const changed = c < totalCols && cellStr(newRow[c]) !== '' && cellStr(newRow[c]) !== cellStr(oldRow[c]);
-      if (changed && runStart === -1) runStart = c;
-      if (!changed && runStart !== -1) {
-        requests.push({
-          repeatCell: {
-            range: { sheetId, startRowIndex: r, endRowIndex: r + 1, startColumnIndex: runStart, endColumnIndex: c },
-            cell: { userEnteredFormat: { backgroundColor: HIGHLIGHT_COLOR } },
-            fields: 'userEnteredFormat.backgroundColor',
-          },
-        });
-        runStart = -1;
-      }
-    }
-  }
-  return requests;
+  return (patches || []).map(p => {
+    const height = p.values.length;
+    const width = Math.max(0, ...p.values.map(r => r.length));
+    return {
+      repeatCell: {
+        range: {
+          sheetId,
+          startRowIndex: p.startRow0, endRowIndex: p.startRow0 + height,
+          startColumnIndex: p.startCol0, endColumnIndex: p.startCol0 + width,
+        },
+        cell: { userEnteredFormat: { backgroundColor: HIGHLIGHT_COLOR } },
+        fields: 'userEnteredFormat.backgroundColor',
+      },
+    };
+  });
 }
 
-// Pushes every item-group tab plus a summary tab to an external spreadsheet in one go, then
-// highlights whatever changed. Sequence: read tab metadata once, create any missing tabs in a single
-// batchUpdate (capturing their new numeric sheetId from the response), read every EXISTING tab's
-// current values in one batchGet (this is the "before" snapshot the highlight diff needs), write
-// each tab's new values, then apply ALL tabs' highlight formatting in one final batchUpdate. That's
-// 4 API calls total plus one values.update per tab — still just a handful of calls for an infrequent,
-// manually-triggered action, comfortably inside Google's 60 writes/minute/user quota.
-// itemGroups: [{ tabName, variants: [{ title, header, rows }] }]
-// summary: { rows: [{ item, quantity }] } (optional)
 // Real customer spreadsheets routinely have tab names with trailing spaces or inconsistent casing
 // ("hit & run ", "summary ", "SUMMARY", "T GEL ") — verified directly against BINDAL STOCK.xlsx,
 // DIAMOND.xlsx, and anmol stock dec 22.xlsx, where MOST category tabs have a trailing space. Matching
@@ -466,22 +477,23 @@ function resolveTabPlansAgainstExisting(tabPlans, existingMeta) {
   return { resolved, missing };
 }
 
-async function pushCustomerSheet(spreadsheetId, itemGroups, summary) {
-  const sheets = getSheetsClient();
-  let tabPlans = (Array.isArray(itemGroups) ? itemGroups : []).map(g => ({
-    tabName: g.tabName || 'Sheet',
-    variants: g.variants || [],
-    isSummary: false,
-  }));
-  if (summary && Array.isArray(summary.rows)) {
-    // The summary tab is a live snapshot (current balance per item), not a dated ledger — there's
-    // nothing to "merge," it should always just show the latest computed totals, so it stays a full
-    // refresh every push. The item/variant tabs below are the ones that get the merge treatment.
-    tabPlans.push({ tabName: 'summary', isSummary: true, summaryRows: summary.rows });
-  }
-  const existingMeta = await getSheetMeta(sheets, spreadsheetId);
-  let { resolved, missing } = resolveTabPlansAgainstExisting(tabPlans, existingMeta);
-  tabPlans = resolved;
+// Pushes every item-group tab to an external spreadsheet in one go, appending only new rows and
+// never touching a single pre-existing cell (see computeMergePatches above) — then highlights exactly
+// those new cells. The "summary" tab is deliberately never part of this at all: every real customer
+// file's summary tab is a handful of live formulas (one per item, pointing at that item's block's
+// last row), which keep calculating correctly on their own for as long as this app only ever GROWS a
+// block downward and never touches what's already there. Writing anything to that tab, even a
+// same-looking refresh, would replace those formulas with dead static numbers.
+// Sequence: read tab metadata once, create any missing tabs in a single batchUpdate (capturing their
+// new numeric sheetId from the response), read every EXISTING tab's current values in one batchGet
+// (this is what computeMergePatches needs to know which dates already have a row and where each
+// block's data currently ends), write every tab's new cells in ONE values.batchUpdate covering every
+// tab's patches at once, then highlight all the new cells in one final batchUpdate. That's 4 API
+// calls total for the whole push, regardless of how many tabs or rows — comfortably inside Google's
+// 60 writes/minute/user quota for an infrequent, manually-triggered action.
+// itemGroups: [{ tabName, variants: [{ title, header, rows }] }]
+async function pushCustomerSheet(spreadsheetId, itemGroups) {
+  const { sheets, existingMeta, tabPlans, missing, previousValuesByTab } = await readPushState(spreadsheetId, itemGroups);
   if (missing.length) {
     const createResp = await sheets.spreadsheets.batchUpdate({
       spreadsheetId,
@@ -494,38 +506,37 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, summary) {
       }
     });
   }
-  // "Before" snapshot — needed for BOTH the merge (to know which rows already exist and where to
-  // append) and the highlight diff (to know what's actually new). Only tabs that already had data are
-  // worth reading; a tab just created above is empty, so its previous grid is simply []. UNFORMATTED_
-  // VALUE matters here: with the default FORMATTED_VALUE, a cell showing "1,220" wouldn't string-match
-  // the raw new value "1220" and would be wrongly flagged as changed/re-parsed every single push.
-  const preExistingTabNames = tabPlans.map(p => p.tabName).filter(t => existingMeta[t] && !missing.includes(t));
-  const previousValuesByTab = {};
-  if (preExistingTabNames.length) {
-    try {
-      const readResp = await sheets.spreadsheets.values.batchGet({
-        spreadsheetId, ranges: preExistingTabNames, valueRenderOption: 'UNFORMATTED_VALUE',
-      });
-      (readResp.data.valueRanges || []).forEach((vr, i) => { previousValuesByTab[preExistingTabNames[i]] = vr.values || []; });
-    } catch (e) {
-      console.error('Customer sheet pre-push read (for highlight diff) failed — pushing without highlights:', e);
-    }
-  }
   const results = [];
   const formatRequests = [];
+  const dataUpdates = [];
+  const patchesByTab = {};
   for (const plan of tabPlans) {
+    const previousGrid = previousValuesByTab[plan.tabName] || [];
+    const patches = computeMergePatches(previousGrid, plan.variants);
+    patchesByTab[plan.tabName] = patches;
+    patches.forEach(p => {
+      const startColL = colLetter(p.startCol0);
+      const endColL = colLetter(p.startCol0 + Math.max(0, ...p.values.map(r => r.length)) - 1);
+      const range = `${plan.tabName}!${startColL}${p.startRow0 + 1}:${endColL}${p.startRow0 + p.values.length}`;
+      dataUpdates.push({ range, values: p.values });
+    });
+    results.push({ tab: plan.tabName, ok: true, newRows: patches.reduce((s, p) => s + p.values.length, 0) });
+  }
+  if (dataUpdates.length) {
     try {
-      const gridSize = existingMeta[plan.tabName] || { rowCount: 1000, columnCount: 26 };
-      const previousGrid = previousValuesByTab[plan.tabName] || [];
-      const grid = plan.isSummary ? buildSummaryGrid(plan.summaryRows) : buildMergedGrid(previousGrid, plan.variants);
-      await writeValuesClearingStale(sheets, spreadsheetId, plan.tabName, grid, gridSize);
-      results.push({ tab: plan.tabName, ok: true });
-      const sheetId = existingMeta[plan.tabName] && existingMeta[plan.tabName].sheetId;
-      formatRequests.push(...buildHighlightRequestsForTab(sheetId, grid, previousGrid));
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId,
+        requestBody: { valueInputOption: 'USER_ENTERED', data: dataUpdates },
+      });
     } catch (e) {
-      results.push({ tab: plan.tabName, ok: false, error: friendlyGoogleError(e) });
+      const msg = friendlyGoogleError(e);
+      return tabPlans.map(plan => ({ tab: plan.tabName, ok: false, error: msg }));
     }
   }
+  tabPlans.forEach(plan => {
+    const sheetId = existingMeta[plan.tabName] && existingMeta[plan.tabName].sheetId;
+    formatRequests.push(...buildHighlightRequestsForPatches(sheetId, patchesByTab[plan.tabName]));
+  });
   if (formatRequests.length) {
     try {
       await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: formatRequests } });
@@ -537,6 +548,66 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, summary) {
     }
   }
   return results;
+}
+
+// Dry-run counterpart to pushCustomerSheet — reads the SAME "before" state and identifies the SAME
+// new rows (reusing parseExistingBlocks so there's no risk of the preview ever disagreeing with what
+// an actual push would do), but never writes anything and returns plain numbers instead of formula
+// strings, since a human reviewing a diff wants to see "what will this balance become," not raw
+// Sheets formula syntax. Used to populate the review-before-push screen: shows, per item, the last
+// row already in the sheet (for continuity/context) next to the new row(s) about to be appended.
+function previewCustomerSheet(previousValuesByTab, tabPlans, missing) {
+  return tabPlans.map(plan => {
+    const previousGrid = previousValuesByTab[plan.tabName] || [];
+    const { blocks } = parseExistingBlocks(previousGrid);
+    const variants = (plan.variants || []).map(v => {
+      const key = normalizeTabKey(v.title);
+      const match = blocks.find(b => normalizeTabKey(b.title) === key);
+      const incomingRows = Array.isArray(v.rows) ? v.rows : [];
+      const newRows = match ? incomingRows.filter(r => !match.existingDates.has(normalizeCellStr((r || [])[0]))) : incomingRows;
+      let running = (match && match.lastRowValues) ? (Number(match.lastRowValues[match.width - 1]) || 0) : 0;
+      const rows = newRows.map(r => {
+        const row = r || [];
+        const opening = running;
+        const production = Number(row[2]) || 0;
+        const dispatch = Number(row[3]) || 0;
+        running = opening + production - dispatch;
+        return { date: row[0] || '', opening, production, dispatch, closing: running };
+      });
+      return {
+        title: v.title,
+        isNewBlock: !match,
+        lastExisting: (match && match.lastRowValues)
+          ? { date: match.lastRowValues[0], closing: Number(match.lastRowValues[match.width - 1]) || 0 }
+          : null,
+        rows,
+      };
+    });
+    return { tabName: plan.tabName, isNewTab: missing.includes(plan.tabName), variants };
+  });
+}
+
+// Shared read phase for both the preview and the real push — resolves tab names against what
+// already exists and reads every pre-existing tab's current values once. Kept as one function so the
+// two code paths are guaranteed to be looking at identical "before" state.
+async function readPushState(spreadsheetId, itemGroups) {
+  const sheets = getSheetsClient();
+  let tabPlans = (Array.isArray(itemGroups) ? itemGroups : []).map(g => ({
+    tabName: g.tabName || 'Sheet',
+    variants: g.variants || [],
+  }));
+  const existingMeta = await getSheetMeta(sheets, spreadsheetId);
+  const { resolved, missing } = resolveTabPlansAgainstExisting(tabPlans, existingMeta);
+  tabPlans = resolved;
+  const preExistingTabNames = tabPlans.map(p => p.tabName).filter(t => existingMeta[t] && !missing.includes(t));
+  const previousValuesByTab = {};
+  if (preExistingTabNames.length) {
+    const readResp = await sheets.spreadsheets.values.batchGet({
+      spreadsheetId, ranges: preExistingTabNames, valueRenderOption: 'UNFORMATTED_VALUE',
+    });
+    (readResp.data.valueRanges || []).forEach((vr, i) => { previousValuesByTab[preExistingTabNames[i]] = vr.values || []; });
+  }
+  return { sheets, existingMeta, tabPlans, missing, previousValuesByTab, existingTabNames: Object.keys(existingMeta) };
 }
 
 // --- Customer Sheets: IMPORT direction — read an existing customer's own Google Sheet (any
@@ -624,18 +695,41 @@ async function importCustomerSheetHandler(req, res) {
 
 async function pushCustomerSheetHandler(req, res) {
   try {
-    const { spreadsheetId, itemGroups, summary } = req.body || {};
+    const { spreadsheetId, itemGroups } = req.body || {};
     if (!spreadsheetId || !String(spreadsheetId).trim()) {
       return res.status(400).json({ error: 'spreadsheetId is required.' });
     }
     if (!Array.isArray(itemGroups)) {
       return res.status(400).json({ error: 'itemGroups must be an array.' });
     }
-    const results = await pushCustomerSheet(String(spreadsheetId).trim(), itemGroups, summary);
+    const results = await pushCustomerSheet(String(spreadsheetId).trim(), itemGroups);
     const failed = results.filter(r => !r.ok);
     res.status(failed.length ? 502 : 200).json({ ok: failed.length === 0, results });
   } catch (e) {
     console.error('Customer sheet push error:', e);
+    res.status(502).json({ error: friendlyGoogleError(e) });
+  }
+}
+
+// Dry-run version of the handler above — same request shape, but never writes anything. Backs the
+// review-before-push screen: called every time the computed itemGroups for a customer change, so the
+// screen always shows an accurate, up-to-date diff against what's REALLY in that customer's Sheet
+// right now (not a locally-guessed one), without ever risking a write as a side effect of just
+// looking at the page.
+async function previewCustomerSheetHandler(req, res) {
+  try {
+    const { spreadsheetId, itemGroups } = req.body || {};
+    if (!spreadsheetId || !String(spreadsheetId).trim()) {
+      return res.status(400).json({ error: 'spreadsheetId is required.' });
+    }
+    if (!Array.isArray(itemGroups)) {
+      return res.status(400).json({ error: 'itemGroups must be an array.' });
+    }
+    const { tabPlans, missing, previousValuesByTab, existingTabNames } = await readPushState(String(spreadsheetId).trim(), itemGroups);
+    const tabs = previewCustomerSheet(previousValuesByTab, tabPlans, missing);
+    res.json({ ok: true, tabs, existingTabNames });
+  } catch (e) {
+    console.error('Customer sheet preview error:', e);
     res.status(502).json({ error: friendlyGoogleError(e) });
   }
 }
@@ -672,4 +766,4 @@ async function putBlocksTab(req, res) {
   }
 }
 
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler };
+module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler };

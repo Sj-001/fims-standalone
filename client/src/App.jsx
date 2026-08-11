@@ -797,6 +797,17 @@ function FIMSApp() {
   const [customerSheetIds, setCustomerSheetIds] = useState([]); // [{id, customer, sheetId}]
   const [pushStatus, setPushStatus] = useState({}); // { [customer]: { state: 'idle'|'pushing'|'done'|'error', message, unmatched } }
   const [serviceAccountEmail, setServiceAccountEmail] = useState('');
+  // Review-before-push: reviewByCustomer holds the last fetched diff (a dry run against the customer's
+  // REAL Sheet — see /api/customer-sheets/preview), reviewEdits holds only what a person has changed
+  // in that preview (date/production/dispatch per row, or which tab an item is routed to) — never
+  // written back into production/customerDispatch, only ever applied on top of the computed payload at
+  // preview-refresh and push time. approvedByCustomer stores a snapshot of the edited payload at the
+  // moment "Approve" was clicked; Push to Sheet is only enabled while the CURRENT edited payload still
+  // matches that snapshot exactly — any further edit or newly confirmed register row invalidates it,
+  // requiring a fresh look before anything real gets written.
+  const [reviewByCustomer, setReviewByCustomer] = useState({}); // { [customer]: { loading, error, tabs, existingTabNames } }
+  const [reviewEdits, setReviewEdits] = useState({}); // { [customer]: { [variantTitle]: { tabNameOverride, rowEdits: { [rowIndex]: {date,production,dispatch} } } } }
+  const [approvedByCustomer, setApprovedByCustomer] = useState({}); // { [customer]: JSON string of the approved itemGroups }
   const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
   const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch };
   useEffect(() => {
@@ -1428,15 +1439,17 @@ function FIMSApp() {
   /* -------- Customer Sheets: push a customer's stock ledger out to THEIR OWN separate Google
      Sheet (not a tab on this app's main sheet) — matching the real BINDAL STOCK.xlsx / DIAMOND.xlsx /
      anmol stock dec 22.xlsx layout exactly: one tab per base item ("IT 500", "Digestive", "CREAM"),
-     with every variant of that item as its own side-by-side table within that tab, plus a "summary"
-     tab listing every variant's current closing balance. This is a write-only computed mirror (the
-     Production Register and Customer Dispatch Bills stay the real source of truth) and is pushed
-     ONLY when you click "Push to Sheet" for that customer below — never automatically. The item/
-     variant tabs are MERGED, not overwritten: the backend reads what's already in each tab first and
-     only appends rows for dates it doesn't already have there — anything already in the sheet, pushed
-     by the app before or typed in by hand, is left completely untouched, so re-pushing never creates
-     duplicate rows. The summary tab is the one exception: it's a live snapshot of current balances,
-     so it's always fully refreshed on every push (there's nothing to "merge" in a running total). */
+     with every variant of that item as its own side-by-side table within that tab. This is a
+     write-only computed mirror (the Production Register and Customer Dispatch Bills stay the real
+     source of truth) and is pushed ONLY when you click "Push to Sheet" for that customer below —
+     never automatically. The item/variant tabs are MERGED, never overwritten: the backend reads what's
+     already in each tab first and only appends rows for dates it doesn't already have there, using
+     the SAME formula convention already used throughout the real file (Opening references the
+     previous row's Closing cell, Closing = Opening+Production-Dispatch) — anything already in the
+     sheet, pushed by the app before or typed in by hand, is never touched, not even to re-write it
+     unchanged. The "summary" tab is never read or written at all: it's a handful of formulas that
+     already point at each item's block's own last row, so it keeps calculating itself correctly for
+     as long as a block only ever grows downward. */
   const allCustomerTabNames = Array.from(new Set([
     ...productCatalog.map(c => c.customer),
     ...customerNames,
@@ -1456,7 +1469,22 @@ function FIMSApp() {
   // against all 4 real dispatch bills: correctly matches every real abbreviation variant, and still
   // correctly flags a genuinely different name ("HANDLE LOCK" vs. catalog's "Tijori Handle") as
   // unmatched rather than guessing.
-  const normalizeForCatalogMatch = (s) => (s || '').toLowerCase().replace(/\bcont\.?\b/g, 'container').replace(/[^a-z0-9]/g, '');
+  //
+  // The Production Register has its own systematic abbreviation, found by tracing a real scanned
+  // page (Anmol, Dec 2025) through this exact matching logic: every entry is written as "<item> x<N>"
+  // — e.g. "Hit & Run 128g x30", "Digestive 120g x60" — where "x<N>" is that day's carton/batch count,
+  // NOT part of the item's own identity (the catalog just calls it "hit & run 128g" / "Digestive
+  // 120g"). Without stripping it, EVERY register entry for an item whose catalog name has no such
+  // suffix fails to match — which is exactly what was flooding customer sheets with one tab per
+  // register line instead of grouping into the item's real tab. This strips a trailing "x<digits>"
+  // (or "×<digits>") ONLY at the end of the string, so it's safe against catalog items whose own name
+  // legitimately ends in a pack count written the OTHER way round ("64gm * 60pkt", "32g*144pkt" —
+  // neither has a literal "x" immediately before the trailing digits, so neither is touched).
+  const normalizeForCatalogMatch = (s) => (s || '')
+    .toLowerCase()
+    .replace(/\s*[x×]\s*\d+\s*$/i, '')
+    .replace(/\bcont\.?\b/g, 'container')
+    .replace(/[^a-z0-9]/g, '');
   const buildCustomerSheetPayload = (customer) => {
     const groups = customerStockGroups.filter(g => g.customer === customer);
     const sheetGroupByItem = {};
@@ -1465,18 +1493,16 @@ function FIMSApp() {
     });
     const unmatched = [];
     const tabsMap = {};
-    const matchedGroups = [];
     groups.forEach(g => {
       const key = normalizeForCatalogMatch(g.description);
       const sheetGroup = sheetGroupByItem[key];
       // An item with no catalog match must NEVER get pushed under its own improvised tab — that's
       // exactly what fragmented real customer sheets into one tab per pack-size variant instead of
       // one tab per product category. It's reported in `unmatched` so it's visible and fixable, but
-      // it's excluded from itemGroups AND the summary tab entirely: nothing gets written to the
-      // Sheet for it until it's deliberately mapped in the Known Product Catalog with the exact
-      // wording that customer's own Sheet uses for that variant's shared tab.
+      // it's excluded from itemGroups entirely: nothing gets written to the Sheet for it until it's
+      // deliberately mapped in the Known Product Catalog with the exact wording that customer's own
+      // Sheet uses for that variant's shared tab.
       if (!sheetGroup) { unmatched.push(g.description || '(blank description)'); return; }
-      matchedGroups.push(g);
       if (!tabsMap[sheetGroup]) tabsMap[sheetGroup] = [];
       tabsMap[sheetGroup].push({
         title: g.description || 'Item',
@@ -1485,11 +1511,112 @@ function FIMSApp() {
       });
     });
     const itemGroups = Object.entries(tabsMap).map(([tabName, variants]) => ({ tabName, variants }));
-    const summaryRows = matchedGroups
-      .map(g => ({ item: g.description || 'Item', quantity: g.closingBalance }))
-      .sort((a, b) => a.item.localeCompare(b.item));
-    return { itemGroups, summary: { rows: summaryRows }, unmatched: Array.from(new Set(unmatched)) };
+    // No summary payload here on purpose — the real "summary" tab in every customer's own Sheet is a
+    // handful of live formulas (one per item, pointing at that item's block's own last row), which
+    // already keeps itself correct as long as the app only ever appends rows to a block and never
+    // rewrites it. The app never reads or writes that tab at all now, for any customer.
+    return { itemGroups, unmatched: Array.from(new Set(unmatched)) };
   };
+  // Applies whatever's staged in reviewEdits[customer] on top of the freshly computed itemGroups —
+  // used both to regenerate the diff shown on screen and to build the exact payload Push actually
+  // sends, so there's no way for what got approved to differ from what gets written. Edits live ONLY
+  // here — a changed date/production/dispatch value, or a reassigned tab, is never written back into
+  // `production`/`customerDispatch`, so the original register stays exactly as scanned or entered.
+  const applyReviewEdits = (itemGroups, editsForCustomer) => {
+    if (!editsForCustomer || !Object.keys(editsForCustomer).length) return itemGroups;
+    const regrouped = {};
+    itemGroups.forEach(g => (g.variants || []).forEach(v => {
+      const e = editsForCustomer[v.title];
+      const finalTab = (e && e.tabNameOverride && e.tabNameOverride.trim()) ? e.tabNameOverride.trim() : g.tabName;
+      const rows = (v.rows || []).map((r, i) => {
+        const re = e && e.rowEdits && e.rowEdits[i];
+        if (!re) return r;
+        return [
+          re.date !== undefined ? re.date : r[0],
+          r[1],
+          (re.production !== undefined && re.production !== '') ? Number(re.production) : r[2],
+          (re.dispatch !== undefined && re.dispatch !== '') ? Number(re.dispatch) : r[3],
+          r[4],
+        ];
+      });
+      if (!regrouped[finalTab]) regrouped[finalTab] = [];
+      regrouped[finalTab].push({ ...v, rows });
+    }));
+    return Object.entries(regrouped).map(([tabName, variants]) => ({ tabName, variants }));
+  };
+  const getEditedPayload = (customer) => {
+    const { itemGroups, unmatched } = buildCustomerSheetPayload(customer);
+    return { itemGroups: applyReviewEdits(itemGroups, reviewEdits[customer]), unmatched };
+  };
+  // Dry-runs the CURRENT (edited) payload against the customer's real Sheet so the review area always
+  // shows an accurate diff — old row (from the real Sheet, read fresh every time) next to the new
+  // row(s) about to be appended — rather than a locally-guessed one. Called automatically whenever the
+  // computed payload changes (a new register entry gets confirmed, a catalog mapping changes, or a
+  // review edit is made), debounced below, and manually never needs to be triggered by hand.
+  const refreshReview = async (customer) => {
+    const sheetId = getCustomerSheetId(customer).trim();
+    const { itemGroups } = getEditedPayload(customer);
+    if (!sheetId || !itemGroups.length) { setReviewByCustomer(prev => ({ ...prev, [customer]: null })); return; }
+    setReviewByCustomer(prev => ({ ...prev, [customer]: { ...(prev[customer] || {}), loading: true, error: '' } }));
+    try {
+      const res = await fetch('/api/customer-sheets/preview', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+        body: JSON.stringify({ spreadsheetId: sheetId, itemGroups }),
+      });
+      if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return; }
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) {
+        setReviewByCustomer(prev => ({ ...prev, [customer]: { loading: false, error: '', tabs: data.tabs, existingTabNames: data.existingTabNames || [] } }));
+      } else {
+        setReviewByCustomer(prev => ({ ...prev, [customer]: { loading: false, error: data.error || `Preview failed (HTTP ${res.status}).`, tabs: [] } }));
+      }
+    } catch (e) {
+      setReviewByCustomer(prev => ({ ...prev, [customer]: { loading: false, error: e.message || 'Network error — could not reach the server.', tabs: [] } }));
+    }
+  };
+  const setRowEdit = (customer, variantTitle, rowIndex, field, value) => {
+    setReviewEdits(prev => {
+      const forCustomer = { ...(prev[customer] || {}) };
+      const forVariant = { ...(forCustomer[variantTitle] || {}) };
+      const rowEdits = { ...(forVariant.rowEdits || {}) };
+      rowEdits[rowIndex] = { ...(rowEdits[rowIndex] || {}), [field]: value };
+      forVariant.rowEdits = rowEdits;
+      forCustomer[variantTitle] = forVariant;
+      return { ...prev, [customer]: forCustomer };
+    });
+  };
+  const setTabOverride = (customer, variantTitle, tabName) => {
+    setReviewEdits(prev => {
+      const forCustomer = { ...(prev[customer] || {}) };
+      forCustomer[variantTitle] = { ...(forCustomer[variantTitle] || {}), tabNameOverride: tabName };
+      return { ...prev, [customer]: forCustomer };
+    });
+  };
+  const approveReview = (customer) => {
+    const { itemGroups } = getEditedPayload(customer);
+    setApprovedByCustomer(prev => ({ ...prev, [customer]: JSON.stringify(itemGroups) }));
+  };
+  const isReviewApproved = (customer) => {
+    const { itemGroups } = getEditedPayload(customer);
+    return !!approvedByCustomer[customer] && approvedByCustomer[customer] === JSON.stringify(itemGroups);
+  };
+  // Auto-refreshes every customer's review whenever what would actually get pushed changes — a new
+  // production/dispatch entry gets confirmed, a catalog mapping is edited, or a review edit is made.
+  // Debounced so a burst of confirms (e.g. "Confirm all suggested") triggers one preview call per
+  // customer, not one per row.
+  const reviewRefreshKey = JSON.stringify({
+    groups: customerStockGroups.map(g => ({ c: g.customer, d: g.description, ledger: g.ledger })),
+    catalog: productCatalog, sheetIds: customerSheetIds, edits: reviewEdits,
+  });
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      allCustomerTabNames.forEach(customer => {
+        if (getCustomerSheetId(customer).trim()) refreshReview(customer);
+      });
+    }, 700);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reviewRefreshKey]);
   const persistCustomerSheetIds = (next) => {
     setCustomerSheetIds(next);
     scheduleSave('customer-sheet-ids', () => window.storage.set(CUSTOMER_SHEET_IDS_KEY, JSON.stringify(next), false).catch(() => {}));
@@ -1662,20 +1789,33 @@ function FIMSApp() {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Add a Google Sheet ID for this customer first (see field above).' } }));
       return;
     }
-    const { itemGroups, summary, unmatched } = buildCustomerSheetPayload(customer);
+    if (!isReviewApproved(customer)) {
+      setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Review the changes below and click Approve first — the diff has to be approved (and match exactly what you\'re about to push) before Push to Sheet will do anything.' } }));
+      return;
+    }
+    // Approved and current — use the EDITED payload (review edits applied), never the raw computed
+    // one, so what gets written matches exactly what was reviewed and approved.
+    const { itemGroups, unmatched } = getEditedPayload(customer);
     setPushStatus(prev => ({ ...prev, [customer]: { state: 'pushing', message: '', unmatched } }));
     try {
       const res = await fetch('/api/customer-sheets/push', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({ spreadsheetId: sheetId, itemGroups, summary }),
+        body: JSON.stringify({ spreadsheetId: sheetId, itemGroups }),
       });
       if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return; }
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.ok) {
-        setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Pushed ${itemGroups.length} item tab${itemGroups.length === 1 ? '' : 's'} + summary just now.`, unmatched } }));
+        setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Pushed ${itemGroups.length} item tab${itemGroups.length === 1 ? '' : 's'} just now.`, unmatched } }));
         patchCustomerSheetEntry(customer, { sheetId, lastPushedAt: new Date().toISOString() });
+        // The approval was for THIS specific diff — once it's actually written, clear both the
+        // approval and the row-level edits (their values are now baked into the real rows the app
+        // just appended) and pull a fresh diff so the screen immediately shows "nothing new" instead
+        // of a stale approved state that happens to still match.
+        setApprovedByCustomer(prev => { const next = { ...prev }; delete next[customer]; return next; });
+        setReviewEdits(prev => { const next = { ...prev }; delete next[customer]; return next; });
+        refreshReview(customer);
       } else {
         const failedTabs = (data.results || []).filter(r => !r.ok).map(r => `${r.tab}: ${r.error}`).join(' · ');
         setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: failedTabs || data.error || `Push failed (HTTP ${res.status}).`, unmatched } }));
@@ -2412,8 +2552,8 @@ function FIMSApp() {
             <div>
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Customer Sheets</h2>
-                <p className="subtitle" style={{ marginBottom: 4 }}>Push a customer's stock ledger out to THEIR OWN separate Google Sheet — not a tab on this app's main sheet — laid out the same way as your original BINDAL STOCK.xlsx / DIAMOND.xlsx / anmol stock files: one tab per base item, every variant of that item as its own side-by-side table within that tab, plus a "summary" tab listing every variant's current balance.</p>
-                <p className="subtitle" style={{ marginBottom: 4 }}>Pushing only happens when you click "Push to Sheet" below — nothing is pushed automatically. Pushing MERGES: it never touches or duplicates a row that's already in the sheet, whether it got there from a previous push or someone typed it in by hand — it only adds rows for dates it doesn't already have. The summary tab is the exception; it's always refreshed to show current totals, since there's nothing to merge in a running total.</p>
+                <p className="subtitle" style={{ marginBottom: 4 }}>Push a customer's stock ledger out to THEIR OWN separate Google Sheet — not a tab on this app's main sheet — laid out the same way as your original BINDAL STOCK.xlsx / DIAMOND.xlsx / anmol stock files: one tab per base item, every variant of that item as its own side-by-side table within that tab.</p>
+                <p className="subtitle" style={{ marginBottom: 4 }}>Pushing only happens when you click "Push to Sheet" below — nothing is pushed automatically. Pushing only appends: it never touches or duplicates a row that's already in the sheet, whether it got there from a previous push or someone typed it in by hand, and new rows use the same Opening/Closing formula convention already in your sheet instead of dumping in flat numbers. The "summary" tab is never touched at all — its existing formulas already point at each item's latest row, so they keep calculating themselves.</p>
                 <p className="subtitle">Setup per customer, once: create or open their Google Sheet, share it with the service account email below as an Editor, then paste that sheet's link below — you can paste the whole browser address bar URL, no need to dig out just the ID. Skipping the share step is the #1 cause of "the caller does not have permission" errors.</p>
                 <div className="field-row" style={{ marginTop: 10 }}>
                   <span style={{ fontSize: 13, fontWeight: 600 }}>Share every customer Sheet with:</span>
@@ -2471,15 +2611,20 @@ function FIMSApp() {
               {allCustomerTabNames.length === 0 && <div className="panel"><div className="empty-state">No customers yet — add one above.</div></div>}
               {allCustomerTabNames.map(customer => {
                 const status = pushStatus[customer] || {};
-                const { itemGroups, summary, unmatched } = buildCustomerSheetPayload(customer);
+                const { itemGroups, unmatched } = buildCustomerSheetPayload(customer);
+                const variantCount = itemGroups.reduce((s, g) => s + (g.variants || []).length, 0);
                 const sheetId = getCustomerSheetId(customer);
                 const registryEntry = customerSheetIds.find(c => c.customer === customer);
+                const review = reviewByCustomer[customer];
+                const reviewTabs = (review && review.tabs) || [];
+                const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => v.rows.length > 0));
+                const approved = isReviewApproved(customer);
                 return (
                   <div className="panel" key={customer}>
                     <div className="panel-header">
                       <div>
                         <h2>{customer}</h2>
-                        <p className="subtitle">{itemGroups.length} item tab{itemGroups.length === 1 ? '' : 's'} · {summary.rows.length} variant{summary.rows.length === 1 ? '' : 's'} ready to push
+                        <p className="subtitle">{itemGroups.length} item tab{itemGroups.length === 1 ? '' : 's'} · {variantCount} variant{variantCount === 1 ? '' : 's'} ready to push
                           {registryEntry?.lastImportedAt && <> · last imported {new Date(registryEntry.lastImportedAt).toLocaleString()}</>}
                           {registryEntry?.lastPushedAt && <> · last pushed {new Date(registryEntry.lastPushedAt).toLocaleString()}</>}
                         </p>
@@ -2488,7 +2633,7 @@ function FIMSApp() {
                         <button className="btn btn-ghost" onClick={() => importSheetById(sheetId, { mode: 'resync', resyncCustomer: customer })} disabled={sheetImportBusy || !sheetId.trim()} title="Re-check this customer's Sheet for newly added items and add them to the catalog">
                           <RefreshCw size={15} /> Re-sync
                         </button>
-                        <button className="btn btn-primary" onClick={() => pushCustomerSheetNow(customer)} disabled={status.state === 'pushing' || !sheetId.trim()}>
+                        <button className="btn btn-primary" onClick={() => pushCustomerSheetNow(customer)} disabled={status.state === 'pushing' || !sheetId.trim() || !approved} title={!approved ? 'Approve the changes in the review section below first' : ''}>
                           {status.state === 'pushing' ? <Loader2 size={15} className="spin" /> : <FileSpreadsheet size={15} />} Push to Sheet
                         </button>
                       </div>
@@ -2510,6 +2655,84 @@ function FIMSApp() {
                     {status.state === 'done' && <div className="doc-hint" style={{ color: 'var(--ok)', marginTop: 10 }}>✓ {status.message}</div>}
                     {status.state === 'error' && <div className="error-box" style={{ marginTop: 10 }}><AlertCircle size={16} /><span>{status.message}</span></div>}
                     {!sheetId.trim() && <div className="doc-hint" style={{ marginTop: 10 }}>Add a Sheet ID above to enable pushing or re-syncing.</div>}
+                    {sheetId.trim() && review && (
+                      <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                          <h3 style={{ margin: 0, fontSize: 14 }}>
+                            Review before push
+                            {review.loading && <span className="doc-hint" style={{ marginLeft: 8, fontWeight: 400 }}><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle' }} /> checking against the real Sheet…</span>}
+                          </h3>
+                          {hasAnyNewRows && (
+                            approved
+                              ? <span style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                  <span className="doc-hint" style={{ color: 'var(--ok)' }}>✓ Approved — matches what Push will send</span>
+                                  <button className="btn btn-ghost" onClick={() => setApprovedByCustomer(prev => { const next = { ...prev }; delete next[customer]; return next; })}>Edit again</button>
+                                </span>
+                              : <button className="btn btn-primary" onClick={() => approveReview(customer)}><CheckCircle2 size={15} /> Approve these changes</button>
+                          )}
+                        </div>
+                        {review.error && <div className="error-box"><AlertCircle size={16} /><span>{review.error}</span></div>}
+                        {!review.error && !hasAnyNewRows && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet.</div>}
+                        {reviewTabs.map(tab => (tab.variants || []).filter(v => v.rows.length > 0).map(v => (
+                          <div key={`${tab.tabName}::${v.title}`} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
+                              <strong>{v.title}</strong>
+                              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                                <span className="doc-hint">Sheet tab:</span>
+                                <input
+                                  className="cell-input" style={{ width: 150 }} list={`review-tabs-${customer}`}
+                                  value={(reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) ?? tab.tabName}
+                                  onChange={e => setTabOverride(customer, v.title, e.target.value)}
+                                  disabled={approved}
+                                />
+                                <datalist id={`review-tabs-${customer}`}>
+                                  {(review.existingTabNames || []).map(t => <option value={t} key={t} />)}
+                                </datalist>
+                                {v.isNewBlock && <span className="doc-hint">(new — this tab/block doesn't exist yet)</span>}
+                              </div>
+                            </div>
+                            <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
+                              <thead>
+                                <tr style={{ textAlign: 'left', color: 'var(--muted)' }}>
+                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Date</th>
+                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Opening</th>
+                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Production</th>
+                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Dispatch</th>
+                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Closing</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {v.lastExisting && (
+                                  <tr style={{ opacity: 0.55 }} title="Already in the real Sheet — shown for reference, never touched">
+                                    <td style={{ padding: '2px 6px' }}>{v.lastExisting.date}</td>
+                                    <td style={{ padding: '2px 6px' }} colSpan={3}>(already in the Sheet)</td>
+                                    <td style={{ padding: '2px 6px' }}>{v.lastExisting.closing}</td>
+                                  </tr>
+                                )}
+                                {v.rows.map((r, i) => {
+                                  const edit = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].rowEdits && reviewEdits[customer][v.title].rowEdits[i]) || {};
+                                  return (
+                                    <tr key={i} style={{ background: 'rgba(214,163,80,0.14)' }}>
+                                      <td style={{ padding: '2px 6px' }}>
+                                        <input className="cell-input" style={{ width: 100 }} value={edit.date ?? r.date} onChange={e => setRowEdit(customer, v.title, i, 'date', e.target.value)} disabled={approved} />
+                                      </td>
+                                      <td style={{ padding: '2px 6px' }}>{r.opening}</td>
+                                      <td style={{ padding: '2px 6px' }}>
+                                        <input className="cell-input" style={{ width: 80 }} type="number" value={edit.production ?? r.production} onChange={e => setRowEdit(customer, v.title, i, 'production', e.target.value)} disabled={approved} />
+                                      </td>
+                                      <td style={{ padding: '2px 6px' }}>
+                                        <input className="cell-input" style={{ width: 80 }} type="number" value={edit.dispatch ?? r.dispatch} onChange={e => setRowEdit(customer, v.title, i, 'dispatch', e.target.value)} disabled={approved} />
+                                      </td>
+                                      <td style={{ padding: '2px 6px' }}>{r.closing}</td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        )))}
+                      </div>
+                    )}
                   </div>
                 );
               })}

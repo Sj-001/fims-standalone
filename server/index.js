@@ -4,7 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const { requireEnv, login, logout, requireAuth } = require('./lib/auth');
 const { extract } = require('./lib/anthropic');
-const { getTab, putTab, putBlocksTab, pushCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler } = require('./lib/sheets');
+const { getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler } = require('./lib/sheets');
 
 // Fail fast and loud if required secrets are missing, instead of the app half-working with
 // confusing downstream errors — matches the "no guesses" standard this project was built to.
@@ -60,6 +60,9 @@ app.post('/api/sheets/:tab/blocks', putBlocksTab);
 // variants laid out side by side, plus a summary tab. Manually triggered from the Customer Sheets
 // tab in the app, never automatic.
 app.post('/api/customer-sheets/push', pushCustomerSheetHandler);
+// Dry-run of the above — same request shape, returns the diff (old row vs. new rows about to be
+// appended) without writing anything. Backs the review-before-push screen in the Customer Sheets tab.
+app.post('/api/customer-sheets/preview', previewCustomerSheetHandler);
 // Reads an existing customer's own Google Sheet (any spreadsheet ID) and returns its item list with
 // which tab each item belongs to, for review before adding to the Product Catalog / Customer Mapping.
 app.post('/api/customer-sheets/import', importCustomerSheetHandler);
