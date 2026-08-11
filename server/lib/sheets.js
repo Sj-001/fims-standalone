@@ -111,6 +111,35 @@ async function getSheetMeta(sheets, spreadsheetId) {
   return byTitle;
 }
 
+// Converts a 1-based column number to its A1 letter(s) (1 -> A, 26 -> Z, 27 -> AA, ...).
+function columnNumberToLetters(n) {
+  let s = '';
+  let num = n;
+  while (num > 0) {
+    const rem = (num - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    num = Math.floor((num - 1) / 26);
+  }
+  return s || 'A';
+}
+
+// Builds an UNAMBIGUOUS whole-sheet A1 range for a tab, e.g. "'N200'!A1:L1000". Passing just a bare
+// tab name as a values.get/batchGet range (what this file used to do everywhere) is dangerous: if the
+// name happens to look like a cell reference — letters immediately followed by digits, no space, e.g.
+// "N200", "E900", "N150" — the Sheets API silently reads it as THAT CELL on the spreadsheet's default
+// sheet instead of "the whole tab with this name," and returns 0 rows with no error at all. Confirmed
+// directly against the live API (a bare "N200" request came back tagged "'summary '!N200" — i.e. cell
+// N200 on the first/default tab). Quoting the sheet name AND appending an explicit A1 range removes
+// the ambiguity entirely, verified against the same tabs that were previously misread. Every place
+// that requests a tab by name for a batchGet/get call MUST go through this, not a bare title string.
+function wholeSheetRangeA1(title, meta) {
+  const rowCount = (meta && meta.rowCount) || 1000;
+  const columnCount = (meta && meta.columnCount) || 26;
+  const lastCol = columnNumberToLetters(columnCount);
+  const safeTitle = String(title).replace(/'/g, "''");
+  return `'${safeTitle}'!A1:${lastCol}${rowCount}`;
+}
+
 // Creates the tab if it doesn't exist yet. Returns its current {rowCount, columnCount} either way
 // (a freshly created tab gets Google Sheets' default new-sheet grid, 1000x26, which this also
 // returns so the caller doesn't need a second read to find out).
@@ -527,6 +556,13 @@ const TAB_KEY_ALIASES = [
 ];
 const normalizeTabKey = (name) => {
   let s = String(name || '').trim().toLowerCase();
+  // Fold hyphens/dashes into a plain space FIRST, before any alias or whitespace-collapse logic runs.
+  // Confirmed against a real mismatch: the Production Register spells one Bindal item "T-GEL CONT"
+  // (hyphen) while the real Sheet's block is titled "T GEL CONTAINER" (space) — since only whitespace
+  // got collapsed below, the hyphen survived and the two never converged to the same key. Treating
+  // -/–/— exactly like a space (rather than stripping it outright) keeps this symmetric with how
+  // spaces are already handled everywhere else in this function.
+  s = s.replace(/[-‐-―]/g, ' ');
   TAB_KEY_ALIASES.forEach(([pattern, replacement]) => { s = s.replace(pattern, replacement); });
   // Trailing "x60ppkt" / "×60 pkt" / "*60" style pack-count marker: an explicit multiplier symbol
   // (x/×/*) is an unambiguous signal that whatever follows is a pack/carton count, never part of a
@@ -694,7 +730,9 @@ async function readPushState(spreadsheetId, itemGroups) {
   const previousValuesByTab = {};
   if (preExistingTabNames.length) {
     const readResp = await sheets.spreadsheets.values.batchGet({
-      spreadsheetId, ranges: preExistingTabNames, valueRenderOption: 'UNFORMATTED_VALUE',
+      spreadsheetId,
+      ranges: preExistingTabNames.map(t => wholeSheetRangeA1(t, existingMeta[t])),
+      valueRenderOption: 'UNFORMATTED_VALUE',
     });
     (readResp.data.valueRanges || []).forEach((vr, i) => { previousValuesByTab[preExistingTabNames[i]] = vr.values || []; });
   }
@@ -747,15 +785,22 @@ async function importCustomerSheet(spreadsheetId) {
   const sheets = getSheetsClient();
   const meta = await sheets.spreadsheets.get({
     spreadsheetId,
-    fields: 'properties.title,sheets.properties.title',
+    fields: 'properties.title,sheets.properties(title,gridProperties(rowCount,columnCount))',
   });
   const spreadsheetTitle = (meta.data.properties && meta.data.properties.title) || '';
   const allTabTitles = (meta.data.sheets || []).map(s => s.properties.title);
+  const gridPropsByTitle = {};
+  (meta.data.sheets || []).forEach(s => { gridPropsByTitle[s.properties.title] = s.properties.gridProperties || {}; });
   const dataTabTitles = allTabTitles.filter(t => !/summary/i.test(t));
   if (!dataTabTitles.length) {
     return { spreadsheetTitle, tabCount: allTabTitles.length, items: [] };
   }
-  const resp = await sheets.spreadsheets.values.batchGet({ spreadsheetId, ranges: dataTabTitles });
+  // See wholeSheetRangeA1 above: a bare tab name is ambiguous with a cell reference (e.g. "N200",
+  // "E900") and the Sheets API will silently read the wrong thing. Always quote + range every tab.
+  const resp = await sheets.spreadsheets.values.batchGet({
+    spreadsheetId,
+    ranges: dataTabTitles.map(t => wholeSheetRangeA1(t, gridPropsByTitle[t])),
+  });
   const items = [];
   (resp.data.valueRanges || []).forEach((vr, idx) => {
     const tabName = dataTabTitles[idx];
@@ -857,66 +902,4 @@ async function putBlocksTab(req, res) {
   }
 }
 
-// TEMP DEBUG — added to track down why parseExistingBlocks/extractItemsFromTabGrid report "no date
-// header found" on N200/N150/E900/T GEL/TIJORI HANDLE while structurally-identical tabs (E130/N100/
-// IT500) parse fine. Returns exactly what sheets.spreadsheets.values.get hands back for one tab, raw,
-// so the real API response can be inspected instead of guessed at. REMOVE after root cause is found.
-async function debugRawTabHandler(req, res) {
-  try {
-    const { spreadsheetId, tabName } = req.body || {};
-    if (!spreadsheetId || !tabName) return res.status(400).json({ error: 'spreadsheetId and tabName are required.' });
-    const sheets = getSheetsClient();
-    const meta = await sheets.spreadsheets.get({
-      spreadsheetId,
-      fields: 'sheets.properties(sheetId,title,index,gridProperties,hidden)',
-    });
-    const sheetMetaEntry = (meta.data.sheets || []).find(s => s.properties.title === tabName);
-    const resp = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: tabName,
-      valueRenderOption: 'UNFORMATTED_VALUE',
-    });
-    const values = resp.data.values || [];
-    res.json({
-      requestedRange: resp.data.range,
-      sheetProperties: sheetMetaEntry ? sheetMetaEntry.properties : null,
-      rowCount: values.length,
-      rowLengths: values.map(r => r.length),
-      first6Rows: values.slice(0, 6).map(r => r.map(c => ({ value: c, type: typeof c, jsonEscaped: JSON.stringify(c) }))),
-    });
-  } catch (e) {
-    console.error('debugRawTabHandler error:', e);
-    res.status(500).json({ error: String(e && e.message || e), stack: e && e.stack });
-  }
-}
-
-// TEMP DEBUG #2 — reproduces the exact multi-range batchGet the real import/preview code uses, to
-// check whether a batch that mixes ambiguous bare-name ranges (N200/E900/N150, which the API reads as
-// cell refs on the default sheet — confirmed via debugRawTabHandler above) with normal sheet-name
-// ranges causes the RESPONSE array to misalign with the REQUEST array by index. REMOVE with the above.
-async function debugBatchTabsHandler(req, res) {
-  try {
-    const { spreadsheetId, tabNames } = req.body || {};
-    if (!spreadsheetId || !Array.isArray(tabNames)) return res.status(400).json({ error: 'spreadsheetId and tabNames[] are required.' });
-    const sheets = getSheetsClient();
-    const resp = await sheets.spreadsheets.values.batchGet({
-      spreadsheetId, ranges: tabNames, valueRenderOption: 'UNFORMATTED_VALUE',
-    });
-    const valueRanges = resp.data.valueRanges || [];
-    res.json({
-      requestedTabNames: tabNames,
-      responseCount: valueRanges.length,
-      perIndex: valueRanges.map((vr, i) => ({
-        requestedAtThisIndex: tabNames[i],
-        returnedRange: vr.range,
-        rowCount: (vr.values || []).length,
-        firstCell: vr.values && vr.values[0] ? vr.values[0][0] : null,
-      })),
-    });
-  } catch (e) {
-    console.error('debugBatchTabsHandler error:', e);
-    res.status(500).json({ error: String(e && e.message || e), stack: e && e.stack });
-  }
-}
-
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, debugRawTabHandler, debugBatchTabsHandler };
+module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler };
