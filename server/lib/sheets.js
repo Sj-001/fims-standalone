@@ -299,6 +299,43 @@ const serialToDateStr = (n) => {
 // to a readable date string first, instead of stringifying the raw number.
 const normalizeDateCell = (v) => (typeof v === 'number' && isFinite(v)) ? serialToDateStr(v) : normalizeCellStr(v);
 
+const MONTH_ABBR_TO_NUM = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+// Produces a canonical "YYYY-MM-DD" key for DUPLICATE-ROW DETECTION ONLY — never for what actually
+// gets written or displayed (that stays exactly as normalizeDateCell/normalizeCellStr already produce
+// it). The same real date shows up written in several different formats depending on where a row came
+// from — dot "18.7.26" (this app's own pushes, and most of what's already hand-typed in these Sheets),
+// slash "18/07/2026" (Production Register OCR), dash+month "18-Jul-26" (Customer Dispatch Bill
+// extraction), or a numeric Sheets date serial. Comparing those as raw trimmed strings (what this used
+// to do) means they never match each other, so the SAME real transaction gets pushed a second time as
+// a "new" row instead of being recognized as already in the sheet — confirmed directly: Bindal's T GEL
+// tab ended up with both "18.07.26" and "18-Jul-26" as separate rows for what was really one dispatch.
+// Every date comparison used to decide "is this row already here" MUST go through this, not through
+// normalizeDateCell/normalizeCellStr directly.
+function canonicalDateKey(v) {
+  if (typeof v === 'number' && isFinite(v)) {
+    const ms = Math.round((v - 25569) * 86400 * 1000); // 25569 = days between 1899-12-30 and 1970-01-01
+    const d = new Date(ms);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  }
+  const s = normalizeCellStr(v);
+  if (!s) return '';
+  const toKey = (d, mo, y) => {
+    const yyyy = String(y).length <= 2 ? (Number(y) + 2000) : Number(y);
+    return `${yyyy}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  };
+  let m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$/);
+  if (m) return toKey(m[1], m[2], m[3]);
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (m) return toKey(m[1], m[2], m[3]);
+  m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})$/);
+  if (m) {
+    const mo = MONTH_ABBR_TO_NUM[m[2].toLowerCase()];
+    if (mo) return toKey(m[1], mo, m[3]);
+  }
+  // Unrecognized format — fall back to the literal trimmed string, same behavior as before this fix.
+  return s.toLowerCase();
+}
+
 // Parses an EXISTING tab's grid into its variant blocks, using the same "find the row containing a
 // 'date' cell" heuristic used for import — so a merge-push can tell, per variant, exactly which dates
 // already have a row (whether the app put it there on a previous push, or a person typed it in by
@@ -330,7 +367,7 @@ function parseExistingBlocks(grid) {
     for (let r = headerRowIdx + 1; r < rows.length; r++) {
       const dateStr = normalizeDateCell((rows[r] || [])[startCol]);
       if (!dateStr) break; // first blank date cell ends this block's existing data
-      existingDates.add(dateStr);
+      existingDates.add(canonicalDateKey((rows[r] || [])[startCol]));
       nextRowIdx = r + 1;
       lastRowValues = [];
       for (let c = startCol; c < startCol + width; c++) {
@@ -414,7 +451,7 @@ function computeMergePatches(existingGrid, variants) {
     const incomingRows = Array.isArray(v.rows) ? v.rows : [];
 
     if (match) {
-      const newRows = incomingRows.filter(r => !match.existingDates.has(normalizeCellStr((r || [])[0])));
+      const newRows = incomingRows.filter(r => !match.existingDates.has(canonicalDateKey((r || [])[0])));
       if (!newRows.length) return;
       const openingCol = colLetter(match.startCol + 1);
       const prodCol = colLetter(match.startCol + 2);
@@ -442,7 +479,7 @@ function computeMergePatches(existingGrid, variants) {
       // them. Advancing the block's own bookkeeping here — same object `blocks.find` will return next
       // time — is what makes that safe.
       match.nextRowIdx += newRows.length;
-      newRows.forEach(r => match.existingDates.add(normalizeCellStr((r || [])[0])));
+      newRows.forEach(r => match.existingDates.add(canonicalDateKey((r || [])[0])));
     } else {
       const startCol = rightmostCol === -1 ? 0 : rightmostCol + 1;
       const width = Math.max(header.length, ...incomingRows.map(r => (r || []).length), 1);
@@ -684,7 +721,7 @@ function previewCustomerSheet(previousValuesByTab, tabPlans, missing) {
       const key = normalizeTabKey(v.title);
       const match = blocks.find(b => normalizeTabKey(b.title) === key);
       const incomingRows = Array.isArray(v.rows) ? v.rows : [];
-      const newRows = match ? incomingRows.filter(r => !match.existingDates.has(normalizeCellStr((r || [])[0]))) : incomingRows;
+      const newRows = match ? incomingRows.filter(r => !match.existingDates.has(canonicalDateKey((r || [])[0]))) : incomingRows;
       const lastExisting = (match && match.lastRowValues)
         ? { date: match.lastRowValues[0], closing: Number(match.lastRowValues[match.width - 1]) || 0 }
         : null;
@@ -702,7 +739,7 @@ function previewCustomerSheet(previousValuesByTab, tabPlans, missing) {
       // running balance continues from here instead of the real sheet's last row, and so it doesn't
       // re-offer the same dates as "new".
       if (match && rows.length) {
-        newRows.forEach(r => match.existingDates.add(normalizeCellStr((r || [])[0])));
+        newRows.forEach(r => match.existingDates.add(canonicalDateKey((r || [])[0])));
         const synthesized = new Array(match.width).fill(null);
         synthesized[0] = rows[rows.length - 1].date;
         synthesized[match.width - 1] = rows[rows.length - 1].closing;
