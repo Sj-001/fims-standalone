@@ -2681,7 +2681,12 @@ function FIMSApp() {
                         {!review.error && !hasAnyNewRows && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet.</div>}
                         {reviewTabs.map(tab => (tab.variants || []).filter(v => v.rows.length > 0).map(v => (
                           <div key={`${tab.tabName}::${v.title}`} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
-                            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
+                            <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
+                              {/* alignItems:'baseline' (not 'center') — the title is 16px bold and the
+                                  label/input/new-tag are all 12px, so centering by height put the smaller
+                                  text visibly higher than the title instead of sitting on the same line of
+                                  text. Baseline alignment lines up their actual text baselines, which is
+                                  what "sitting on the same line" means for mixed font sizes. */}
                               <strong>{v.title}</strong>
                               <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>— Sheet tab:</span>
                               {(() => {
