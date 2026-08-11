@@ -2443,12 +2443,44 @@ function FIMSApp() {
                 </div>
               )}
               {(() => {
+                // Restores the per-item ledger table this page originally had for Unassigned entries
+                // (it got collapsed to a one-line description list when the real per-customer ledgers
+                // moved to the Customer Sheets tab — but Unassigned isn't a real customer with a Sheet,
+                // so it never got a home over there, and lost its table in the move). Each item shown
+                // here is a confirmed Production/Dispatch row that still doesn't match any Customer
+                // Mapping rule, with its full production+dispatch ledger so you can see exactly what's
+                // sitting unrouted before writing the keyword rule that will pick it up.
                 const unassignedGroups = customerStockGroups.filter(g => g.customer === 'Unassigned');
                 if (!unassignedGroups.length) return null;
                 return (
-                  <div className="error-box">
-                    <AlertCircle size={16} />
-                    <span>{unassignedGroups.length} description{unassignedGroups.length === 1 ? '' : 's'} didn't match any rule in Customer Mapping, so they're not attributed to any customer yet: {unassignedGroups.map(g => g.description).join(', ')}. Add a keyword rule for them in Customer Mapping so they route to the right customer.</span>
+                  <div className="panel" style={{ borderColor: 'var(--ledger-red)' }}>
+                    <div className="panel-header">
+                      <div>
+                        <h2>Unassigned ({unassignedGroups.length})</h2>
+                        <p className="subtitle">Confirmed rows that didn't match any rule in Customer Mapping, so they're not attributed to any customer yet. Add a keyword rule for them in Customer Mapping, then they'll route to the right customer automatically.</p>
+                      </div>
+                    </div>
+                    {unassignedGroups.map(g => (
+                      <div key={g.id} style={{ marginBottom: 18 }}>
+                        <div className="section-label">{g.description} — closing balance: <Pill tone={g.closingBalance >= 0 ? 'ok' : 'warn'}>{g.closingBalance}</Pill></div>
+                        <div className="table-wrap">
+                          <table>
+                            <thead><tr><th>Date</th><th>Opening</th><th>Production</th><th>Dispatch</th><th>Closing</th></tr></thead>
+                            <tbody>
+                              {g.ledger.map((e, i) => (
+                                <tr key={i}>
+                                  <td style={{ padding: '6px 10px' }}>{e.date}</td>
+                                  <td style={{ padding: '6px 10px' }}>{e.opening}</td>
+                                  <td style={{ padding: '6px 10px' }}>{e.pieces || ''}</td>
+                                  <td style={{ padding: '6px 10px' }}>{e.dispatch || ''}</td>
+                                  <td style={{ padding: '6px 10px' }}>{e.closing}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 );
               })()}
