@@ -1531,6 +1531,40 @@ function FIMSApp() {
     .replace(/\s*[x×]\s*\d+\s*$/i, '')
     .replace(/\bcont\.?\b/g, 'container')
     .replace(/[^a-z0-9]/g, '');
+  // Every real customer Sheet writes dates as dot-separated D.M.YY ("5.1.24", "26.1.24") — never with
+  // slashes or month names. Rows we push come from several different sources with their own native
+  // formats though: Production Register OCR tends to read as "02/01/2026" (slash), Customer Dispatch
+  // Bills extraction reads as "16-Jul-26" (dash + month abbreviation), and manually-typed rows are
+  // already dot-formatted. Pushing whatever format a row happened to arrive in — as the app did before
+  // this — makes the same block end up with three different date styles mixed together (confirmed
+  // directly in Bindal's N200 tab). This normalizes any of those known formats to the Sheet's own dot
+  // convention right before a row is sent; anything unrecognized is left exactly as-is rather than
+  // guessed at, so a genuinely new format shows up untouched (and visibly odd) instead of silently
+  // mangled.
+  const MONTH_ABBR_TO_NUM = { jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9, oct:10, nov:11, dec:12 };
+  const formatDateForPush = (raw) => {
+    const s = String(raw || '').trim();
+    if (!s) return s;
+    // Already dot-separated ("5.1.24", "13.08.24") — leave as-is, that's the target format.
+    if (/^\d{1,2}\.\d{1,2}\.\d{2,4}$/.test(s)) return s;
+    // Slash-separated DD/MM/YYYY or D/M/YY (what the Production Register's OCR tends to produce).
+    let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+    if (m) {
+      const yy = m[3].length > 2 ? m[3].slice(-2) : m[3];
+      return `${Number(m[1])}.${Number(m[2])}.${yy}`;
+    }
+    // Dash + month-abbreviation ("16-Jul-26", what Customer Dispatch Bill extraction produces).
+    m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})$/);
+    if (m) {
+      const monthNum = MONTH_ABBR_TO_NUM[m[2].toLowerCase()];
+      if (monthNum) {
+        const yy = m[3].length > 2 ? m[3].slice(-2) : m[3];
+        return `${Number(m[1])}.${monthNum}.${yy}`;
+      }
+    }
+    // Unrecognized format — don't guess, leave untouched.
+    return s;
+  };
   const buildCustomerSheetPayload = (customer) => {
     const groups = customerStockGroups.filter(g => g.customer === customer);
     const sheetGroupByItem = {};
@@ -1553,7 +1587,7 @@ function FIMSApp() {
       tabsMap[sheetGroup].push({
         title: g.description || 'Item',
         header: ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
-        rows: g.ledger.map(e => [e.date || '', e.opening, e.pieces || 0, e.dispatch || 0, e.closing]),
+        rows: g.ledger.map(e => [formatDateForPush(e.date), e.opening, e.pieces || 0, e.dispatch || 0, e.closing]),
       });
     });
     const itemGroups = Object.entries(tabsMap).map(([tabName, variants]) => ({ tabName, variants }));
