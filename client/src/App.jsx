@@ -1370,8 +1370,28 @@ function FIMSApp() {
   };
   const matchCustomer = (row) => {
     const hint = (row.customerHint || '').trim();
-    if (hint) return hint.charAt(0).toUpperCase() + hint.slice(1).toLowerCase();
     const d = (row.description || '').toLowerCase();
+    if (hint) {
+      // A dispatch bill's Party field often carries a full legal name ("Anmol Industries
+      // Ltd.") rather than the short name we already track ("Anmol"). Before treating this
+      // hint as a brand-new customer, check it against customers we already know — anyone
+      // with a tracked Sheet, or anyone already used in Customer Mapping. If the hint
+      // contains (or is contained by) a known customer's name, route there instead of
+      // spinning up a disconnected duplicate. This is what makes it sustainable: a new
+      // legal-name variant of an EXISTING customer resolves automatically from now on, no
+      // code change needed — only a genuinely new customer still lands here as "new," and
+      // that just needs a Customer Mapping keyword rule (added from the UI, not code).
+      const hintLower = hint.toLowerCase();
+      const knownCustomers = new Set([
+        ...customerSheetIds.map(c => c.customer),
+        ...customerMapping.map(r => r.customer),
+      ].filter(Boolean));
+      for (const known of knownCustomers) {
+        const knownLower = known.toLowerCase();
+        if (hintLower.includes(knownLower) || knownLower.includes(hintLower)) return known;
+      }
+      return hint.charAt(0).toUpperCase() + hint.slice(1).toLowerCase();
+    }
     for (const rule of customerMapping) {
       if (rule.keyword && d.includes(rule.keyword.toLowerCase())) return rule.customer || 'Unassigned';
     }
