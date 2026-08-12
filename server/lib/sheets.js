@@ -18,6 +18,7 @@
 const { google } = require('googleapis');
 
 let _sheetsClient = null;
+let _driveClient = null;
 
 function getCredentials() {
   // Accept either the raw JSON (GOOGLE_SERVICE_ACCOUNT_JSON) or a base64-encoded version
@@ -36,16 +37,67 @@ function getCredentials() {
   throw new Error('Set either GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_BASE64.');
 }
 
+// TEMPORARY (debug): 'drive.file' added alongside 'spreadsheets' purely to test whether this service
+// account can create + share a brand-new spreadsheet at all (plain service accounts typically have no
+// Drive storage of their own, which would make that fail) — see debugTestSheetCreateHandler below.
+// 'drive.file' only ever grants access to files this app itself creates, never the rest of anyone's
+// Drive. If the test shows creation doesn't work, this scope (and the drive client) gets removed again
+// along with the debug endpoint.
 function getSheetsClient() {
   if (_sheetsClient) return _sheetsClient;
   const credentials = getCredentials();
   const auth = new google.auth.JWT({
     email: credentials.client_email,
     key: credentials.private_key,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    scopes: ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file'],
   });
   _sheetsClient = google.sheets({ version: 'v4', auth });
   return _sheetsClient;
+}
+function getDriveClient() {
+  if (_driveClient) return _driveClient;
+  const credentials = getCredentials();
+  const auth = new google.auth.JWT({
+    email: credentials.client_email,
+    key: credentials.private_key,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file'],
+  });
+  _driveClient = google.drive({ version: 'v3', auth });
+  return _driveClient;
+}
+// TEMPORARY (debug): creates a small throwaway spreadsheet and tries to share it with the given email
+// (defaults to the account this app is run for) — answers, definitively, whether this service account
+// can create+share brand-new files before any real "generate a customer sheet from scratch" feature
+// gets built on top of that assumption. Reports exactly which step failed and why, if either does.
+// Remove this handler (and its route in index.js) once the answer is known.
+async function debugTestSheetCreateHandler(req, res) {
+  const email = (req.body && req.body.email) || 'shrutijainsj001@gmail.com';
+  const result = { createOk: false, shareOk: false };
+  try {
+    const sheets = getSheetsClient();
+    const createResp = await sheets.spreadsheets.create({
+      requestBody: { properties: { title: 'FIMS test — safe to delete' } },
+    });
+    result.createOk = true;
+    result.spreadsheetId = createResp.data.spreadsheetId;
+    result.spreadsheetUrl = createResp.data.spreadsheetUrl;
+  } catch (e) {
+    result.createError = { message: e.message, code: e.code || (e.response && e.response.status), details: e.response && e.response.data };
+    return res.json(result);
+  }
+  try {
+    const drive = getDriveClient();
+    await drive.permissions.create({
+      fileId: result.spreadsheetId,
+      requestBody: { type: 'user', role: 'writer', emailAddress: email },
+      sendNotificationEmail: false,
+    });
+    result.shareOk = true;
+    result.sharedWith = email;
+  } catch (e) {
+    result.shareError = { message: e.message, code: e.code || (e.response && e.response.status), details: e.response && e.response.data };
+  }
+  res.json(result);
 }
 
 function getSpreadsheetId() {
@@ -939,4 +991,4 @@ async function putBlocksTab(req, res) {
   }
 }
 
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler };
+module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, debugTestSheetCreateHandler };
