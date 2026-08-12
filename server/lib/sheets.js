@@ -18,7 +18,6 @@
 const { google } = require('googleapis');
 
 let _sheetsClient = null;
-let _driveClient = null;
 
 function getCredentials() {
   // Accept either the raw JSON (GOOGLE_SERVICE_ACCOUNT_JSON) or a base64-encoded version
@@ -37,67 +36,16 @@ function getCredentials() {
   throw new Error('Set either GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_BASE64.');
 }
 
-// TEMPORARY (debug): 'drive.file' added alongside 'spreadsheets' purely to test whether this service
-// account can create + share a brand-new spreadsheet at all (plain service accounts typically have no
-// Drive storage of their own, which would make that fail) — see debugTestSheetCreateHandler below.
-// 'drive.file' only ever grants access to files this app itself creates, never the rest of anyone's
-// Drive. If the test shows creation doesn't work, this scope (and the drive client) gets removed again
-// along with the debug endpoint.
 function getSheetsClient() {
   if (_sheetsClient) return _sheetsClient;
   const credentials = getCredentials();
   const auth = new google.auth.JWT({
     email: credentials.client_email,
     key: credentials.private_key,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file'],
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
   _sheetsClient = google.sheets({ version: 'v4', auth });
   return _sheetsClient;
-}
-function getDriveClient() {
-  if (_driveClient) return _driveClient;
-  const credentials = getCredentials();
-  const auth = new google.auth.JWT({
-    email: credentials.client_email,
-    key: credentials.private_key,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file'],
-  });
-  _driveClient = google.drive({ version: 'v3', auth });
-  return _driveClient;
-}
-// TEMPORARY (debug): creates a small throwaway spreadsheet and tries to share it with the given email
-// (defaults to the account this app is run for) — answers, definitively, whether this service account
-// can create+share brand-new files before any real "generate a customer sheet from scratch" feature
-// gets built on top of that assumption. Reports exactly which step failed and why, if either does.
-// Remove this handler (and its route in index.js) once the answer is known.
-async function debugTestSheetCreateHandler(req, res) {
-  const email = (req.body && req.body.email) || 'shrutijainsj001@gmail.com';
-  const result = { createOk: false, shareOk: false };
-  try {
-    const sheets = getSheetsClient();
-    const createResp = await sheets.spreadsheets.create({
-      requestBody: { properties: { title: 'FIMS test — safe to delete' } },
-    });
-    result.createOk = true;
-    result.spreadsheetId = createResp.data.spreadsheetId;
-    result.spreadsheetUrl = createResp.data.spreadsheetUrl;
-  } catch (e) {
-    result.createError = { message: e.message, code: e.code || (e.response && e.response.status), details: e.response && e.response.data };
-    return res.json(result);
-  }
-  try {
-    const drive = getDriveClient();
-    await drive.permissions.create({
-      fileId: result.spreadsheetId,
-      requestBody: { type: 'user', role: 'writer', emailAddress: email },
-      sendNotificationEmail: false,
-    });
-    result.shareOk = true;
-    result.sharedWith = email;
-  } catch (e) {
-    result.shareError = { message: e.message, code: e.code || (e.response && e.response.status), details: e.response && e.response.data };
-  }
-  res.json(result);
 }
 
 function getSpreadsheetId() {
@@ -495,6 +443,11 @@ function computeMergePatches(existingGrid, variants) {
   const usedHeaderRowIdx = headerRowIdx === -1 ? 1 : headerRowIdx; // title row 0, header row 1 by default
   let rightmostCol = blocks.reduce((max, b) => Math.max(max, b.startCol + b.width), -1);
   const patches = [];
+  // One entry per variant: exactly where its block ended up and how far its just-written rows reached
+  // (row1 = 1-indexed sheet row number of the LAST row just written, real or phantom-padding). Lets a
+  // caller building a summary-tab formula reference (generateCustomerSheetStructure) point at a precise
+  // cell without re-deriving this same column/row math itself.
+  const placements = [];
 
   (Array.isArray(variants) ? variants : []).forEach(v => {
     const key = normalizeTabKey(v.title);
@@ -509,13 +462,23 @@ function computeMergePatches(existingGrid, variants) {
       const prodCol = colLetter(match.startCol + 2);
       const dispCol = colLetter(match.startCol + 3);
       const closingCol = colLetter(match.startCol + match.width - 1);
+      // A block can be "found" here (its title+header exist) while having ZERO real data rows yet —
+      // exactly what generateCustomerSheetStructure creates for a brand-new customer, ahead of any
+      // real transaction. In that case there's no real previous row to reference: nextRowIdx just
+      // points at the row right after the header, so `=${closingCol}${match.nextRowIdx}` would
+      // reference the HEADER row's cell (literally the text "Closing"), not a balance. The first row
+      // of a truly empty block needs a literal 0 opening balance, same as a brand-new block created
+      // from scratch below; only rows after that (whether pre-existing or added earlier in this same
+      // push) can safely reference a previous row.
+      const hasRealPriorRow = match.existingDates.size > 0;
       let prevRow1 = match.nextRowIdx; // 0-indexed row (match.nextRowIdx - 1) -> 1-indexed = match.nextRowIdx
       const values = newRows.map((r, i) => {
         const row = r || [];
         const thisRow1 = match.nextRowIdx + i + 1;
+        const opening = (i === 0 && !hasRealPriorRow) ? 0 : `=${closingCol}${prevRow1}`;
         const out = [
           forceTextValue(row[0] || ''),
-          `=${closingCol}${prevRow1}`,
+          opening,
           Number(row[2]) || 0,
           Number(row[3]) || 0,
           `=${openingCol}${thisRow1}+${prodCol}${thisRow1}-${dispCol}${thisRow1}`,
@@ -525,6 +488,7 @@ function computeMergePatches(existingGrid, variants) {
         return out;
       });
       patches.push({ startRow0: match.nextRowIdx, startCol0: match.startCol, values });
+      placements.push({ title: v.title, startCol0: match.startCol, width: match.width, lastWrittenRow1: match.nextRowIdx + newRows.length });
       // If a SECOND variant in this same push also resolves to this block (two catalog entries
       // mapped to the same real block, or two differently-worded register lines for the same item),
       // it must continue appending after THESE rows, not start over at the same spot and overwrite
@@ -558,11 +522,12 @@ function computeMergePatches(existingGrid, variants) {
         return out;
       });
       if (values.length) patches.push({ startRow0: dataStartRow0, startCol0: startCol, values });
+      placements.push({ title: v.title, startCol0: startCol, width, lastWrittenRow1: dataStartRow0 + values.length });
       rightmostCol = startCol + width;
       blocks.push({ title: v.title, startCol, width, nextRowIdx: dataStartRow0 + values.length, existingDates: new Set(), lastRowValues: null });
     }
   });
-  return patches;
+  return { patches, placements };
 }
 
 // Highlight color for the "what's new since last push" formatting below — a warm tint matching this
@@ -721,7 +686,7 @@ async function pushCustomerSheet(spreadsheetId, itemGroups) {
   const patchesByTab = {};
   for (const plan of tabPlans) {
     const previousGrid = previousValuesByTab[plan.tabName] || [];
-    const patches = computeMergePatches(previousGrid, plan.variants);
+    const { patches, placements } = computeMergePatches(previousGrid, plan.variants);
     patchesByTab[plan.tabName] = patches;
     patches.forEach(p => {
       const startColL = colLetter(p.startCol0);
@@ -729,7 +694,11 @@ async function pushCustomerSheet(spreadsheetId, itemGroups) {
       const range = `${plan.tabName}!${startColL}${p.startRow0 + 1}:${endColL}${p.startRow0 + p.values.length}`;
       dataUpdates.push({ range, values: p.values });
     });
-    results.push({ tab: plan.tabName, ok: true, newRows: patches.reduce((s, p) => s + p.values.length, 0) });
+    // placements is included alongside the usual ok/newRows summary purely so a caller building
+    // structure for a brand-new customer (generateCustomerSheetStructure) can construct a precise
+    // summary-tab formula reference per item without re-deriving this column/row math itself. Ignored
+    // by every other existing caller of pushCustomerSheet.
+    results.push({ tab: plan.tabName, ok: true, newRows: patches.reduce((s, p) => s + p.values.length, 0), placements });
   }
   if (dataUpdates.length) {
     try {
@@ -757,6 +726,141 @@ async function pushCustomerSheet(spreadsheetId, itemGroups) {
     }
   }
   return results;
+}
+
+// --- Customer Sheets: GENERATE a brand-new customer's full tab/item-block/summary structure inside a
+// spreadsheet the person already created and shared with the service account themselves. The service
+// account can't create+own a new spreadsheet on its own — verified directly: plain service accounts
+// have no Drive storage of their own, so `spreadsheets.create` comes back 403 PERMISSION_DENIED — but
+// writing into an already-shared blank sheet needs nothing beyond the ordinary Sheets permission this
+// app already has for every other customer sheet, so that's the split: the person creates+shares an
+// empty Sheet (the same one-time step already required for every customer), this fills it in.
+//
+// Every item block is pre-seeded with GENERATED_PAD_ROWS "phantom" carry-forward rows (blank date, 0
+// production/dispatch, live Opening/Closing formulas chained to the row above) — the exact authoring
+// convention already verified directly in the real BINDAL STOCK / DIAMOND / anmol files (rows sitting
+// well past the last real transaction that just keep repeating the same balance). This is what lets the
+// generated summary tab's formula point at a fixed row far below any real data and still show the
+// correct live balance from day one: computeMergePatches stops scanning a block's "real" data at the
+// first blank-date cell, so every phantom row is invisible to it — a real push later overwrites them
+// from the top down exactly like it would write brand-new rows, and every phantom row still below
+// correctly references "the row directly above me," so the chain self-heals with zero extra work. No
+// separate re-pointing of the summary formula is ever needed unless GENERATED_PAD_ROWS worth of real
+// transactions actually gets used up on one item, same limit every hand-built customer file already has.
+const GENERATED_PAD_ROWS = 300;
+const SUMMARY_HEADER = ['s. no.', 'item name', 'quantity.'];
+
+function quoteTabNameForFormula(tabName) {
+  return `'${String(tabName || '').replace(/'/g, "''")}'`;
+}
+
+// Finds an existing tab whose title matches /summary/i (same convention importCustomerSheet already
+// uses to exclude it from the item list), or null if this spreadsheet doesn't have one yet.
+function findSummaryTabName(existingMeta) {
+  return Object.keys(existingMeta).find(t => /summary/i.test(t)) || null;
+}
+
+// Writes (creating the tab if needed) one row per generated item into the summary tab, appending after
+// whatever's already there. Known limitation: if an existing summary tab ends with a hand-typed "Total"
+// row, new rows get appended AFTER it rather than re-inserted above it — acceptable for this feature's
+// primary case (a brand-new summary tab, written fresh, with no Total row yet); re-running generate
+// against an already-in-use customer sheet may need that Total row moved back down by hand afterward.
+async function writeSummaryTab(sheets, spreadsheetId, existingMeta, items) {
+  let summaryTabName = findSummaryTabName(existingMeta);
+  let startRow0 = 1; // 0-indexed — row right after the header, for a brand-new summary tab
+  let nextSerial = 1;
+  if (!summaryTabName) {
+    summaryTabName = 'summary';
+    const createResp = await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: [{ addSheet: { properties: { title: summaryTabName, index: 0 } } }] },
+    });
+    const props = createResp.data.replies[0].addSheet.properties;
+    existingMeta[props.title] = { sheetId: props.sheetId, rowCount: 1000, columnCount: 26 };
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${summaryTabName}!A1`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: [SUMMARY_HEADER] },
+    });
+  } else {
+    const readResp = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: wholeSheetRangeA1(summaryTabName, existingMeta[summaryTabName]),
+      valueRenderOption: 'UNFORMATTED_VALUE',
+    });
+    const rows = readResp.data.values || [];
+    let lastRow = 0; // 0-indexed count of rows already used, header included
+    for (let r = 1; r < rows.length; r++) {
+      if (normalizeCellStr((rows[r] || [])[1])) { lastRow = r; nextSerial++; }
+    }
+    startRow0 = rows.length ? lastRow + 1 : 1;
+  }
+  const values = items.map((it, i) => [nextSerial + i, it.item, it.summaryFormula]);
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: `${summaryTabName}!A${startRow0 + 1}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values },
+  });
+}
+
+// categories: [{ name: 'IT 500', items: ['IT 500 LID', 'IT 500 CONTAINER'] }, ...]
+async function generateCustomerSheetStructure(spreadsheetId, categories) {
+  const id = String(spreadsheetId || '').trim();
+  const cats = (Array.isArray(categories) ? categories : [])
+    .map(c => ({ name: String((c && c.name) || '').trim(), items: (Array.isArray(c && c.items) ? c.items : []).map(i => String(i || '').trim()).filter(Boolean) }))
+    .filter(c => c.name && c.items.length);
+  if (!cats.length) throw new Error('At least one category with at least one item is required.');
+
+  const padRow = () => ['', 0, 0, 0];
+  const itemGroups = cats.map(c => ({
+    tabName: c.name,
+    variants: c.items.map(item => ({
+      title: item,
+      header: ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
+      rows: Array.from({ length: GENERATED_PAD_ROWS }, padRow),
+    })),
+  }));
+
+  const pushResults = await pushCustomerSheet(id, itemGroups);
+  const failed = pushResults.filter(r => !r.ok);
+  if (failed.length) throw new Error(failed.map(f => `${f.tab}: ${f.error}`).join('; '));
+
+  const items = [];
+  pushResults.forEach(r => {
+    (r.placements || []).forEach(p => {
+      const closingCol = colLetter(p.startCol0 + p.width - 1);
+      items.push({
+        item: p.title,
+        sheetGroup: r.tab,
+        summaryFormula: `=${quoteTabNameForFormula(r.tab)}!${closingCol}${p.lastWrittenRow1}`,
+      });
+    });
+  });
+
+  const sheets = getSheetsClient();
+  const existingMeta = await getSheetMeta(sheets, id);
+  await writeSummaryTab(sheets, id, existingMeta, items);
+
+  return { tabCount: cats.length, items: items.map(({ item, sheetGroup }) => ({ item, sheetGroup })) };
+}
+
+async function generateCustomerSheetStructureHandler(req, res) {
+  try {
+    const { spreadsheetId, categories } = req.body || {};
+    if (!spreadsheetId || !String(spreadsheetId).trim()) {
+      return res.status(400).json({ error: 'spreadsheetId is required.' });
+    }
+    if (!Array.isArray(categories) || !categories.length) {
+      return res.status(400).json({ error: 'categories must be a non-empty array.' });
+    }
+    const result = await generateCustomerSheetStructure(String(spreadsheetId).trim(), categories);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('Customer sheet generate-structure error:', e);
+    res.status(502).json({ error: friendlyGoogleError(e) });
+  }
 }
 
 // Dry-run counterpart to pushCustomerSheet — reads the SAME "before" state and identifies the SAME
@@ -991,4 +1095,4 @@ async function putBlocksTab(req, res) {
   }
 }
 
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, debugTestSheetCreateHandler };
+module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler };

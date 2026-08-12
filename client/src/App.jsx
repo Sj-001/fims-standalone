@@ -1763,7 +1763,7 @@ function FIMSApp() {
       itemCount: nextCatalog.filter(c => c.customer === customer).length,
     });
     const reassignedCount = reassignUnassignedRows();
-    const verb = sheetReview.mode === 'resync' ? 'Re-synced' : 'Imported';
+    const verb = sheetReview.mode === 'resync' ? 'Re-synced' : sheetReview.mode === 'generate' ? 'Generated' : 'Imported';
     setImportResultMessage(
       `${verb} ${customer}: added ${newCatalogEntries.length} new catalog item${newCatalogEntries.length === 1 ? '' : 's'}` +
       (sheetReview.skippedExisting ? ` (${sheetReview.skippedExisting} already known, skipped)` : '') +
@@ -1771,6 +1771,53 @@ function FIMSApp() {
     );
     setSheetReview(null);
     setNewSheetId('');
+  };
+  /* -------- Customer Sheets: GENERATE a brand-new customer's tabs/blocks/summary from scratch, into a
+     blank Sheet the person already created and shared with the service account (the service account
+     can't create+own a new file itself — verified directly, plain service accounts have no Drive
+     storage of their own). Category name -> tab, each line under it -> one item block within that tab.
+     Reuses the exact same sheetReview/confirmSheetImport review-then-confirm flow as the Sheet-ID
+     import above (mode: 'generate'), so a generated structure gets the same "review before it touches
+     your catalog" treatment as anything else. -------- */
+  const [genCustomerName, setGenCustomerName] = useState('');
+  const [genSheetId, setGenSheetId] = useState('');
+  const [genCategories, setGenCategories] = useState([{ id: genId(), name: '', itemsText: '' }]);
+  const [genBusy, setGenBusy] = useState(false);
+  const [genError, setGenError] = useState('');
+  const addGenCategory = () => setGenCategories(prev => [...prev, { id: genId(), name: '', itemsText: '' }]);
+  const removeGenCategory = (id) => setGenCategories(prev => prev.filter(c => c.id !== id));
+  const updateGenCategory = (id, field, value) => setGenCategories(prev => prev.map(c => c.id === id ? { ...c, [field]: value } : c));
+  const buildGeneratedStructure = async () => {
+    const customer = genCustomerName.trim();
+    const sheetId = extractSheetIdFromInput(genSheetId);
+    if (!customer) { setGenError('Enter a customer name.'); return; }
+    if (!sheetId) { setGenError("Paste the blank Google Sheet's link or ID (create it and share it with the service account email above first)."); return; }
+    const categories = genCategories
+      .map(c => ({ name: c.name.trim(), items: c.itemsText.split('\n').map(s => s.trim()).filter(Boolean) }))
+      .filter(c => c.name && c.items.length);
+    if (!categories.length) { setGenError('Add at least one category name with at least one item listed under it.'); return; }
+    setGenError(''); setImportResultMessage(''); setGenBusy(true);
+    try {
+      const res = await fetch('/api/customer-sheets/generate-structure', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ spreadsheetId: sheetId, categories }),
+      });
+      if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return; }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        setGenError(data.error || `Could not build the structure (HTTP ${res.status}).`);
+        return;
+      }
+      const items = (data.items || []).map(it => ({ id: genId(), item: it.item, sheetGroup: it.sheetGroup || it.item, include: true, isNew: true }));
+      setSheetReview({ spreadsheetId: sheetId, spreadsheetTitle: customer, customerName: customer, mode: 'generate', resyncCustomer: '', items, skippedExisting: 0 });
+      setGenCustomerName(''); setGenSheetId(''); setGenCategories([{ id: genId(), name: '', itemsText: '' }]);
+    } catch (e) {
+      setGenError(e.message || 'Network error — could not reach the server.');
+    } finally {
+      setGenBusy(false);
+    }
   };
   // Re-check every already-confirmed production/dispatch row still sitting as Unassigned against the
   // (possibly just-widened) customer mapping. Only PENDING rows re-evaluate matchCustomer live on every
@@ -2556,7 +2603,9 @@ function FIMSApp() {
                 {sheetReview && (
                   <div className="review-box">
                     <p className="subtitle" style={{ marginBottom: 6 }}>
-                      {sheetReview.mode === 'resync' ? `Re-syncing ${sheetReview.customerName} — showing only items not already in the catalog.` : `Imported from "${sheetReview.spreadsheetTitle || sheetReview.spreadsheetId}".`}
+                      {sheetReview.mode === 'resync' ? `Re-syncing ${sheetReview.customerName} — showing only items not already in the catalog.`
+                        : sheetReview.mode === 'generate' ? `Structure built in the Sheet for "${sheetReview.customerName}" — every tab, item block, and the summary tab are already written and live.`
+                        : `Imported from "${sheetReview.spreadsheetTitle || sheetReview.spreadsheetId}".`}
                     </p>
                     <div className="field-row">
                       <span style={{ fontSize: 13, fontWeight: 600 }}>Customer name:</span>
@@ -2583,6 +2632,33 @@ function FIMSApp() {
                     </div>
                   </div>
                 )}
+              </div>
+              <div className="panel">
+                <div className="panel-header">
+                  <div><h2>Generate a Brand-New Customer Sheet</h2><p className="subtitle">For a customer with no Sheet yet: create one blank Google Sheet, share it with the service account email above as an Editor, paste its link below, then list the customer's product categories and the items under each. Every tab, item block (with live Opening/Closing formulas), and a summary tab get written into that Sheet for you — same structure and formulas as every other customer here, just built from scratch instead of pushed to over time.</p></div>
+                </div>
+                <div className="field-row">
+                  <input className="text-input" style={{ minWidth: 220 }} placeholder="Customer name" value={genCustomerName} onChange={e => setGenCustomerName(e.target.value)} autoComplete="off" spellCheck={false} />
+                  <input className="text-input" style={{ minWidth: 300, flex: 1 }} placeholder="Paste the blank Google Sheet's link or ID" value={genSheetId} onChange={e => setGenSheetId(e.target.value)} autoComplete="off" spellCheck={false} />
+                </div>
+                <div style={{ marginTop: 10 }}>
+                  {genCategories.map((cat, idx) => (
+                    <div key={cat.id} style={{ display: 'flex', gap: 8, marginBottom: 8, alignItems: 'flex-start' }}>
+                      <input className="text-input" style={{ minWidth: 180 }} placeholder="Category name (becomes a tab)" value={cat.name} onChange={e => updateGenCategory(cat.id, 'name', e.target.value)} autoComplete="off" spellCheck={false} />
+                      <textarea className="text-input" style={{ flex: 1, minHeight: 60, resize: 'vertical', fontFamily: 'inherit' }} placeholder={'One item per line, e.g.\nIT 500 LID\nIT 500 CONTAINER'} value={cat.itemsText} onChange={e => updateGenCategory(cat.id, 'itemsText', e.target.value)} spellCheck={false} />
+                      {genCategories.length > 1 && (
+                        <button className="icon-btn danger" onClick={() => removeGenCategory(cat.id)} title="Remove category"><Trash2 size={15} /></button>
+                      )}
+                    </div>
+                  ))}
+                  <button className="btn btn-ghost" onClick={addGenCategory}><Plus size={15} /> Add category</button>
+                </div>
+                <div className="review-actions" style={{ marginTop: 10 }}>
+                  <button className="btn btn-primary" onClick={buildGeneratedStructure} disabled={genBusy}>
+                    {genBusy ? <Loader2 size={15} className="spin" /> : <FileSpreadsheet size={15} />} Build structure
+                  </button>
+                </div>
+                {genError && <div className="error-box" style={{ marginTop: 10 }}><AlertCircle size={16} /><span>{genError}</span></div>}
               </div>
               {(() => {
                 const unassignedGroups = customerStockGroups.filter(g => g.customer === 'Unassigned');

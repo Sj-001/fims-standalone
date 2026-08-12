@@ -4,7 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const { requireEnv, login, logout, requireAuth } = require('./lib/auth');
 const { extract } = require('./lib/anthropic');
-const { getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, debugTestSheetCreateHandler } = require('./lib/sheets');
+const { getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler } = require('./lib/sheets');
 
 // Fail fast and loud if required secrets are missing, instead of the app half-working with
 // confusing downstream errors — matches the "no guesses" standard this project was built to.
@@ -70,10 +70,12 @@ app.post('/api/customer-sheets/import', importCustomerSheetHandler);
 // there's a one-click answer to "what do I share the customer's Sheet with," instead of making
 // someone dig it out of a Render env var or a downloaded JSON key file.
 app.get('/api/service-account-email', getServiceAccountEmailHandler);
-// TEMPORARY (debug): tests whether the service account can create + share a brand-new spreadsheet at
-// all, before building a "generate a customer sheet from scratch" feature on top of that assumption.
-// Remove this route (and debugTestSheetCreateHandler in lib/sheets.js) once the answer is known.
-app.post('/api/debug/test-sheet-create', debugTestSheetCreateHandler);
+// Builds the full tab/item-block/formula structure (and a generated summary tab) for a brand-new
+// customer inside a spreadsheet the person already created and shared with the service account
+// themselves — the service account can't create+own a new file itself (confirmed: plain service
+// accounts have no Drive storage of their own), but writing into an already-shared blank sheet needs
+// nothing beyond the existing Sheets permission. See generateCustomerSheetStructure in lib/sheets.js.
+app.post('/api/customer-sheets/generate-structure', generateCustomerSheetStructureHandler);
 
 // --- serve the built frontend (client/dist), if present, so this is a single deployable service ---
 const clientDist = path.join(__dirname, '..', 'client', 'dist');
