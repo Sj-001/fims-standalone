@@ -661,7 +661,7 @@ const GUIDE_STEPS = [
     title: 'Customer Mapping decides who gets what',
     tab: 'customerMapping',
     what: 'This is the rulebook Customer Stock uses to guess which customer a product belongs to — plus the reference catalog of exact item names that helps correct handwriting misreads during extraction.',
-    how: 'Upload a customer’s stock .xlsx (a new one, or an updated version of one you’ve shared already) to add its products automatically. You can also add, edit, or delete individual rules by hand at any time — rules are checked top to bottom, first match wins.',
+    how: 'Paste a customer’s Google Sheet ID/link on the Customer Sheets tab (new or already-added) to add its products automatically. You can also add, edit, or delete individual rules by hand at any time — rules are checked top to bottom, first match wins.',
   },
   {
     title: 'Check what’s available before promising a customer an order',
@@ -1316,95 +1316,21 @@ function FIMSApp() {
   const addMappingRow = () => persistCustomerMapping([...customerMapping, { id: genId(), keyword: '', customer: '' }]);
   const updateMappingRow = (id, field, value) => persistCustomerMapping(customerMapping.map(r => r.id === id ? { ...r, [field]: value } : r));
   const deleteMappingRow = (id) => persistCustomerMapping(customerMapping.filter(r => r.id !== id));
-  /* -------- product catalog (editable + importable from a customer's stock .xlsx) -------- */
+  /* -------- product catalog (editable; populated via Customer Sheets tab's Sheet-ID import) -------- */
   const persistCatalog = (next) => {
     setProductCatalog(next);
     scheduleSave('catalog', () => window.storage.set(CATALOG_KEY, JSON.stringify(next), false).catch(() => {}));
   };
   const deleteCatalogItem = (id) => persistCatalog(productCatalog.filter(c => c.id !== id));
   const updateCatalogItem = (id, field, value) => persistCatalog(productCatalog.map(c => c.id === id ? { ...c, [field]: value } : c));
-  const [catalogImportBusy, setCatalogImportBusy] = useState(false);
-  const [catalogImportError, setCatalogImportError] = useState('');
-  const [catalogReview, setCatalogReview] = useState(null); // { fileName, customerName, items: [{id, item, include}] }
-  const handleCatalogFile = async (file) => {
-    if (!file) return;
-    setCatalogImportError(''); setCatalogReview(null); setCatalogImportBusy(true);
-    try {
-      const buf = await file.arrayBuffer();
-      const wb = XLSX.read(buf, { type: 'array' });
-      const summarySheetName = wb.SheetNames.find(n => /summary/i.test(n));
-      let items = [];
-      if (summarySheetName) {
-        const ws = wb.Sheets[summarySheetName];
-        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
-        let headerRowIdx = rows.findIndex(r => r.some(c => String(c).toLowerCase().includes('item name')));
-        let itemColIdx = headerRowIdx >= 0 ? rows[headerRowIdx].findIndex(c => String(c).toLowerCase().includes('item name')) : -1;
-        for (let i = headerRowIdx >= 0 ? headerRowIdx + 1 : 0; i < rows.length; i++) {
-          const row = rows[i];
-          const val = itemColIdx >= 0 ? row[itemColIdx] : row.find(c => typeof c === 'string' && c.trim());
-          const clean = String(val || '').trim();
-          if (clean && clean.toLowerCase() !== 'total') items.push(clean);
-        }
-      } else {
-        items = wb.SheetNames.filter(n => !/summary/i.test(n));
-      }
-      items = Array.from(new Set(items));
-      if (!items.length) { setCatalogImportError('Could not find a product list in this file — looked for a "summary" sheet, then fell back to sheet tab names, and found nothing usable.'); setCatalogImportBusy(false); return; }
-      const suggestedCustomer = file.name.replace(/\.[^.]+$/, '').replace(/[_-]?stock/gi, '').replace(/[_-]?\d{1,4}([_-]\d{1,4})*$/g, '').replace(/[_-]+/g, ' ').trim();
-      setCatalogReview({
-        fileName: file.name,
-        customerName: suggestedCustomer.charAt(0).toUpperCase() + suggestedCustomer.slice(1),
-        items: items.map(item => ({ id: genId(), item, include: true })),
-      });
-    } catch (e) {
-      setCatalogImportError(`Could not read this file (${e.message || 'unknown error'}). Make sure it's a real .xlsx file.`);
-    } finally {
-      setCatalogImportBusy(false);
-    }
-  };
-  const updateCatalogReviewItem = (id, field, value) => {
-    setCatalogReview(prev => ({ ...prev, items: prev.items.map(it => it.id === id ? { ...it, [field]: value } : it) }));
-  };
-  // Shared dedup keys for both import flows below (file-upload AND Sheet-ID import) — trims BOTH
-  // sides before comparing. Catalog items imported from a Sheet are always already trimmed at
-  // extraction time, but a row added by hand through the UI might have stray leading/trailing
-  // whitespace; without trimming both sides symmetrically, a manually-entered "Hit & Run 120g " with
-  // a trailing space wouldn't match an incoming "Hit & Run 120g" and would get silently re-added as a
-  // duplicate. Same reasoning for mapping keywords.
+  // Shared dedup keys for the Sheet-ID import flow below — trims BOTH sides before comparing.
+  // Catalog items imported from a Sheet are always already trimmed at extraction time, but a row
+  // added by hand through the UI might have stray leading/trailing whitespace; without trimming both
+  // sides symmetrically, a manually-entered "Hit & Run 120g " with a trailing space wouldn't match an
+  // incoming "Hit & Run 120g" and would get silently re-added as a duplicate. Same reasoning for
+  // mapping keywords.
   const catalogDedupKey = (customer, item) => `${(customer || '').trim().toLowerCase()}||${(item || '').trim().toLowerCase()}`;
   const mappingDedupKey = (keyword) => (keyword || '').trim().toLowerCase();
-  const confirmCatalogImport = () => {
-    if (!catalogReview || !catalogReview.customerName.trim()) return;
-    const customer = catalogReview.customerName.trim();
-    const included = catalogReview.items.filter(it => it.include && it.item.trim());
-    const existingItems = new Set(productCatalog.map(c => catalogDedupKey(c.customer, c.item)));
-    const newCatalogEntries = included
-      .filter(it => !existingItems.has(catalogDedupKey(customer, it.item)))
-      // sheetGroup defaults to the item's own name (its own tab in that customer's Sheet) — edit it
-      // in the Known Product Catalog table below to group several variants under one shared tab,
-      // matching however that customer's real file actually groups them.
-      .map(it => ({ id: genId(), customer, item: it.item.trim(), sheetGroup: it.item.trim() }));
-    persistCatalog([...productCatalog, ...newCatalogEntries]);
-    const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
-    const exactRules = []; // high priority: the full exact item name
-    const fallbackRules = []; // low priority: broader family keyword, in case ledger has an unlisted pack size
-    included.forEach(it => {
-      const exact = it.item.trim().toLowerCase();
-      if (exact && !existingKeywords.has(exact)) {
-        exactRules.push({ id: genId(), keyword: exact, customer });
-        existingKeywords.add(exact);
-      }
-      const fallback = exact.replace(/[\d].*$/, '').trim();
-      if (fallback && fallback.length > 2 && !existingKeywords.has(fallback)) {
-        fallbackRules.push({ id: genId(), keyword: fallback, customer });
-        existingKeywords.add(fallback);
-      }
-    });
-    // exact rules go first (checked before existing rules too, since they're most specific),
-    // fallback rules go last so they never shadow anything more specific already in the list
-    persistCustomerMapping([...exactRules, ...customerMapping, ...fallbackRules]);
-    setCatalogReview(null);
-  };
   const matchCustomer = (row) => {
     const hint = (row.customerHint || '').trim();
     const d = (row.description || '').toLowerCase();
@@ -2554,45 +2480,6 @@ function FIMSApp() {
             <div>
               <div className="panel">
                 <div className="panel-header">
-                  <div><h2>Import / Update a Customer Sheet</h2><p className="subtitle">Upload a customer's stock .xlsx (like BINDAL_STOCK.xlsx, DIAMOND.xlsx, or a new one you haven't shared yet). It reads the "summary" sheet's item list — or falls back to sheet tab names if there's no summary sheet — and lets you review before adding anything.</p></div>
-                </div>
-                <label className="dropzone" htmlFor="catalogFileInput" style={{ padding: 18 }}>
-                  <Upload size={20} style={{ marginBottom: 4 }} />
-                  <div style={{ fontSize: 13.5, fontWeight: 600 }}>Click to upload a customer stock .xlsx</div>
-                  <div style={{ fontSize: 11.5, color: 'var(--ink-soft)', marginTop: 4 }}>Works for a brand-new customer, or a newer version of one you've already added.</div>
-                </label>
-                <input id="catalogFileInput" type="file" accept=".xlsx,.xls" style={{ display: 'none' }} onChange={e => handleCatalogFile(e.target.files?.[0])} />
-                {catalogImportBusy && <div className="doc-hint" style={{ marginTop: 10 }}><Loader2 size={13} className="spin" style={{ verticalAlign: 'middle', marginRight: 6 }} />Reading file…</div>}
-                {catalogImportError && <div className="error-box"><AlertCircle size={16} /><span>{catalogImportError}</span></div>}
-                {catalogReview && (
-                  <div className="review-box">
-                    <div className="field-row">
-                      <span style={{ fontSize: 13, fontWeight: 600 }}>Customer name:</span>
-                      <input className="text-input" value={catalogReview.customerName} onChange={e => setCatalogReview(prev => ({ ...prev, customerName: e.target.value }))} />
-                    </div>
-                    <p className="subtitle" style={{ marginBottom: 10 }}>{catalogReview.items.length} item(s) found in {catalogReview.fileName}. Uncheck anything that isn't really a product, fix any typos, then confirm.</p>
-                    <div className="table-wrap">
-                      <table>
-                        <thead><tr><th style={{ width: 34 }}></th><th>Item name</th></tr></thead>
-                        <tbody>
-                          {catalogReview.items.map(it => (
-                            <tr key={it.id}>
-                              <td style={{ textAlign: 'center' }}><input type="checkbox" checked={it.include} onChange={e => updateCatalogReviewItem(it.id, 'include', e.target.checked)} /></td>
-                              <td><input className="cell-input" value={it.item} onChange={e => updateCatalogReviewItem(it.id, 'item', e.target.value)} /></td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                    <div className="review-actions">
-                      <button className="btn btn-primary" onClick={confirmCatalogImport}><CheckCircle2 size={15} /> Add to catalog &amp; mapping</button>
-                      <button className="btn btn-ghost" onClick={() => setCatalogReview(null)}><XCircle size={15} /> Discard</button>
-                    </div>
-                  </div>
-                )}
-              </div>
-              <div className="panel">
-                <div className="panel-header">
                   <div><h2>Customer Mapping</h2><p className="subtitle">Which keyword in a production-ledger item name routes to which customer. Checked top to bottom — the first match wins, so more specific keywords should sit above general ones. A bracketed customer name found right next to an item always overrides this list.</p></div>
                   <button className="btn btn-primary" onClick={addMappingRow}><Plus size={15} /> Add rule</button>
                 </div>
@@ -2613,7 +2500,7 @@ function FIMSApp() {
               </div>
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Known Product Catalog</h2>
-                <p className="subtitle" style={{ marginBottom: 14 }}>Exact item names used to correct handwriting misreads during extraction (e.g. "g" vs "9", "&" vs "8"). "Sheet Tab" is which tab this item lands under in that customer's own Google Sheet (Customer Sheets tab) — several variants of one base item (e.g. "IT 500 Lid" and "IT 500 Container") should share the same Sheet Tab name, exactly like your original files. Built from the files you've imported above — edit or delete anything that's wrong.</p>
+                <p className="subtitle" style={{ marginBottom: 14 }}>Exact item names used to correct handwriting misreads during extraction (e.g. "g" vs "9", "&" vs "8"). "Sheet Tab" is which tab this item lands under in that customer's own Google Sheet (Customer Sheets tab) — several variants of one base item (e.g. "IT 500 Lid" and "IT 500 Container") should share the same Sheet Tab name, exactly like your original files. Built from whatever you've imported via the Customer Sheets tab — edit or delete anything that's wrong.</p>
                 {customerNames.length === 0 && !productCatalog.length && <div className="empty-state">No catalog items yet.</div>}
                 {Array.from(new Set(productCatalog.map(c => c.customer))).map(customer => (
                   <div key={customer} style={{ marginBottom: 16 }}>
