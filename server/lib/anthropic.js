@@ -26,7 +26,15 @@ async function extract(req, res) {
       },
       body: JSON.stringify({
         model: DEFAULT_MODEL,
-        max_tokens: 4096,
+        // Was 4096 — confirmed too low directly: a real production-register page with ~33 rows came
+        // back with only 1 row (the response got cut off after row 1), and a 31-row page came back
+        // with 23 (cut off after row 23). Denser pages, or ones with harder handwriting the model has
+        // to work through, can genuinely need more room than that. This is a hard generation ceiling
+        // per request, not a cost/context-window concern — 8192 gives real headroom for an 80+ row
+        // mill slip (the busiest document type this app expects) while still returning fast for a
+        // typical page. See the stop_reason/truncated handling in callClaudeExtract (client/src/App.jsx)
+        // for how a response that STILL hits this ceiling gets surfaced instead of silently accepted.
+        max_tokens: 8192,
         system: systemPrompt,
         messages: [{
           role: 'user',

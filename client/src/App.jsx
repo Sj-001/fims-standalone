@@ -244,11 +244,19 @@ async function callClaudeExtract(systemPrompt, base64Image, signal) {
     ...['[', '{'].map(ch => { const i = clean.indexOf(ch); return i === -1 ? Infinity : i; })
   );
   if (firstBrace > 0 && firstBrace !== Infinity) clean = clean.slice(firstBrace);
+  // Anthropic's own signal for "I was cut off by max_tokens before I finished" — confirmed directly:
+  // a dense production-register page came back with only 1 of ~33 real rows, another with 23 of 31,
+  // both silently "successful" because the truncated JSON still happened to parse (or repair-parse)
+  // cleanly. Trusting stop_reason here, rather than only reacting to a JSON.parse failure, is what
+  // catches BOTH failure shapes: a response cut off cleanly between two complete items (parses fine,
+  // just missing everything after) and one cut off mid-item (fails to parse, needs repairTruncatedJson).
+  const truncated = data.stop_reason === 'max_tokens';
   try {
-    return JSON.parse(clean);
+    return { raw: JSON.parse(clean), truncated };
   } catch (parseErr) {
-    // response may have been cut off before finishing — salvage what we can
-    return repairTruncatedJson(clean);
+    // response was cut off badly enough that even a well-formed prefix doesn't exist — needing the
+    // salvage repair is itself evidence of truncation, regardless of what stop_reason said.
+    return { raw: repairTruncatedJson(clean), truncated: true };
   }
 }
 /* ============================== storage ============================== */
@@ -1111,15 +1119,16 @@ function FIMSApp() {
     try {
       const basePrompt = activeConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog));
       const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[docType]);
-      const raw = await extractWithRateLimitBackoff(promptWithTraining, base64Img, abortControllerRef.current.signal, (waitMs, attempt, total) => {
+      const { raw, truncated } = await extractWithRateLimitBackoff(promptWithTraining, base64Img, abortControllerRef.current.signal, (waitMs, attempt, total) => {
         setErrorMsg(`Rate limit hit — waiting ${Math.round(waitMs / 1000)}s and retrying automatically (attempt ${attempt} of ${total})… Click Cancel below if you'd rather stop.`);
       }, (secondsLeft) => {
         setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
       });
       const rows = activeConfig.shape(raw);
       if (!rows.length) setErrorMsg('No line items found on this page. If this is a duplicate copy or an e-Way Bill page, that’s expected — just move to the next one. Otherwise, try a clearer photo or crop closer to the table.');
+      else if (truncated) setErrorMsg(`Claude's response was cut off before it finished this page — it may have more rows than the ${rows.length} shown below. Check against the original, and use "Re-extract this file" if anything's missing.`);
       else setErrorMsg('');
-      setFileResults(prev => prev.map(r => r.id === current.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })) } : r));
+      setFileResults(prev => prev.map(r => r.id === current.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })), truncated } : r));
     } catch (e) {
       console.error('Extraction error:', e);
       if (isCancelled(e)) {
@@ -1146,6 +1155,7 @@ function FIMSApp() {
     const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[docType]);
     const gapMs = BATCH_REQUEST_GAP_MS;
     let anySucceeded = false;
+    let anyTruncated = false;
     let rateLimited = false;
     let lastRateLimitError = null;
     let cancelled = false;
@@ -1160,14 +1170,15 @@ function FIMSApp() {
       } catch (e) { cancelled = true; break; }
       setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'extracting' } : r));
       try {
-        const raw = await extractWithRateLimitBackoff(promptWithTraining, p.base64, signal, (waitMs, attempt, total) => {
+        const { raw, truncated } = await extractWithRateLimitBackoff(promptWithTraining, p.base64, signal, (waitMs, attempt, total) => {
           setErrorMsg(`Rate limit hit on "${p.label}" — waiting ${Math.round(waitMs / 1000)}s and retrying automatically (attempt ${attempt} of ${total})… Click Cancel below if you'd rather stop.`);
         }, (secondsLeft) => {
           setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
         });
         const rows = activeConfig.shape(raw);
         anySucceeded = true;
-        setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })) } : r));
+        if (truncated) anyTruncated = true;
+        setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })), truncated } : r));
       } catch (e) {
         console.error('Extraction error:', e);
         if (isCancelled(e)) {
@@ -1190,6 +1201,8 @@ function FIMSApp() {
       setErrorMsg(`${rateLimitExplainer(lastRateLimitError)} Anything already extracted in this batch is safe and untouched — use "Retry remaining" below once you're ready to continue.`);
     } else if (!anySucceeded && targets.length) {
       setErrorMsg('Every file in this batch failed to extract. Check your connection and try again, or extract one file at a time to isolate the problem.');
+    } else if (anyTruncated) {
+      setErrorMsg('One or more files in this batch had a response cut off before it finished the page — they\'re marked below. Check each against the original and use "Re-extract this file" for any that look incomplete.');
     } else {
       setErrorMsg('');
     }
@@ -1211,6 +1224,18 @@ function FIMSApp() {
     });
     if (!targets.length) return;
     await extractQueue(targets);
+  };
+  // Re-runs extraction for ONE already-"done" file — the response to being told a page's response was
+  // cut off (page.truncated) is to just try again, since a fresh request isn't guaranteed to hit the
+  // same wall a second time. Resets that file back to 'pending' first (clearing its old rows/truncated
+  // flag) rather than appending to what's already there, so a second cut-off attempt can't leave stale
+  // rows from the first mixed in with a fresh partial result.
+  const reextractFile = async (id) => {
+    if (extracting) return;
+    const page = queuedPages.find(p => p.id === id);
+    if (!page) return;
+    setFileResults(prev => prev.map(r => r.id === id ? { ...r, status: 'pending', rows: [], originalRows: [], error: '', truncated: false } : r));
+    await extractQueue([page]);
   };
   const recordCorrections = (originalRows, finalRows) => {
     if (!originalRows || !finalRows.length) return;
@@ -2276,6 +2301,12 @@ function FIMSApp() {
                       )}
                       {page.status === 'done' && (
                         <div>
+                          {page.truncated && (
+                            <div className="error-box" style={{ marginBottom: 10 }}>
+                              <AlertCircle size={16} />
+                              <span>Claude's response was cut off before it finished this page — there may be more rows than the {page.rows.length} shown below. Check against the original document, then re-extract if anything's missing (a fresh attempt isn't guaranteed to hit the same cutoff).</span>
+                            </div>
+                          )}
                           <p className="subtitle" style={{ marginBottom: 10 }}>{page.rows.length} row(s) found for <strong>{activeConfig.label}</strong>. Fix anything that looks wrong, then confirm.</p>
                           <EditableTable columns={COLUMNS[activeConfig.register]} rows={page.rows}
                             onUpdate={(rowId, field, value) => updateReviewCell(idx, rowId, field, value)}
@@ -2283,6 +2314,9 @@ function FIMSApp() {
                             emptyLabel="All rows removed — nothing to add." />
                           <div className="review-actions">
                             <button className="btn btn-primary" onClick={() => confirmPage(idx)} disabled={!page.rows.length}><CheckCircle2 size={15} /> Add {page.rows.length} row(s) to register</button>
+                            {page.truncated && (
+                              <button className="btn btn-ghost" disabled={extracting} onClick={() => reextractFile(page.id)}><RefreshCw size={15} /> Re-extract this file</button>
+                            )}
                             <button className="btn btn-ghost" onClick={() => discardPage(idx)}><XCircle size={15} /> Discard this file</button>
                           </div>
                         </div>
