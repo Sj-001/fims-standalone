@@ -3,7 +3,7 @@ import * as XLSX from 'xlsx';
 import {
   Upload, Image as ImageIcon, Package, Boxes, Search, Truck, ClipboardList,
   FileSpreadsheet, Download, CheckCircle2, XCircle, Trash2, Loader2,
-  AlertCircle, LayoutDashboard, FileText, Archive, ListChecks, Plus, RefreshCw, Link2, Info
+  AlertCircle, LayoutDashboard, FileText, Archive, ListChecks, Plus, RefreshCw, Link2, Info, Check
 } from 'lucide-react';
 /* ============================== helpers ============================== */
 const num = (v) => {
@@ -633,6 +633,7 @@ const NAV = [
   { key: 'customerStock', label: 'Customer Stock', icon: Boxes },
   { key: 'customerMapping', label: 'Customer Mapping', icon: ListChecks },
   { key: 'customerSheets', label: 'Customer Sheets', icon: FileSpreadsheet },
+  { key: 'settings', label: 'Settings', icon: Trash2 },
 ];
 const GUIDE_STEPS = [
   {
@@ -923,6 +924,53 @@ function FIMSApp() {
   const persist = useCallback((registerKey, rows) => {
     scheduleSave(`register:${registerKey}`, () => saveRegister(STORAGE_KEYS[registerKey], rows));
   }, [scheduleSave]);
+  /* -------- Settings: Clear App Data — a UI version of the direct-API wipe used earlier this
+     session, so this doesn't need a one-off script every time a clean retest is wanted. Writes go
+     out immediately (not through the debounced `persist`/scheduleSave path) since a clear should be
+     final the moment it's confirmed, not sit in a 1.5s window where a tab close could drop it.
+     Training examples are deliberately NOT clearable here — they improve extraction accuracy rather
+     than being test data, same reasoning as when this was first done manually. -------- */
+  const CLEAR_GROUPS = [
+    { key: 'rawMaterialIn', label: 'Raw Material Register', registerKeys: ['rawMaterialIn'] },
+    { key: 'consumption', label: 'Consumption', registerKeys: ['consumption'] },
+    { key: 'production', label: 'Production Register', registerKeys: ['production'] },
+    { key: 'customerDispatch', label: 'Customer Dispatch Bills', registerKeys: ['customerDispatch'] },
+    { key: 'dabur', label: 'Dabur (Specs, PO, Dispatch)', registerKeys: ['daburSpecs', 'daburPO', 'daburDispatch'] },
+    { key: 'catalogMapping', label: 'Product Catalog & Customer Mapping', catalogMapping: true },
+    { key: 'sheetIds', label: 'Customer Sheet IDs (tracked links to customer sheets — the sheets themselves are untouched)', sheetIds: true },
+  ];
+  const [clearSelected, setClearSelected] = useState({});
+  const [clearBusy, setClearBusy] = useState(false);
+  const [clearMessage, setClearMessage] = useState('');
+  const toggleClearGroup = (key) => setClearSelected(prev => ({ ...prev, [key]: !prev[key] }));
+  const runClearSelected = async () => {
+    const chosen = CLEAR_GROUPS.filter(g => clearSelected[g.key]);
+    if (!chosen.length) return;
+    const summary = chosen.map(g => g.label).join(', ');
+    if (!window.confirm(`Permanently clear: ${summary}?\n\nThis cannot be undone.`)) return;
+    setClearBusy(true); setClearMessage('');
+    try {
+      for (const g of chosen) {
+        if (g.registerKeys) {
+          for (const rk of g.registerKeys) {
+            registerSetters[rk]([]);
+            await saveRegister(STORAGE_KEYS[rk], []);
+          }
+        } else if (g.catalogMapping) {
+          setProductCatalog([]); await window.storage.set(CATALOG_KEY, JSON.stringify([]), false);
+          setCustomerMapping([]); await window.storage.set(CUSTOMER_MAPPING_KEY, JSON.stringify([]), false);
+        } else if (g.sheetIds) {
+          setCustomerSheetIds([]); await window.storage.set(CUSTOMER_SHEET_IDS_KEY, JSON.stringify([]), false);
+        }
+      }
+      setClearMessage(`Cleared: ${summary}.`);
+      setClearSelected({});
+    } catch (e) {
+      setClearMessage(`Something went wrong partway through (${e.message || 'unknown error'}) — check which registers above still show data and retry just those.`);
+    } finally {
+      setClearBusy(false);
+    }
+  };
   const updateRow = (registerKey) => (id, field, value) => {
     registerSetters[registerKey](prev => {
       const next = prev.map(r => r.id === id ? { ...r, [field]: value } : r);
@@ -1868,6 +1916,36 @@ function FIMSApp() {
     if (d.count) { setCustomerDispatch(d.next); persist('customerDispatch', d.next); }
     return p.count + d.count;
   };
+  // Manual assign form for the Unassigned section (Customer Stock tab) — lets a person route a
+  // stuck item straight to a customer + sheet tab + item block by hand instead of only being able
+  // to fix it indirectly via a Customer Mapping keyword rule. One form per unassigned group, keyed
+  // by group id, so several can be filled in without clobbering each other.
+  const [assignForms, setAssignForms] = useState({});
+  const updateAssignForm = (groupId, field, value) => setAssignForms(prev => ({ ...prev, [groupId]: { ...prev[groupId], [field]: value } }));
+  // Same two-step fix an unassigned row already gets from a Customer Mapping rule: (1) make sure a
+  // Product Catalog entry exists mapping this item to the chosen customer + sheet tab, so it lands
+  // in the right block when the customer's sheet is next generated/pushed, and (2) add an exact-match
+  // Customer Mapping keyword so this and any future row with the same description routes here
+  // automatically. Then re-run the same reassignUnassignedRows() pass confirmSheetImport already
+  // relies on to move this (and anything else now matching) off Unassigned immediately.
+  const assignUnassignedGroup = (groupId, description) => {
+    const form = assignForms[groupId] || {};
+    const customer = (form.customer || '').trim();
+    const sheetGroup = (form.sheetGroup || '').trim();
+    const item = (form.item || description || '').trim();
+    if (!customer || !sheetGroup || !item) return;
+    const existingItems = new Set(productCatalog.map(c => catalogDedupKey(c.customer, c.item)));
+    if (!existingItems.has(catalogDedupKey(customer, item))) {
+      persistCatalog([...productCatalog, { id: genId(), customer, item, sheetGroup }]);
+    }
+    const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
+    const exact = item.toLowerCase();
+    if (exact && !existingKeywords.has(exact)) {
+      persistCustomerMapping([{ id: genId(), keyword: exact, customer }, ...customerMapping]);
+    }
+    reassignUnassignedRows();
+    setAssignForms(prev => { const next = { ...prev }; delete next[groupId]; return next; });
+  };
   const pushCustomerSheetNow = async (customer) => {
     const sheetId = getCustomerSheetId(customer).trim();
     if (!sheetId) {
@@ -2547,6 +2625,57 @@ function FIMSApp() {
                             </tbody>
                           </table>
                         </div>
+                        {(() => {
+                          const form = assignForms[g.id] || {};
+                          const chosenCustomer = (form.customer || '').trim();
+                          const customerSheetGroups = Array.from(new Set(
+                            productCatalog.filter(c => c.customer.toLowerCase() === chosenCustomer.toLowerCase()).map(c => c.sheetGroup)
+                          )).filter(Boolean);
+                          const chosenSheetGroup = (form.sheetGroup || '').trim();
+                          const sheetGroupItems = Array.from(new Set(
+                            productCatalog
+                              .filter(c => c.customer.toLowerCase() === chosenCustomer.toLowerCase() && c.sheetGroup.toLowerCase() === chosenSheetGroup.toLowerCase())
+                              .map(c => c.item)
+                          )).filter(Boolean);
+                          const canAssign = chosenCustomer && chosenSheetGroup && (form.item || g.description || '').trim();
+                          return (
+                            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
+                              <input
+                                list={`assign-customer-${g.id}`}
+                                placeholder="Customer"
+                                value={form.customer || ''}
+                                onChange={e => updateAssignForm(g.id, 'customer', e.target.value)}
+                                style={{ width: 150 }}
+                              />
+                              <datalist id={`assign-customer-${g.id}`}>
+                                {allCustomerTabNames.map(c => <option key={c} value={c} />)}
+                              </datalist>
+                              <input
+                                list={`assign-sheetgroup-${g.id}`}
+                                placeholder="Sheet tab"
+                                value={form.sheetGroup || ''}
+                                onChange={e => updateAssignForm(g.id, 'sheetGroup', e.target.value)}
+                                style={{ width: 150 }}
+                              />
+                              <datalist id={`assign-sheetgroup-${g.id}`}>
+                                {customerSheetGroups.map(s => <option key={s} value={s} />)}
+                              </datalist>
+                              <input
+                                list={`assign-item-${g.id}`}
+                                placeholder="Block (item name)"
+                                value={form.item !== undefined ? form.item : g.description}
+                                onChange={e => updateAssignForm(g.id, 'item', e.target.value)}
+                                style={{ width: 180 }}
+                              />
+                              <datalist id={`assign-item-${g.id}`}>
+                                {sheetGroupItems.map(i => <option key={i} value={i} />)}
+                              </datalist>
+                              <button className="btn btn-primary" disabled={!canAssign} onClick={() => assignUnassignedGroup(g.id, g.description)}>
+                                <Check size={15} /> Assign
+                              </button>
+                            </div>
+                          );
+                        })()}
                       </div>
                     ))}
                   </div>
@@ -2853,6 +2982,26 @@ function FIMSApp() {
                   </div>
                 );
               })}
+            </div>
+          )}
+          {loaded && activeTab === 'settings' && (
+            <div>
+              <div className="panel">
+                <h2 style={{ marginBottom: 6 }}>Clear App Data</h2>
+                <p className="subtitle" style={{ marginBottom: 14 }}>Pick exactly what to wipe, then confirm — nothing happens until you click "Clear selected," and there's a confirmation prompt listing exactly what you picked before anything is actually deleted. This only clears data inside this app's own registers; it never touches any customer's real Google Sheet.</p>
+                {CLEAR_GROUPS.map(g => (
+                  <label key={g.key} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={!!clearSelected[g.key]} onChange={() => toggleClearGroup(g.key)} />
+                    <span style={{ fontSize: 13.5 }}>{g.label}</span>
+                  </label>
+                ))}
+                <div className="review-actions" style={{ marginTop: 10 }}>
+                  <button className="btn btn-danger" disabled={clearBusy || !Object.values(clearSelected).some(Boolean)} onClick={runClearSelected}>
+                    {clearBusy ? <Loader2 size={15} className="spin" /> : <Trash2 size={15} />} Clear selected
+                  </button>
+                </div>
+                {clearMessage && <div className="doc-hint" style={{ marginTop: 10 }}>{clearMessage}</div>}
+              </div>
             </div>
           )}
         </div>
