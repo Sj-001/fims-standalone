@@ -452,6 +452,23 @@ function normalizeDateToDots(raw) {
   // Unrecognized format — don't guess, leave untouched.
   return s;
 }
+const REAL_DATE_RE = /^\d{1,2}\.\d{1,2}\.\d{2,4}$/;
+// Safety net for ditto marks (a tick, quote mark, "11", "//", "do", a dash, etc. — handwritten
+// shorthand for "same date as the row above"). The extraction prompt already asks Claude to resolve
+// these itself, but that's a probabilistic instruction — this is a deterministic backstop that runs
+// on every extraction regardless of whether the model actually followed it. Any row whose date, after
+// normalizeDateToDots, still isn't a real-looking D.M.YY date (i.e. the ditto symbol came through
+// literally, or the field was left blank) gets filled in from the nearest row ABOVE it that does have
+// a real date — exactly what a ditto mark means on the page. The very first row can't borrow from
+// anything above it, so an unresolved ditto there is left as-is (visibly wrong, not silently guessed).
+function fillDittoDates(rows) {
+  let lastDate = '';
+  rows.forEach(r => {
+    if (REAL_DATE_RE.test((r.date || '').trim())) { lastDate = r.date; }
+    else if (lastDate) { r.date = lastDate; }
+  });
+  return rows;
+}
 /* ============================== document type configs ============================== */
 const DOCUMENT_TYPES = [
   {
@@ -484,7 +501,8 @@ IMPORTANT:
 - Interpret unclear handwriting as best you can; if a value is genuinely illegible leave it as an empty string rather than guessing wildly.`,
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
-      return raw.items.map(it => ({ id: genId(), date: normalizeDateToDots(it.date_override || raw.date || ''), shade: it.shade || '', size: it.size || '', gsm: it.gsm || '', weight_consumed: num(it.weight_consumed), balance_left: it.balance_left === '' || it.balance_left == null ? '' : num(it.balance_left) }));
+      const rows = raw.items.map(it => ({ id: genId(), date: normalizeDateToDots(it.date_override || raw.date || ''), shade: it.shade || '', size: it.size || '', gsm: it.gsm || '', weight_consumed: num(it.weight_consumed), balance_left: it.balance_left === '' || it.balance_left == null ? '' : num(it.balance_left) }));
+      return fillDittoDates(rows);
     },
   },
   {
@@ -501,18 +519,19 @@ STYLE B — product ledger style: each line has a DATE and a product DESCRIPTION
 {{PRODUCT_CATALOG}}
   (This list isn't exhaustive — other legitimate products exist too. Only use it to correct obvious misreads of these specific items, never to force an unrelated line into matching one of them.)
 - IMPORTANT: a customer name is sometimes written in brackets right next to the item name, either before or after it — e.g. "(Diamond) Cream Burst 30g x140" or "Cream Burst 30g x140 (Diamond)". Pull that bracketed name OUT into its own "customer_hint" field and do NOT leave it inside "description" — "description" should be just the clean item name with no bracket in it.
-- Dates are often written once then repeated below with a ditto mark (a tick, quote mark, or short symbol like " or 11 or //) — resolve a ditto mark to the same date as the row above, never leave date blank because of one.
-- Some pages have a single "Quantity" column — put that value into "pieces". Other pages have two columns headed roughly S and D side by side — S goes into "pieces", D goes into "dispatch". If a row only has one of the two, leave the other as 0.
+- Dates are VERY often written once then repeated below with a ditto mark for every following row that shares that same date — this could be a tick, a quote mark ("), the digits 11, two short slashes (//), the word "do", a dash, or any other short repeat-symbol instead of an actual date. Whenever a row's date cell is anything other than a clearly legible date, treat it as a ditto mark and resolve it to the SAME date as the row directly above it — copy that exact date into "date_override" for the row. Never leave a row's date blank or output the ditto symbol itself just because it wasn't written out in full.
+- Some pages have a single "Quantity" column — put that value into "pieces". Other pages have TWO numeric columns side by side for the same row (regardless of what they're headed with, e.g. small letters like S/D, two batch tallies, etc.) — both of these are PRODUCTION quantities, never a dispatch quantity. If a row has a number in only one of the two columns, put that number in "pieces". If a row genuinely has a number in BOTH columns, add them together into "pieces" — do not put the second column's number into "dispatch". The "dispatch" field on this register is rare — only use it if the page has an explicit, separately-written note that some of that day's production was sent out immediately (e.g. an actual word like "dispatch"/"bheja" next to a number), never just because a second quantity column exists.
 For EITHER style: do not include page-total or running-total rows (a lone number with no row content, usually at the bottom of a page or column). Extract every real row on the page, in order, exactly once — do not skip rows and do not repeat any row, even if faint printing or ruling lines make it look duplicated. If an actual customer/party name is written somewhere on the page itself (separate from the shade column — e.g. as a page header/title, applying to the WHOLE page, not a per-row bracket), include it as "party" for every item on that page; otherwise omit "party" entirely.
-Return ONLY one JSON object: {"date":"shared header date if Style A, DD/MM/YYYY, else omit","items":[{"date_override":"only if a specific row's date differs from the header or ditto-resolves to something else, else omit","party":"only if found as a whole-page header, else omit","customer_hint":"Style B only — a bracketed customer name found next to this specific item, else omit","shade":"Style A only, else omit","size":"Style A only, else omit","gsm":"Style A only, else omit","weight":"Style A only (number), else omit","description":"Style B only — the FULL exact item name including weight and pack count, with no bracketed customer name in it, else omit","pieces":"number — pieces produced (Tukda in Style A, the single Quantity or the S column in Style B)","dispatch":"number — Style B's D column only, else 0"}]}`,
+Return ONLY one JSON object: {"date":"shared header date if Style A, DD/MM/YYYY, else omit","items":[{"date_override":"the row's own date if Style A/B and it differs from the header, OR the ditto-resolved date copied from the row above if this row used a ditto mark — include this whenever you're not 100% sure the header date alone is right, else omit","party":"only if found as a whole-page header, else omit","customer_hint":"Style B only — a bracketed customer name found next to this specific item, else omit","shade":"Style A only, else omit","size":"Style A only, else omit","gsm":"Style A only, else omit","weight":"Style A only (number), else omit","description":"Style B only — the FULL exact item name including weight and pack count, with no bracketed customer name in it, else omit","pieces":"number — pieces produced (Tukda in Style A; in Style B, the single Quantity column, or the SUM of both quantity columns if the page has two side by side)","dispatch":"number — ONLY if the page has an explicit, separately-written dispatch/sent notation for this row (rare) — never just because a second quantity column exists, else 0"}]}`,
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
-      return raw.items.map(it => ({
+      const rows = raw.items.map(it => ({
         id: genId(), date: normalizeDateToDots(it.date_override || raw.date || it.date || ''), party: it.party || '', shade: it.shade || '',
         size: it.size || '', gsm: it.gsm || '', weight: num(it.weight), description: it.description || '',
         customerHint: it.customer_hint || '', pieces: num(it.pieces), dispatch: num(it.dispatch),
         stockConfirmed: false, confirmedCustomer: '',
       }));
+      return fillDittoDates(rows);
     },
   },
   {
