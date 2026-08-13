@@ -452,6 +452,22 @@ function normalizeDateToDots(raw) {
   // Unrecognized format — don't guess, leave untouched.
   return s;
 }
+// Real chronological ordering for D.M.YY / D.M.YYYY dot-formatted dates. A plain string compare
+// (what the ledger sort used before) sorts "11.8.26" before "3.8.26" because '1' < '3' character by
+// character, even though August 3rd is chronologically first — confirmed live in the Customer Sheets
+// review screen (Hit & Run 30g showed 1.08.26, 11.8.26, 3.8.26, 5.8.26 in that literal order). Opening/
+// closing balances are a running total down the ledger, so a misordered row corrupts every balance
+// after it. Parses into a zero-padded YYYY-MM-DD sort key instead; anything that isn't a clean D.M.YY
+// date sorts to the end rather than crashing or silently miscomparing.
+function dateSortKey(raw) {
+  const s = String(raw || '').trim();
+  const m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$/);
+  if (!m) return `9999-99-99::${s}`;
+  const day = m[1].padStart(2, '0');
+  const month = m[2].padStart(2, '0');
+  const year = m[3].length === 2 ? `20${m[3]}` : m[3];
+  return `${year}-${month}-${day}`;
+}
 const REAL_DATE_RE = /^\d{1,2}\.\d{1,2}\.\d{2,4}$/;
 // Safety net for ditto marks (a tick, quote mark, "11", "//", "do", a dash, etc. — handwritten
 // shorthand for "same date as the row above"). The extraction prompt already asks Claude to resolve
@@ -897,15 +913,14 @@ function FIMSApp() {
   const [serviceAccountEmail, setServiceAccountEmail] = useState('');
   // Review-before-push: reviewByCustomer holds the last fetched diff (a dry run against the customer's
   // REAL Sheet — see /api/customer-sheets/preview), reviewEdits holds only what a person has changed
-  // in that preview (date/production/dispatch per row, or which tab an item is routed to) — never
-  // written back into production/customerDispatch, only ever applied on top of the computed payload at
-  // preview-refresh and push time. approvedByCustomer stores a snapshot of the edited payload at the
-  // moment "Approve" was clicked; Push to Sheet is only enabled while the CURRENT edited payload still
-  // matches that snapshot exactly — any further edit or newly confirmed register row invalidates it,
-  // requiring a fresh look before anything real gets written.
+  // in that preview (date/production/dispatch per row, a deleted row, or which tab an item is routed
+  // to) — never written back into production/customerDispatch, only ever applied on top of the
+  // computed payload at preview-refresh and push time. This CRUD editing lives on the Customer Stock
+  // tab; Customer Sheets only shows a read-only version of the same diff plus the Push button itself —
+  // there's no separate "Approve" step anymore, Push just sends whatever the current edited payload is
+  // (with a plain confirm dialog, same as every other real write in this app).
   const [reviewByCustomer, setReviewByCustomer] = useState({}); // { [customer]: { loading, error, tabs, existingTabNames } }
   const [reviewEdits, setReviewEdits] = useState({}); // { [customer]: { [variantTitle]: { tabNameOverride, rowEdits: { [rowIndex]: {date,production,dispatch} }, deletedRows: { [rowIndex]: true } } } }
-  const [approvedByCustomer, setApprovedByCustomer] = useState({}); // { [customer]: JSON string of the approved itemGroups }
   // Inline "+ Add row" form state for the review screen, keyed by `${customer}::${variantTitle}`.
   const [newRowForms, setNewRowForms] = useState({});
   const updateNewRowForm = (key, field, value) => setNewRowForms(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
@@ -1627,7 +1642,7 @@ function FIMSApp() {
     confirmedProductionRows.forEach(row => addEntry(row, num(row.pieces), num(row.dispatch)));
     confirmedDispatchRows.forEach(row => addEntry(row, 0, num(row.quantity)));
     return Object.values(groups).map(g => {
-      const sorted = [...g.entries].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+      const sorted = [...g.entries].sort((a, b) => dateSortKey(a.date).localeCompare(dateSortKey(b.date)));
       let running = 0;
       const ledger = sorted.map(e => {
         const opening = running;
@@ -1827,12 +1842,10 @@ function FIMSApp() {
     });
   };
   // "Discard changes" for a specific customer sheet — wipes every staged edit/deletion/tab-override
-  // for that customer (and its approval snapshot, since the payload it was approved against no longer
-  // applies), reverting the review screen back to the freshly computed diff. Never touches the
-  // Production Register / Customer Dispatch Bills registers themselves.
+  // for that customer, reverting the review screen back to the freshly computed diff. Never touches
+  // the Production Register / Customer Dispatch Bills registers themselves.
   const discardCustomerReview = (customer) => {
     setReviewEdits(prev => { const next = { ...prev }; delete next[customer]; return next; });
-    setApprovedByCustomer(prev => { const next = { ...prev }; delete next[customer]; return next; });
   };
   // "Create a row" in the review screen. A synthetic row bolted directly onto the push payload would
   // need its own opening/closing balance math duplicating what customerStockGroups already does
@@ -1888,14 +1901,6 @@ function FIMSApp() {
       }
     });
     return movedAny;
-  };
-  const approveReview = (customer) => {
-    const { itemGroups } = getEditedPayload(customer);
-    setApprovedByCustomer(prev => ({ ...prev, [customer]: JSON.stringify(itemGroups) }));
-  };
-  const isReviewApproved = (customer) => {
-    const { itemGroups } = getEditedPayload(customer);
-    return !!approvedByCustomer[customer] && approvedByCustomer[customer] === JSON.stringify(itemGroups);
   };
   // Auto-refreshes every customer's review whenever what would actually get pushed changes — a new
   // production/dispatch entry gets confirmed, a catalog mapping is edited, or a review edit is made.
@@ -2159,6 +2164,23 @@ function FIMSApp() {
     reassignUnassignedRows();
     setAssignForms(prev => { const next = { ...prev }; delete next[groupId]; return next; });
   };
+  // Assign form for "unmatched" items — a confirmed row already routed to the right CUSTOMER (it
+  // matched a Customer Mapping rule), but its exact wording doesn't match any Product Catalog item,
+  // so buildCustomerSheetPayload has nowhere to route it and silently excludes it from what gets
+  // pushed. Same underlying fix as the Unassigned assign form (register the wording as an alias), just
+  // with the customer field already fixed instead of picked — there's nothing to guess there.
+  const [unmatchedAssignForms, setUnmatchedAssignForms] = useState({}); // keyed by `${customer}::${description}`
+  const updateUnmatchedAssignForm = (key, field, value) => setUnmatchedAssignForms(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
+  const assignUnmatchedItem = (customer, description) => {
+    const key = `${customer}::${description}`;
+    const form = unmatchedAssignForms[key] || {};
+    const sheetGroup = (form.sheetGroup || '').trim();
+    const rawAlias = (description || '').trim();
+    const item = (form.item || rawAlias).trim();
+    if (!customer || !sheetGroup || !item) return;
+    registerAliases(customer, [item, rawAlias], sheetGroup);
+    setUnmatchedAssignForms(prev => { const next = { ...prev }; delete next[key]; return next; });
+  };
   // Add-new-alias form for the dedicated Aliases tab.
   const [newAliasForm, setNewAliasForm] = useState({ customer: '', item: '', sheetGroup: '' });
   const updateNewAliasForm = (field, value) => setNewAliasForm(prev => ({ ...prev, [field]: value }));
@@ -2174,13 +2196,16 @@ function FIMSApp() {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Add a Google Sheet ID for this customer first (see field above).' } }));
       return;
     }
-    if (!isReviewApproved(customer)) {
-      setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Review the changes below and click Approve first — the diff has to be approved (and match exactly what you\'re about to push) before Push to Sheet will do anything.' } }));
+    // Always the CURRENT edited payload (review edits — value changes, deletions, moves, added rows —
+    // applied on top of the freshly computed ledger), so what gets written always matches exactly what
+    // was last shown on screen. No separate "Approve" step anymore — just a plain confirm, same as any
+    // other real write in this app (Clear Data, Discard changes, etc.).
+    const { itemGroups, unmatched } = getEditedPayload(customer);
+    if (!itemGroups.some(g => (g.variants || []).some(v => (v.rows || []).length > 0))) {
+      setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Nothing new to push right now.' } }));
       return;
     }
-    // Approved and current — use the EDITED payload (review edits applied), never the raw computed
-    // one, so what gets written matches exactly what was reviewed and approved.
-    const { itemGroups, unmatched } = getEditedPayload(customer);
+    if (!window.confirm(`Push ${itemGroups.length} item tab${itemGroups.length === 1 ? '' : 's'} to ${customer}'s Google Sheet now?`)) return;
     setPushStatus(prev => ({ ...prev, [customer]: { state: 'pushing', message: '', unmatched } }));
     try {
       const res = await fetch('/api/customer-sheets/push', {
@@ -2194,11 +2219,8 @@ function FIMSApp() {
       if (res.ok && data.ok) {
         setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Pushed ${itemGroups.length} item tab${itemGroups.length === 1 ? '' : 's'} just now.`, unmatched } }));
         patchCustomerSheetEntry(customer, { sheetId, lastPushedAt: new Date().toISOString() });
-        // The approval was for THIS specific diff — once it's actually written, clear both the
-        // approval and the row-level edits (their values are now baked into the real rows the app
-        // just appended) and pull a fresh diff so the screen immediately shows "nothing new" instead
-        // of a stale approved state that happens to still match.
-        setApprovedByCustomer(prev => { const next = { ...prev }; delete next[customer]; return next; });
+        // The staged edits were for THIS specific diff — once it's actually written, their values are
+        // now baked into the real rows the app just appended, so clear them and pull a fresh diff.
         setReviewEdits(prev => { const next = { ...prev }; delete next[customer]; return next; });
         refreshReview(customer);
       } else {
@@ -2926,9 +2948,207 @@ function FIMSApp() {
                   </div>
                 );
               })()}
-              {!pendingProductionRows.length && !pendingDispatchRows.length && !customerStockGroups.filter(g => g.customer === 'Unassigned').length && (
-                <div className="empty-state">Nothing pending review right now. Per-customer stock and the diff before pushing now live in the Customer Sheets tab.</div>
-              )}
+              {(() => {
+                // Per-customer ledger + diff-against-the-real-Sheet + full CRUD (edit/delete/move/add a
+                // row, discard staged changes) — moved here from Customer Sheets so there's one review
+                // step, not two. Customer Sheets now just shows a read-only version of the same data
+                // plus the Push button itself. Only customers with something to actually show (an item
+                // that needs routing, or a fetched diff) get a panel — no empty shells for customers
+                // that don't have a Sheet ID set up yet (that setup still happens on Customer Sheets).
+                const customersToShow = allCustomerTabNames.filter(customer => {
+                  if (!getCustomerSheetId(customer).trim()) return false;
+                  const { unmatched } = buildCustomerSheetPayload(customer);
+                  return unmatched.length > 0 || !!reviewByCustomer[customer];
+                });
+                if (!pendingProductionRows.length && !pendingDispatchRows.length && !customerStockGroups.filter(g => g.customer === 'Unassigned').length && !customersToShow.length) {
+                  return <div className="empty-state">Nothing pending review right now.</div>;
+                }
+                return customersToShow.map(customer => (
+                  <div className="panel" key={`stock-review-${customer}`}>
+                    <div className="panel-header">
+                      <div>
+                        <h2>{customer}</h2>
+                        <p className="subtitle">Per-item ledger and what's about to go to their Sheet — fix anything here, then push from the Customer Sheets tab.</p>
+                      </div>
+                      {!!reviewEdits[customer] && Object.keys(reviewEdits[customer]).length > 0 && (
+                        <button className="btn btn-ghost" onClick={() => { if (window.confirm(`Discard every staged change (edited values, deleted rows, tab overrides) for ${customer}'s review? This never touches the Production Register or Customer Dispatch Bills — only what's staged here.`)) discardCustomerReview(customer); }}>
+                          <XCircle size={15} /> Discard changes
+                        </button>
+                      )}
+                    </div>
+                    {(() => {
+                      const { unmatched } = buildCustomerSheetPayload(customer);
+                      if (!unmatched.length) return null;
+                      return (
+                        <div style={{ marginBottom: 14 }}>
+                          <div className="section-label" style={{ color: 'var(--ledger-red)' }}>{unmatched.length} item{unmatched.length === 1 ? '' : 's'} not routed to a Sheet tab yet</div>
+                          <p className="subtitle" style={{ marginBottom: 8 }}>These matched {customer} fine, but the exact wording doesn't match a known item name, so nothing gets pushed for them yet. Pick the Sheet tab (and an existing block name, if this should merge into one) below.</p>
+                          {unmatched.map(description => {
+                            const key = `${customer}::${description}`;
+                            const form = unmatchedAssignForms[key] || {};
+                            const customerSheetGroups = Array.from(new Set(
+                              productCatalog.filter(c => c.customer.toLowerCase() === customer.toLowerCase()).map(c => c.sheetGroup)
+                            )).filter(Boolean);
+                            const chosenSheetGroup = (form.sheetGroup || '').trim();
+                            const sheetGroupItems = Array.from(new Set(
+                              productCatalog
+                                .filter(c => c.customer.toLowerCase() === customer.toLowerCase() && c.sheetGroup.toLowerCase() === chosenSheetGroup.toLowerCase())
+                                .map(c => c.item)
+                            )).filter(Boolean);
+                            const canAssign = chosenSheetGroup && (form.item || description || '').trim();
+                            return (
+                              <div key={description} style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6, flexWrap: 'wrap' }}>
+                                <span style={{ fontSize: 13, minWidth: 160 }}>{description}</span>
+                                <input list={`unmatched-sheetgroup-${key}`} placeholder="Sheet tab" value={form.sheetGroup || ''} onChange={e => updateUnmatchedAssignForm(key, 'sheetGroup', e.target.value)} style={{ width: 150 }} />
+                                <datalist id={`unmatched-sheetgroup-${key}`}>{customerSheetGroups.map(s => <option key={s} value={s} />)}</datalist>
+                                <input list={`unmatched-item-${key}`} placeholder="Block (item name)" value={form.item !== undefined ? form.item : description} onChange={e => updateUnmatchedAssignForm(key, 'item', e.target.value)} style={{ width: 180 }} />
+                                <datalist id={`unmatched-item-${key}`}>{sheetGroupItems.map(i => <option key={i} value={i} />)}</datalist>
+                                <button className="btn btn-primary" disabled={!canAssign} onClick={() => assignUnmatchedItem(customer, description)}><Check size={15} /> Assign</button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
+                    {(() => {
+                      const review = reviewByCustomer[customer];
+                      if (!review) return null;
+                      const reviewTabs = review.tabs || [];
+                      const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => v.rows.length > 0));
+                      return (
+                        <div>
+                          {review.loading && <div className="doc-hint"><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle', marginRight: 6 }} />checking against the real Sheet…</div>}
+                          {review.error && <div className="error-box"><AlertCircle size={16} /><span>{review.error}</span></div>}
+                          {!review.error && !hasAnyNewRows && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet.</div>}
+                          {reviewTabs.map(tab => (tab.variants || []).filter(v => v.rows.length > 0).map(v => (
+                            <div key={`${tab.tabName}::${v.title}`} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
+                              <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
+                                <strong>{v.title}</strong>
+                                <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>— Sheet tab:</span>
+                                <input
+                                  className="cell-input"
+                                  style={{ width: 200, fontSize: 12 }}
+                                  list={`review-tabs-${customer}`}
+                                  value={(reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) ?? tab.tabName}
+                                  onChange={e => setTabOverride(customer, v.title, e.target.value)}
+                                />
+                                <datalist id={`review-tabs-${customer}`}>
+                                  {(review.existingTabNames || []).map(t => <option value={t} key={t} />)}
+                                </datalist>
+                                {tab.isNewTab
+                                  ? <span className="doc-hint">(new — this tab doesn't exist yet)</span>
+                                  : v.isNewBlock && <span className="doc-hint">(new — this block doesn't exist yet)</span>}
+                              </div>
+                              <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
+                                <thead>
+                                  <tr style={{ textAlign: 'left', color: 'var(--muted)' }}>
+                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Date</th>
+                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Opening</th>
+                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Production</th>
+                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Dispatch</th>
+                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Closing</th>
+                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Move to</th>
+                                    <th style={{ padding: '2px 6px', fontWeight: 500 }} className="col-action"></th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {v.lastExisting && (
+                                    <tr style={{ opacity: 0.55 }} title="Already in the real Sheet — shown for reference, never touched">
+                                      <td style={{ padding: '2px 6px' }}>{v.lastExisting.date}</td>
+                                      <td style={{ padding: '2px 6px' }} colSpan={3}>(already in the Sheet)</td>
+                                      <td style={{ padding: '2px 6px' }}>{v.lastExisting.closing}</td>
+                                      <td colSpan={2} />
+                                    </tr>
+                                  )}
+                                  {v.rows.map((r, i) => {
+                                    const variantEdits = (reviewEdits[customer] && reviewEdits[customer][v.title]) || {};
+                                    const edit = (variantEdits.rowEdits && variantEdits.rowEdits[i]) || {};
+                                    const isDeleted = !!(variantEdits.deletedRows && variantEdits.deletedRows[i]);
+                                    const moveKey = `${customer}::${v.title}::${i}`;
+                                    const rowDateValue = edit.date ?? r.date;
+                                    return (
+                                      <tr key={i} style={{ background: isDeleted ? 'rgba(162,59,46,0.08)' : 'rgba(214,163,80,0.14)', opacity: isDeleted ? 0.55 : 1 }}>
+                                        <td style={{ padding: '2px 6px' }}>
+                                          <input className="cell-input" style={{ width: 100 }} value={rowDateValue} onChange={e => setRowEdit(customer, v.title, i, 'date', e.target.value)} disabled={isDeleted} />
+                                        </td>
+                                        <td style={{ padding: '2px 6px' }}>{r.opening}</td>
+                                        <td style={{ padding: '2px 6px' }}>
+                                          <input className="cell-input" style={{ width: 80 }} type="number" value={edit.production ?? r.production} onChange={e => setRowEdit(customer, v.title, i, 'production', e.target.value)} disabled={isDeleted} />
+                                        </td>
+                                        <td style={{ padding: '2px 6px' }}>
+                                          <input className="cell-input" style={{ width: 80 }} type="number" value={edit.dispatch ?? r.dispatch} onChange={e => setRowEdit(customer, v.title, i, 'dispatch', e.target.value)} disabled={isDeleted} />
+                                        </td>
+                                        <td style={{ padding: '2px 6px' }}>{r.closing}</td>
+                                        <td style={{ padding: '2px 6px' }}>
+                                          <div style={{ display: 'flex', gap: 4 }}>
+                                            <input
+                                              list={`move-customers-${customer}`}
+                                              placeholder="Customer…"
+                                              style={{ width: 110, fontSize: 11.5 }}
+                                              className="cell-input"
+                                              value={moveTargets[moveKey] || ''}
+                                              onChange={e => setMoveTargets(prev => ({ ...prev, [moveKey]: e.target.value }))}
+                                              disabled={isDeleted}
+                                            />
+                                            <button
+                                              className="icon-btn"
+                                              title="Move this row (matched by date + item) to a different customer. If more than one dispatch bill shares this exact date and item, they all move together."
+                                              disabled={isDeleted || !(moveTargets[moveKey] || '').trim()}
+                                              onClick={() => {
+                                                const target = (moveTargets[moveKey] || '').trim();
+                                                if (!target) return;
+                                                if (!window.confirm(`Move the ${rowDateValue} entry for "${v.title}" from ${customer} to ${target}?`)) return;
+                                                const moved = moveReviewRow(customer, v.title, rowDateValue, target);
+                                                if (!moved) { window.alert(`Couldn't find a matching Production/Dispatch register row for ${rowDateValue} · ${v.title} · ${customer} to move — it may already have been edited or moved.`); return; }
+                                                setMoveTargets(prev => { const next = { ...prev }; delete next[moveKey]; return next; });
+                                              }}
+                                            >
+                                              <RefreshCw size={13} />
+                                            </button>
+                                          </div>
+                                        </td>
+                                        <td style={{ padding: '2px 6px' }} className="col-action">
+                                          <button className="icon-btn" title={isDeleted ? 'Undo delete' : 'Delete this row (only from this push — never touches the register)'} onClick={() => setRowDeleted(customer, v.title, i, !isDeleted)}>
+                                            {isDeleted ? <RefreshCw size={13} /> : <Trash2 size={13} />}
+                                          </button>
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                              <datalist id={`move-customers-${customer}`}>
+                                {allCustomerTabNames.filter(c => c !== customer).map(c => <option value={c} key={c} />)}
+                              </datalist>
+                              {(() => {
+                                const formKey = `${customer}::${v.title}`;
+                                const form = newRowForms[formKey] || {};
+                                return (
+                                  <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 8 }}>
+                                    <input className="cell-input" style={{ width: 100 }} placeholder="Date" value={form.date || ''} onChange={e => updateNewRowForm(formKey, 'date', e.target.value)} />
+                                    <input className="cell-input" style={{ width: 90 }} type="number" placeholder="Production" value={form.production || ''} onChange={e => updateNewRowForm(formKey, 'production', e.target.value)} />
+                                    <input className="cell-input" style={{ width: 90 }} type="number" placeholder="Dispatch" value={form.dispatch || ''} onChange={e => updateNewRowForm(formKey, 'dispatch', e.target.value)} />
+                                    <button
+                                      className="btn btn-ghost"
+                                      disabled={!form.date || (!form.production && !form.dispatch)}
+                                      onClick={() => {
+                                        addManualStockRow(customer, v.title, form.date, form.production, form.dispatch);
+                                        setNewRowForms(prev => { const next = { ...prev }; delete next[formKey]; return next; });
+                                      }}
+                                    >
+                                      <Plus size={13} /> Add row
+                                    </button>
+                                  </div>
+                                );
+                              })()}
+                            </div>
+                          )))}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                ));
+              })()}
             </div>
           )}
           {loaded && activeTab === 'customerMapping' && (
@@ -3130,14 +3350,13 @@ function FIMSApp() {
               {allCustomerTabNames.length === 0 && <div className="panel"><div className="empty-state">No customers yet — add one above.</div></div>}
               {allCustomerTabNames.map(customer => {
                 const status = pushStatus[customer] || {};
-                const { itemGroups, unmatched } = buildCustomerSheetPayload(customer);
+                const { itemGroups } = buildCustomerSheetPayload(customer);
                 const variantCount = itemGroups.reduce((s, g) => s + (g.variants || []).length, 0);
                 const sheetId = getCustomerSheetId(customer);
                 const registryEntry = customerSheetIds.find(c => c.customer === customer);
                 const review = reviewByCustomer[customer];
                 const reviewTabs = (review && review.tabs) || [];
                 const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => v.rows.length > 0));
-                const approved = isReviewApproved(customer);
                 return (
                   <div className="panel" key={customer}>
                     <div className="panel-header">
@@ -3152,7 +3371,7 @@ function FIMSApp() {
                         <button className="btn btn-ghost" onClick={() => importSheetById(sheetId, { mode: 'resync', resyncCustomer: customer })} disabled={sheetImportBusy || !sheetId.trim()} title="Re-check this customer's Sheet for newly added items and add them to the catalog">
                           <RefreshCw size={15} /> Re-sync
                         </button>
-                        <button className="btn btn-primary" onClick={() => pushCustomerSheetNow(customer)} disabled={status.state === 'pushing' || !sheetId.trim() || !approved} title={!approved ? 'Approve the changes in the review section below first' : ''}>
+                        <button className="btn btn-primary" onClick={() => pushCustomerSheetNow(customer)} disabled={status.state === 'pushing' || !sheetId.trim() || !hasAnyNewRows} title={!hasAnyNewRows ? 'Nothing new to push right now' : ''}>
                           {status.state === 'pushing' ? <Loader2 size={15} className="spin" /> : <FileSpreadsheet size={15} />} Push to Sheet
                         </button>
                       </div>
@@ -3165,78 +3384,26 @@ function FIMSApp() {
                         </button>
                       )}
                     </div>
-                    {(unmatched.length > 0 && sheetId.trim()) && (
-                      <div className="info-box" style={{ marginTop: 10 }}>
-                        <Info size={16} />
-                        <span>{unmatched.length} item{unmatched.length === 1 ? '' : 's'} in your Production/Dispatch records don't exactly match a known item name for {customer}, so they will NOT be pushed to their Sheet at all (nothing gets written for them, and no new tab gets created): {unmatched.join(', ')}. If these are real products, add them to the Known Product Catalog (Customer Mapping tab) with the exact wording that customer's Sheet uses, then push again.</span>
-                      </div>
-                    )}
                     {status.state === 'done' && <div className="doc-hint" style={{ color: 'var(--ok)', marginTop: 10 }}>✓ {status.message}</div>}
                     {status.state === 'error' && <div className="error-box" style={{ marginTop: 10 }}><AlertCircle size={16} /><span>{status.message}</span></div>}
                     {!sheetId.trim() && <div className="doc-hint" style={{ marginTop: 10 }}>Add a Sheet ID above to enable pushing or re-syncing.</div>}
                     {sheetId.trim() && review && (
                       <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                          <h3 style={{ margin: 0, fontSize: 14 }}>
-                            Review before push
-                            {review.loading && <span className="doc-hint" style={{ marginLeft: 8, fontWeight: 400 }}><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle' }} /> checking against the real Sheet…</span>}
-                          </h3>
-                          <span style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                            {!!reviewEdits[customer] && Object.keys(reviewEdits[customer]).length > 0 && !approved && (
-                              <button className="btn btn-ghost" onClick={() => { if (window.confirm(`Discard every staged change (edited values, deleted rows, tab overrides) for ${customer}'s review? This never touches the Production Register or Customer Dispatch Bills — only what's staged here.`)) discardCustomerReview(customer); }}>
-                                <XCircle size={15} /> Discard changes
-                              </button>
-                            )}
-                            {hasAnyNewRows && (
-                              approved
-                                ? <span style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                                    <span className="doc-hint" style={{ color: 'var(--ok)' }}>✓ Approved — matches what Push will send</span>
-                                    <button className="btn btn-ghost" onClick={() => setApprovedByCustomer(prev => { const next = { ...prev }; delete next[customer]; return next; })}>Edit again</button>
-                                  </span>
-                                : <button className="btn btn-primary" onClick={() => approveReview(customer)}><CheckCircle2 size={15} /> Approve these changes</button>
-                            )}
-                          </span>
-                        </div>
+                        <h3 style={{ margin: '0 0 8px 0', fontSize: 14 }}>
+                          Preview
+                          {review.loading && <span className="doc-hint" style={{ marginLeft: 8, fontWeight: 400 }}><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle' }} /> checking against the real Sheet…</span>}
+                        </h3>
                         {review.error && <div className="error-box"><AlertCircle size={16} /><span>{review.error}</span></div>}
-                        {!review.error && !hasAnyNewRows && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet.</div>}
+                        {!review.error && !hasAnyNewRows && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet. Need to fix something first? See the Customer Stock tab.</div>}
+                        {hasAnyNewRows && <p className="doc-hint" style={{ marginBottom: 8 }}>Read-only — to edit, delete, add, or move a row before pushing, use the Customer Stock tab.</p>}
                         {reviewTabs.map(tab => (tab.variants || []).filter(v => v.rows.length > 0).map(v => (
                           <div key={`${tab.tabName}::${v.title}`} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
-                            <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
-                              {/* alignItems:'baseline' (not 'center') — the title is 16px bold and the
-                                  label/input/new-tag are all 12px, so centering by height put the smaller
-                                  text visibly higher than the title instead of sitting on the same line of
-                                  text. Baseline alignment lines up their actual text baselines, which is
-                                  what "sitting on the same line" means for mixed font sizes. */}
-                              <strong>{v.title}</strong>
-                              <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>— Sheet tab:</span>
-                              {(() => {
-                                const tabNameValue = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) ?? tab.tabName;
-                                // Sits directly after the item name now (no more floating it to the far
-                                // right of the row, which is what caused the label and box to separate
-                                // onto different lines). Width is one flat, generous fixed value rather
-                                // than a per-character estimate — character-counting approaches (px/char,
-                                // then `ch` units) both undersized real lowercase tab names because
-                                // neither actually measures the font's real glyph widths. 200px comfortably
-                                // fits the longest real tab name across all three customers ("coconut
-                                // premium cookies") with room to spare, so nothing truncates — no ellipsis
-                                // needed.
-                                return (
-                                  <input
-                                    className="cell-input"
-                                    style={{ width: 200, fontSize: 12 }}
-                                    list={`review-tabs-${customer}`}
-                                    value={tabNameValue}
-                                    onChange={e => setTabOverride(customer, v.title, e.target.value)}
-                                    disabled={approved}
-                                  />
-                                );
-                              })()}
-                              <datalist id={`review-tabs-${customer}`}>
-                                {(review.existingTabNames || []).map(t => <option value={t} key={t} />)}
-                              </datalist>
+                            <div style={{ marginBottom: 6 }}>
+                              <strong>{v.title}</strong>{' '}
+                              <span className="doc-hint">— Sheet tab: {(reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) || tab.tabName}</span>
                               {tab.isNewTab
-                                ? <span className="doc-hint">(new — this tab doesn't exist yet)</span>
-                                : v.isNewBlock && <span className="doc-hint">(new — this block doesn't exist yet)</span>}
+                                ? <span className="doc-hint"> (new — this tab doesn't exist yet)</span>
+                                : v.isNewBlock && <span className="doc-hint"> (new — this block doesn't exist yet)</span>}
                             </div>
                             <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
                               <thead>
@@ -3246,100 +3413,33 @@ function FIMSApp() {
                                   <th style={{ padding: '2px 6px', fontWeight: 500 }}>Production</th>
                                   <th style={{ padding: '2px 6px', fontWeight: 500 }}>Dispatch</th>
                                   <th style={{ padding: '2px 6px', fontWeight: 500 }}>Closing</th>
-                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Move to</th>
-                                  <th style={{ padding: '2px 6px', fontWeight: 500 }} className="col-action"></th>
                                 </tr>
                               </thead>
                               <tbody>
                                 {v.lastExisting && (
-                                  <tr style={{ opacity: 0.55 }} title="Already in the real Sheet — shown for reference, never touched">
+                                  <tr style={{ opacity: 0.55 }} title="Already in the real Sheet">
                                     <td style={{ padding: '2px 6px' }}>{v.lastExisting.date}</td>
                                     <td style={{ padding: '2px 6px' }} colSpan={3}>(already in the Sheet)</td>
                                     <td style={{ padding: '2px 6px' }}>{v.lastExisting.closing}</td>
-                                    <td colSpan={2} />
                                   </tr>
                                 )}
                                 {v.rows.map((r, i) => {
                                   const variantEdits = (reviewEdits[customer] && reviewEdits[customer][v.title]) || {};
                                   const edit = (variantEdits.rowEdits && variantEdits.rowEdits[i]) || {};
                                   const isDeleted = !!(variantEdits.deletedRows && variantEdits.deletedRows[i]);
-                                  const moveKey = `${customer}::${v.title}::${i}`;
-                                  const rowDateValue = edit.date ?? r.date;
+                                  if (isDeleted) return null;
                                   return (
-                                    <tr key={i} style={{ background: isDeleted ? 'rgba(162,59,46,0.08)' : 'rgba(214,163,80,0.14)', opacity: isDeleted ? 0.55 : 1 }}>
-                                      <td style={{ padding: '2px 6px' }}>
-                                        <input className="cell-input" style={{ width: 100 }} value={rowDateValue} onChange={e => setRowEdit(customer, v.title, i, 'date', e.target.value)} disabled={approved || isDeleted} />
-                                      </td>
+                                    <tr key={i} style={{ background: 'rgba(214,163,80,0.14)' }}>
+                                      <td style={{ padding: '2px 6px' }}>{edit.date ?? r.date}</td>
                                       <td style={{ padding: '2px 6px' }}>{r.opening}</td>
-                                      <td style={{ padding: '2px 6px' }}>
-                                        <input className="cell-input" style={{ width: 80 }} type="number" value={edit.production ?? r.production} onChange={e => setRowEdit(customer, v.title, i, 'production', e.target.value)} disabled={approved || isDeleted} />
-                                      </td>
-                                      <td style={{ padding: '2px 6px' }}>
-                                        <input className="cell-input" style={{ width: 80 }} type="number" value={edit.dispatch ?? r.dispatch} onChange={e => setRowEdit(customer, v.title, i, 'dispatch', e.target.value)} disabled={approved || isDeleted} />
-                                      </td>
+                                      <td style={{ padding: '2px 6px' }}>{edit.production ?? r.production}</td>
+                                      <td style={{ padding: '2px 6px' }}>{edit.dispatch ?? r.dispatch}</td>
                                       <td style={{ padding: '2px 6px' }}>{r.closing}</td>
-                                      <td style={{ padding: '2px 6px' }}>
-                                        <div style={{ display: 'flex', gap: 4 }}>
-                                          <input
-                                            list={`move-customers-${customer}`}
-                                            placeholder="Customer…"
-                                            style={{ width: 110, fontSize: 11.5 }}
-                                            className="cell-input"
-                                            value={moveTargets[moveKey] || ''}
-                                            onChange={e => setMoveTargets(prev => ({ ...prev, [moveKey]: e.target.value }))}
-                                            disabled={approved || isDeleted}
-                                          />
-                                          <button
-                                            className="icon-btn"
-                                            title={`Move this row (matched by date + item) to a different customer. If more than one dispatch bill shares this exact date and item, they all move together.`}
-                                            disabled={approved || isDeleted || !(moveTargets[moveKey] || '').trim()}
-                                            onClick={() => {
-                                              const target = (moveTargets[moveKey] || '').trim();
-                                              if (!target) return;
-                                              if (!window.confirm(`Move the ${rowDateValue} entry for "${v.title}" from ${customer} to ${target}?`)) return;
-                                              const moved = moveReviewRow(customer, v.title, rowDateValue, target);
-                                              if (!moved) { window.alert(`Couldn't find a matching Production/Dispatch register row for ${rowDateValue} · ${v.title} · ${customer} to move — it may already have been edited or moved.`); return; }
-                                              setMoveTargets(prev => { const next = { ...prev }; delete next[moveKey]; return next; });
-                                            }}
-                                          >
-                                            <RefreshCw size={13} />
-                                          </button>
-                                        </div>
-                                      </td>
-                                      <td style={{ padding: '2px 6px' }} className="col-action">
-                                        <button className="icon-btn" title={isDeleted ? 'Undo delete' : 'Delete this row (only from this push — never touches the register)'} onClick={() => setRowDeleted(customer, v.title, i, !isDeleted)} disabled={approved}>
-                                          {isDeleted ? <RefreshCw size={13} /> : <Trash2 size={13} />}
-                                        </button>
-                                      </td>
                                     </tr>
                                   );
                                 })}
                               </tbody>
                             </table>
-                            <datalist id={`move-customers-${customer}`}>
-                              {allCustomerTabNames.filter(c => c !== customer).map(c => <option value={c} key={c} />)}
-                            </datalist>
-                            {(() => {
-                              const formKey = `${customer}::${v.title}`;
-                              const form = newRowForms[formKey] || {};
-                              return (
-                                <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 8 }}>
-                                  <input className="cell-input" style={{ width: 100 }} placeholder="Date" value={form.date || ''} onChange={e => updateNewRowForm(formKey, 'date', e.target.value)} disabled={approved} />
-                                  <input className="cell-input" style={{ width: 90 }} type="number" placeholder="Production" value={form.production || ''} onChange={e => updateNewRowForm(formKey, 'production', e.target.value)} disabled={approved} />
-                                  <input className="cell-input" style={{ width: 90 }} type="number" placeholder="Dispatch" value={form.dispatch || ''} onChange={e => updateNewRowForm(formKey, 'dispatch', e.target.value)} disabled={approved} />
-                                  <button
-                                    className="btn btn-ghost"
-                                    disabled={approved || !form.date || (!form.production && !form.dispatch)}
-                                    onClick={() => {
-                                      addManualStockRow(customer, v.title, form.date, form.production, form.dispatch);
-                                      setNewRowForms(prev => { const next = { ...prev }; delete next[formKey]; return next; });
-                                    }}
-                                  >
-                                    <Plus size={13} /> Add row
-                                  </button>
-                                </div>
-                              );
-                            })()}
                           </div>
                         )))}
                       </div>
