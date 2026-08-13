@@ -493,15 +493,21 @@ IMPORTANT — column format varies between mills, read carefully:
     hint: 'The handwritten daily sheet workers use to record raw material consumed — columns are usually Shade, GSM, Size, Weight, and Balance Left.',
     register: 'consumption',
     systemPrompt: `You read a handwritten daily raw-material consumption report from a corrugated box factory. The sheet has Hindi column headers. Most rows share one date written once at the top. Return ONLY one JSON object:
-{"date":"as written at the top, DD/MM/YYYY","items":[{"shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number","balance_left":"the टुकड़ा / Tukda column value (this is the running balance left, NOT a piece count) as a number, or empty string if that row has none","date_override":"only include this if a specific row has a different date than the header, else omit"}]}
+{"date":"as written at the top, DD/MM/YYYY","items":[{"shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number","balance_left":"the टुकड़ा / Tukda column value (this is the running balance left, NOT a piece count) as a number, or empty string if that row has none","date_override":"only include this if a specific row has a different date than the header, else omit","flag":"only if you couldn't reliably read this row's weight/balance — e.g. a column looks cut off/missing, or there's a crossed-out number and you're unsure which replacement is correct — a short reason why, else omit"}]}
 IMPORTANT:
 - The column that looks like it's labeled "S/K" is actually the SHADE column, not a party name or code. Decode its handwritten values: "S.K" or "SK" means shade NS (Sada Kraft / natural shade). "G.Y" or "GY" means shade GY (Golden Yellow). If you see a different value you don't recognize, copy it as written rather than forcing it into NS or GY.
 - There is no BF field on this document — do not invent one. What might look like a stray extra column is the Size column.
 - Do not skip the last column (टुकड़ा / Tukda) — it is the balance left, and must be captured for every row that has a value in it.
+- CROSSED-OUT / CORRECTED VALUES: this is a real working register — a number is sometimes struck through with the corrected number written right next to it in that same row. Use only the number that is NOT crossed out; ignore the struck-through one entirely. This stays within one row — never borrow a number from the row above or below because a cell looks messy.
+- MISSING/CUT-OFF COLUMNS: if a column genuinely isn't visible for a row (cropped off the scan, torn page, etc.), do not invent a value by reading unrelated nearby text. Leave that field empty/0 and set "flag" to a short reason instead.
 - Interpret unclear handwriting as best you can; if a value is genuinely illegible leave it as an empty string rather than guessing wildly.`,
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
-      const rows = raw.items.map(it => ({ id: genId(), date: normalizeDateToDots(it.date_override || raw.date || ''), shade: it.shade || '', size: it.size || '', gsm: it.gsm || '', weight_consumed: num(it.weight_consumed), balance_left: it.balance_left === '' || it.balance_left == null ? '' : num(it.balance_left) }));
+      const rows = raw.items.map(it => ({
+        id: genId(), date: normalizeDateToDots(it.date_override || raw.date || ''), shade: it.shade || '', size: it.size || '', gsm: it.gsm || '',
+        weight_consumed: num(it.weight_consumed), balance_left: it.balance_left === '' || it.balance_left == null ? '' : num(it.balance_left),
+        flagged: !!(it.flag && String(it.flag).trim()), flagReason: (it.flag || '').trim(),
+      }));
       return fillDittoDates(rows);
     },
   },
@@ -521,8 +527,10 @@ STYLE B — product ledger style: each line has a DATE and a product DESCRIPTION
 - IMPORTANT: a customer name is sometimes written in brackets right next to the item name, either before or after it — e.g. "(Diamond) Cream Burst 30g x140" or "Cream Burst 30g x140 (Diamond)". Pull that bracketed name OUT into its own "customer_hint" field and do NOT leave it inside "description" — "description" should be just the clean item name with no bracket in it.
 - Dates are VERY often written once then repeated below with a ditto mark for every following row that shares that same date — this could be a tick, a quote mark ("), the digits 11, two short slashes (//), the word "do", a dash, or any other short repeat-symbol instead of an actual date. Whenever a row's date cell is anything other than a clearly legible date, treat it as a ditto mark and resolve it to the SAME date as the row directly above it — copy that exact date into "date_override" for the row. Never leave a row's date blank or output the ditto symbol itself just because it wasn't written out in full.
 - Some pages have a single "Quantity" column — put that value into "pieces". Other pages have TWO numeric columns side by side for the same row (regardless of what they're headed with, e.g. small letters like S/D, two batch tallies, etc.) — both of these are PRODUCTION quantities, never a dispatch quantity. If a row has a number in only one of the two columns, put that number in "pieces". If a row genuinely has a number in BOTH columns, add them together into "pieces" — do not put the second column's number into "dispatch". The "dispatch" field on this register is rare — only use it if the page has an explicit, separately-written note that some of that day's production was sent out immediately (e.g. an actual word like "dispatch"/"bheja" next to a number), never just because a second quantity column exists.
+- CROSSED-OUT / CORRECTED VALUES: this is a real working register, so a number is sometimes struck through (a line drawn through it, or scribbled over) with the CORRECTED number written right next to it (before, after, above, or below the crossed-out one, still within that same row). When you see this, use ONLY the number that is NOT crossed out as the real value — completely ignore the struck-through one. This correction always stays within its own row — never borrow a number from the row above or below just because a cell looks messy or hard to read; re-examine that exact row instead of guessing from a neighboring row.
+- MISSING/CUT-OFF COLUMNS: if the quantity column (or any column Style A/B normally has) genuinely is not visible for a row — cropped off the edge of the scan, torn page, or the column simply doesn't exist on this particular page — do NOT invent a number by reading some other nearby text instead (e.g. do not use a pack-size number like "120" from "32g x120", and do not use the word "Pkt"/"Pakt"/"Packet" or any part of it as if it were a quantity). Leave "pieces" as 0 for that row and set "flag" to a short reason like "quantity column not visible in this scan" instead. If this affects the WHOLE page (e.g. the entire quantity column got cropped out of the photo), still extract every row's date/description as normal, just flag each one the same way rather than skipping the page.
 For EITHER style: do not include page-total or running-total rows (a lone number with no row content, usually at the bottom of a page or column). Extract every real row on the page, in order, exactly once — do not skip rows and do not repeat any row, even if faint printing or ruling lines make it look duplicated. If an actual customer/party name is written somewhere on the page itself (separate from the shade column — e.g. as a page header/title, applying to the WHOLE page, not a per-row bracket), include it as "party" for every item on that page; otherwise omit "party" entirely.
-Return ONLY one JSON object: {"date":"shared header date if Style A, DD/MM/YYYY, else omit","items":[{"date_override":"the row's own date if Style A/B and it differs from the header, OR the ditto-resolved date copied from the row above if this row used a ditto mark — include this whenever you're not 100% sure the header date alone is right, else omit","party":"only if found as a whole-page header, else omit","customer_hint":"Style B only — a bracketed customer name found next to this specific item, else omit","shade":"Style A only, else omit","size":"Style A only, else omit","gsm":"Style A only, else omit","weight":"Style A only (number), else omit","description":"Style B only — the FULL exact item name including weight and pack count, with no bracketed customer name in it, else omit","pieces":"number — pieces produced (Tukda in Style A; in Style B, the single Quantity column, or the SUM of both quantity columns if the page has two side by side)","dispatch":"number — ONLY if the page has an explicit, separately-written dispatch/sent notation for this row (rare) — never just because a second quantity column exists, else 0"}]}`,
+Return ONLY one JSON object: {"date":"shared header date if Style A, DD/MM/YYYY, else omit","items":[{"date_override":"the row's own date if Style A/B and it differs from the header, OR the ditto-resolved date copied from the row above if this row used a ditto mark — include this whenever you're not 100% sure the header date alone is right, else omit","party":"only if found as a whole-page header, else omit","customer_hint":"Style B only — a bracketed customer name found next to this specific item, else omit","shade":"Style A only, else omit","size":"Style A only, else omit","gsm":"Style A only, else omit","weight":"Style A only (number), else omit","description":"Style B only — the FULL exact item name including weight and pack count, with no bracketed customer name in it, else omit","pieces":"number — pieces produced (Tukda in Style A; in Style B, the single Quantity column, or the SUM of both quantity columns if the page has two side by side; the CORRECTED number if this row had a crossed-out value; 0 if the quantity column isn't actually visible for this row)","dispatch":"number — ONLY if the page has an explicit, separately-written dispatch/sent notation for this row (rare) — never just because a second quantity column exists, else 0","flag":"only if you couldn't reliably read this row's quantity — e.g. the column looks cut off/missing, or you're genuinely unsure which of two numbers is the corrected one — a short reason why, else omit"}]}`,
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
       const rows = raw.items.map(it => ({
@@ -530,6 +538,7 @@ Return ONLY one JSON object: {"date":"shared header date if Style A, DD/MM/YYYY,
         size: it.size || '', gsm: it.gsm || '', weight: num(it.weight), description: it.description || '',
         customerHint: it.customer_hint || '', pieces: num(it.pieces), dispatch: num(it.dispatch),
         stockConfirmed: false, confirmedCustomer: '',
+        flagged: !!(it.flag && String(it.flag).trim()), flagReason: (it.flag || '').trim(),
       }));
       return fillDittoDates(rows);
     },
@@ -732,15 +741,20 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
         </thead>
         <tbody>
           {rows.map(row => (
-            <tr key={row.id}>
-              {columns.map(c => (
+            <tr key={row.id} className={row.flagged ? 'flagged-row' : ''}>
+              {columns.map((c, ci) => (
                 <td key={c.key}>
-                  <input
-                    className="cell-input"
-                    type={c.type === 'number' ? 'number' : 'text'}
-                    value={row[c.key] ?? ''}
-                    onChange={(e) => onUpdate(row.id, c.key, c.type === 'number' ? e.target.value : e.target.value)}
-                  />
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    {ci === 0 && row.flagged && (
+                      <AlertCircle size={13} color="var(--ledger-red)" style={{ flexShrink: 0 }} title={row.flagReason || 'Flagged during extraction — the model wasn\'t confident about this row. Check it against the original document.'} />
+                    )}
+                    <input
+                      className="cell-input"
+                      type={c.type === 'number' ? 'number' : 'text'}
+                      value={row[c.key] ?? ''}
+                      onChange={(e) => onUpdate(row.id, c.key, c.type === 'number' ? e.target.value : e.target.value)}
+                    />
+                  </div>
                 </td>
               ))}
               <td className="col-action">
@@ -2413,6 +2427,7 @@ function FIMSApp() {
         .dropzone:hover { background: var(--accent-soft); border-color: var(--accent); }
         .preview-img { max-width: 100%; max-height: 70vh; object-fit: contain; border-radius: 6px; border: 1px solid var(--rule); margin-top: 12px; cursor: zoom-in; background: #fff; }
         .error-box { display: flex; gap: 8px; align-items: flex-start; background: var(--warn-soft); border: 1px solid var(--ledger-red); color: #6b241a; padding: 10px 12px; border-radius: 5px; font-size: 12.5px; margin: 10px 0; }
+        .flagged-row { background: var(--warn-soft) !important; }
         .info-box { display: flex; gap: 8px; align-items: flex-start; background: var(--accent-soft); border: 1px solid var(--rule); color: var(--ink); padding: 10px 12px; border-radius: 5px; font-size: 12.5px; margin: 10px 0; }
         .field-row { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
         .text-input { padding: 8px 10px; border-radius: 5px; border: 1px solid var(--rule); font: inherit; font-size: 13px; }
@@ -2607,6 +2622,12 @@ function FIMSApp() {
                             <div className="error-box" style={{ marginBottom: 10 }}>
                               <AlertCircle size={16} />
                               <span>Claude's response was cut off before it finished this page — there may be more rows than the {page.rows.length} shown below. Check against the original document, then re-extract if anything's missing (a fresh attempt isn't guaranteed to hit the same cutoff).</span>
+                            </div>
+                          )}
+                          {page.rows.some(r => r.flagged) && (
+                            <div className="error-box" style={{ marginBottom: 10 }}>
+                              <AlertCircle size={16} />
+                              <span>{page.rows.filter(r => r.flagged).length} row(s) below are flagged (highlighted, with a warning icon on the first cell) — the model wasn't confident about a value, usually because a column looked cut off/missing or a crossed-out number was ambiguous. Check those against the original document and fix by hand; nothing was guessed for them.</span>
                             </div>
                           )}
                           <p className="subtitle" style={{ marginBottom: 10 }}>{page.rows.length} row(s) found for <strong>{activeConfig.label}</strong>. Fix anything that looks wrong, then confirm.</p>
