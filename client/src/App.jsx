@@ -633,6 +633,7 @@ const NAV = [
   { key: 'daburDispatch', label: 'Dabur — Dispatch Log', icon: Truck },
   { key: 'customerStock', label: 'Customer Stock', icon: Boxes },
   { key: 'customerMapping', label: 'Customer Mapping', icon: ListChecks },
+  { key: 'aliases', label: 'Aliases', icon: Link2 },
   { key: 'customerSheets', label: 'Customer Sheets', icon: FileSpreadsheet },
   { key: 'settings', label: 'Settings', icon: Trash2 },
 ];
@@ -1428,8 +1429,6 @@ function FIMSApp() {
     setProductCatalog(next);
     scheduleSave('catalog', () => window.storage.set(CATALOG_KEY, JSON.stringify(next), false).catch(() => {}));
   };
-  const deleteCatalogItem = (id) => persistCatalog(productCatalog.filter(c => c.id !== id));
-  const updateCatalogItem = (id, field, value) => persistCatalog(productCatalog.map(c => c.id === id ? { ...c, [field]: value } : c));
   // Shared dedup keys for the Sheet-ID import flow below — trims BOTH sides before comparing.
   // Catalog items imported from a Sheet are always already trimmed at extraction time, but a row
   // added by hand through the UI might have stray leading/trailing whitespace; without trimming both
@@ -1438,6 +1437,67 @@ function FIMSApp() {
   // mapping keywords.
   const catalogDedupKey = (customer, item) => `${(customer || '').trim().toLowerCase()}||${(item || '').trim().toLowerCase()}`;
   const mappingDedupKey = (keyword) => (keyword || '').trim().toLowerCase();
+  // Deleting or renaming a catalog item ("alias") also keeps its paired exact-match Customer Mapping
+  // keyword rule in sync (if one exists) — same idea everywhere in the app that creates one of these
+  // pairs (see registerAliases below): a name that routes to a Sheet tab and a name that routes to a
+  // customer should never be able to silently drift apart just because they're stored in two arrays.
+  // Used by both the Known Product Catalog table (Customer Mapping tab) and the dedicated Aliases tab
+  // — one implementation, so editing/deleting behaves identically no matter which screen you're on.
+  const deleteCatalogItem = (id) => {
+    const entry = productCatalog.find(c => c.id === id);
+    if (!entry) return;
+    persistCatalog(productCatalog.filter(c => c.id !== id));
+    const exact = mappingDedupKey(entry.item);
+    const rule = customerMapping.find(r => mappingDedupKey(r.keyword) === exact && r.customer === entry.customer);
+    if (rule) persistCustomerMapping(customerMapping.filter(r => r.id !== rule.id));
+  };
+  const updateCatalogItem = (id, field, value) => {
+    const entry = productCatalog.find(c => c.id === id);
+    if (!entry) return;
+    persistCatalog(productCatalog.map(c => c.id === id ? { ...c, [field]: value } : c));
+    if (field === 'item' || field === 'customer') {
+      const oldExact = mappingDedupKey(entry.item);
+      const rule = customerMapping.find(r => mappingDedupKey(r.keyword) === oldExact && r.customer === entry.customer);
+      if (rule) {
+        persistCustomerMapping(customerMapping.map(r => r.id === rule.id
+          ? { ...r, keyword: field === 'item' ? mappingDedupKey(value) : r.keyword, customer: field === 'customer' ? value : r.customer }
+          : r));
+      }
+    }
+  };
+  // Registers one or more alias/name spellings for a customer + sheet tab as a single batch — adds a
+  // Product Catalog entry (routes to the right Sheet tab) and an exact-match Customer Mapping keyword
+  // rule (routes to the right customer) for whichever names aren't already known. Batched into one
+  // persistCatalog/persistCustomerMapping call each on purpose: calling this twice in a row for two
+  // different names (once per name) would each read the pre-first-call arrays from a stale closure,
+  // and the second call would silently overwrite/drop the first's addition — a real bug, not just a
+  // cosmetic staleness quirk, since these two setState calls target the exact same array.
+  const registerAliases = (customer, names, sheetGroup) => {
+    const c = (customer || '').trim();
+    const sg = (sheetGroup || '').trim();
+    const list = Array.from(new Set((names || []).map(n => (n || '').trim()).filter(Boolean)));
+    if (!c || !sg || !list.length) return;
+    const existingItems = new Set(productCatalog.map(x => catalogDedupKey(x.customer, x.item)));
+    const seenCatalogKeys = new Set();
+    const newCatalogEntries = [];
+    list.forEach(name => {
+      const key = catalogDedupKey(c, name);
+      if (existingItems.has(key) || seenCatalogKeys.has(key)) return;
+      seenCatalogKeys.add(key);
+      newCatalogEntries.push({ id: genId(), customer: c, item: name, sheetGroup: sg });
+    });
+    if (newCatalogEntries.length) persistCatalog([...productCatalog, ...newCatalogEntries]);
+    const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
+    const seenKeywords = new Set();
+    const newMappingRules = [];
+    list.forEach(name => {
+      const exact = mappingDedupKey(name);
+      if (!exact || existingKeywords.has(exact) || seenKeywords.has(exact)) return;
+      seenKeywords.add(exact);
+      newMappingRules.push({ id: genId(), keyword: exact, customer: c });
+    });
+    if (newMappingRules.length) persistCustomerMapping([...newMappingRules, ...customerMapping]);
+  };
   const matchCustomer = (row) => {
     const hint = (row.customerHint || '').trim();
     const d = (row.description || '').toLowerCase();
@@ -2062,29 +2122,18 @@ function FIMSApp() {
     const rawAlias = (description || '').trim();
     const item = (form.item || rawAlias).trim();
     if (!customer || !sheetGroup || !item) return;
-    const namesToRegister = Array.from(new Set([item, rawAlias].filter(Boolean)));
-    const existingItems = new Set(productCatalog.map(c => catalogDedupKey(c.customer, c.item)));
-    const seenCatalogKeys = new Set();
-    const newCatalogEntries = [];
-    namesToRegister.forEach(name => {
-      const key = catalogDedupKey(customer, name);
-      if (existingItems.has(key) || seenCatalogKeys.has(key)) return;
-      seenCatalogKeys.add(key);
-      newCatalogEntries.push({ id: genId(), customer, item: name, sheetGroup });
-    });
-    if (newCatalogEntries.length) persistCatalog([...productCatalog, ...newCatalogEntries]);
-    const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
-    const seenKeywords = new Set();
-    const newMappingRules = [];
-    namesToRegister.forEach(name => {
-      const exact = name.toLowerCase();
-      if (!exact || existingKeywords.has(exact) || seenKeywords.has(exact)) return;
-      seenKeywords.add(exact);
-      newMappingRules.push({ id: genId(), keyword: exact, customer });
-    });
-    if (newMappingRules.length) persistCustomerMapping([...newMappingRules, ...customerMapping]);
+    registerAliases(customer, [item, rawAlias], sheetGroup);
     reassignUnassignedRows();
     setAssignForms(prev => { const next = { ...prev }; delete next[groupId]; return next; });
+  };
+  // Add-new-alias form for the dedicated Aliases tab.
+  const [newAliasForm, setNewAliasForm] = useState({ customer: '', item: '', sheetGroup: '' });
+  const updateNewAliasForm = (field, value) => setNewAliasForm(prev => ({ ...prev, [field]: value }));
+  const addAliasFromForm = () => {
+    const { customer, item, sheetGroup } = newAliasForm;
+    if (!customer.trim() || !item.trim() || !sheetGroup.trim()) return;
+    registerAliases(customer, [item], sheetGroup);
+    setNewAliasForm({ customer: '', item: '', sheetGroup: '' });
   };
   const pushCustomerSheetNow = async (customer) => {
     const sheetId = getCustomerSheetId(customer).trim();
@@ -2405,7 +2454,7 @@ function FIMSApp() {
               </div>
               <p className="subtitle" style={{ marginBottom: 18 }}>Everything below is stored on this device for your account and stays put between visits. Click any card to jump to that register.</p>
               <div className="dash-grid">
-                {NAV.filter(n => n.key !== 'dashboard' && n.key !== 'upload' && n.key !== 'orderCheck' && n.key !== 'customerStock' && n.key !== 'customerMapping' && n.key !== 'settings').map(n => (
+                {NAV.filter(n => n.key !== 'dashboard' && n.key !== 'upload' && n.key !== 'orderCheck' && n.key !== 'customerStock' && n.key !== 'customerMapping' && n.key !== 'aliases' && n.key !== 'settings').map(n => (
                   <div className="dash-card" key={n.key} onClick={() => setActiveTab(n.key)}>
                     <div className="num">{counts[n.key]}</div>
                     <div className="lbl">{n.label}</div>
@@ -2874,6 +2923,55 @@ function FIMSApp() {
                     <div className="table-wrap">
                       <table>
                         <thead><tr><th>Item name</th><th>Sheet Tab (item group)</th><th className="col-action"></th></tr></thead>
+                        <tbody>
+                          {productCatalog.filter(c => c.customer === customer).map(c => (
+                            <tr key={c.id}>
+                              <td><input className="cell-input" value={c.item} onChange={e => updateCatalogItem(c.id, 'item', e.target.value)} /></td>
+                              <td><input className="cell-input" value={c.sheetGroup || ''} placeholder={c.item} onChange={e => updateCatalogItem(c.id, 'sheetGroup', e.target.value)} /></td>
+                              <td className="col-action"><button className="icon-btn danger" onClick={() => deleteCatalogItem(c.id)}><Trash2 size={15} /></button></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {loaded && activeTab === 'aliases' && (
+            <div>
+              <div className="panel">
+                <h2 style={{ marginBottom: 6 }}>Aliases</h2>
+                <p className="subtitle" style={{ marginBottom: 14 }}>An alias is an alternate spelling/wording for an item that should route to the same customer and the same Sheet tab as the "real" name — e.g. a dispatch bill written as "HANDLE LOCK" that should really land under Diamond's "Tijori Handle" block. Adding one here does two things together, kept in sync: it adds a Product Catalog entry (so it lands in the right Sheet tab) and an exact-match Customer Mapping keyword rule (so it routes to the right customer). Editing or deleting an alias updates both. This is the same data shown under Customer Mapping → Known Product Catalog — just a dedicated, add-capable view of it.</p>
+                <div className="field-row">
+                  <input className="text-input" list="alias-customers" placeholder="Customer" style={{ width: 160 }} value={newAliasForm.customer} onChange={e => updateNewAliasForm('customer', e.target.value)} />
+                  <datalist id="alias-customers">{allCustomerTabNames.map(c => <option value={c} key={c} />)}</datalist>
+                  <input className="text-input" placeholder="Alias / item name (as it's actually written)" style={{ minWidth: 240, flex: 1 }} value={newAliasForm.item} onChange={e => updateNewAliasForm('item', e.target.value)} />
+                  <input
+                    className="text-input"
+                    list={`alias-sheetgroups-${(newAliasForm.customer || '').trim().toLowerCase()}`}
+                    placeholder="Sheet tab it should land under"
+                    style={{ width: 200 }}
+                    value={newAliasForm.sheetGroup}
+                    onChange={e => updateNewAliasForm('sheetGroup', e.target.value)}
+                  />
+                  <datalist id={`alias-sheetgroups-${(newAliasForm.customer || '').trim().toLowerCase()}`}>
+                    {Array.from(new Set(productCatalog.filter(c => c.customer.toLowerCase() === (newAliasForm.customer || '').trim().toLowerCase()).map(c => c.sheetGroup))).filter(Boolean).map(s => <option value={s} key={s} />)}
+                  </datalist>
+                  <button className="btn btn-primary" disabled={!newAliasForm.customer.trim() || !newAliasForm.item.trim() || !newAliasForm.sheetGroup.trim()} onClick={addAliasFromForm}>
+                    <Plus size={15} /> Add alias
+                  </button>
+                </div>
+              </div>
+              <div className="panel">
+                {customerNames.length === 0 && !productCatalog.length && <div className="empty-state">No aliases yet — add one above.</div>}
+                {Array.from(new Set(productCatalog.map(c => c.customer))).map(customer => (
+                  <div key={customer} style={{ marginBottom: 16 }}>
+                    <div className="section-label">{customer} ({productCatalog.filter(c => c.customer === customer).length})</div>
+                    <div className="table-wrap">
+                      <table>
+                        <thead><tr><th>Alias / item name</th><th>Sheet tab</th><th className="col-action"></th></tr></thead>
                         <tbody>
                           {productCatalog.filter(c => c.customer === customer).map(c => (
                             <tr key={c.id}>
