@@ -3031,10 +3031,11 @@ function FIMSApp() {
                     {(() => {
                       const { unmatched } = buildCustomerSheetPayload(customer);
                       if (!unmatched.length) return null;
+                      const groupsForCustomer = customerStockGroups.filter(g => g.customer === customer);
                       return (
                         <div style={{ marginBottom: 14 }}>
                           <div className="section-label" style={{ color: 'var(--ledger-red)' }}>{unmatched.length} item{unmatched.length === 1 ? '' : 's'} not routed to a Sheet tab yet</div>
-                          <p className="subtitle" style={{ marginBottom: 8 }}>These matched {customer} fine, but the exact wording doesn't match a known item name, so nothing gets pushed for them yet. Pick the Sheet tab (and an existing block name, if this should merge into one) below.</p>
+                          <p className="subtitle" style={{ marginBottom: 8 }}>These matched {customer} fine, but the exact wording doesn't match a known item name, so nothing gets pushed for them yet — their ledger is shown below just like an already-routed item's. Pick the Sheet tab (and an existing block name, if this should merge into one) right here to route it.</p>
                           {unmatched.map(description => {
                             const key = `${customer}::${description}`;
                             const form = unmatchedAssignForms[key] || {};
@@ -3048,14 +3049,43 @@ function FIMSApp() {
                                 .map(c => c.item)
                             )).filter(Boolean);
                             const canAssign = chosenSheetGroup && (form.item || description || '').trim();
+                            const group = groupsForCustomer.find(g => g.description === description);
                             return (
-                              <div key={description} style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6, flexWrap: 'wrap' }}>
-                                <span style={{ fontSize: 13, minWidth: 160 }}>{description}</span>
-                                <input list={`unmatched-sheetgroup-${key}`} placeholder="Sheet tab" value={form.sheetGroup || ''} onChange={e => updateUnmatchedAssignForm(key, 'sheetGroup', e.target.value)} style={{ width: 150 }} />
-                                <datalist id={`unmatched-sheetgroup-${key}`}>{customerSheetGroups.map(s => <option key={s} value={s} />)}</datalist>
-                                <input list={`unmatched-item-${key}`} placeholder="Block (item name)" value={form.item !== undefined ? form.item : description} onChange={e => updateUnmatchedAssignForm(key, 'item', e.target.value)} style={{ width: 180 }} />
-                                <datalist id={`unmatched-item-${key}`}>{sheetGroupItems.map(i => <option key={i} value={i} />)}</datalist>
-                                <button className="btn btn-primary" disabled={!canAssign} onClick={() => assignUnmatchedItem(customer, description)}><Check size={15} /> Assign</button>
+                              <div key={description} style={{ border: '1px solid var(--ledger-red)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
+                                <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
+                                  <strong>{description}</strong>
+                                  <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>— Sheet tab:</span>
+                                  <input className="cell-input" style={{ width: 150, fontSize: 12 }} list={`unmatched-sheetgroup-${key}`} placeholder="Sheet tab" value={form.sheetGroup || ''} onChange={e => updateUnmatchedAssignForm(key, 'sheetGroup', e.target.value)} />
+                                  <datalist id={`unmatched-sheetgroup-${key}`}>{customerSheetGroups.map(s => <option key={s} value={s} />)}</datalist>
+                                  <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>Block:</span>
+                                  <input className="cell-input" style={{ width: 180, fontSize: 12 }} list={`unmatched-item-${key}`} placeholder="Block (item name)" value={form.item !== undefined ? form.item : description} onChange={e => updateUnmatchedAssignForm(key, 'item', e.target.value)} />
+                                  <datalist id={`unmatched-item-${key}`}>{sheetGroupItems.map(i => <option key={i} value={i} />)}</datalist>
+                                  <button className="btn btn-primary" style={{ marginLeft: 'auto' }} disabled={!canAssign} onClick={() => assignUnmatchedItem(customer, description)}><Check size={13} /> Assign</button>
+                                </div>
+                                {group && (
+                                  <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
+                                    <thead>
+                                      <tr style={{ textAlign: 'left', color: 'var(--muted)' }}>
+                                        <th style={{ padding: '2px 6px', fontWeight: 500 }}>Date</th>
+                                        <th style={{ padding: '2px 6px', fontWeight: 500 }}>Opening</th>
+                                        <th style={{ padding: '2px 6px', fontWeight: 500 }}>Production</th>
+                                        <th style={{ padding: '2px 6px', fontWeight: 500 }}>Dispatch</th>
+                                        <th style={{ padding: '2px 6px', fontWeight: 500 }}>Closing</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {group.ledger.map((e, i) => (
+                                        <tr key={i}>
+                                          <td style={{ padding: '2px 6px' }}>{e.date}</td>
+                                          <td style={{ padding: '2px 6px' }}>{e.opening}</td>
+                                          <td style={{ padding: '2px 6px' }}>{e.pieces || ''}</td>
+                                          <td style={{ padding: '2px 6px' }}>{e.dispatch || ''}</td>
+                                          <td style={{ padding: '2px 6px' }}>{e.closing}</td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                )}
                               </div>
                             );
                           })}
