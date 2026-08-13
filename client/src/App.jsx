@@ -826,6 +826,23 @@ function CopyExportModal({ data, onClose }) {
     </div>
   );
 }
+// Full-size view of the uploaded document — the inline preview during extraction is already sized
+// to roughly match the review table, but small handwriting can still need a closer look. Click
+// anywhere on the backdrop (or the × ) to close.
+function ImageZoomModal({ src, onClose }) {
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(35,38,43,0.8)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, cursor: 'zoom-out' }} onClick={onClose}>
+      <img src={src} alt="Full-size preview" style={{ maxWidth: '95vw', maxHeight: '92vh', objectFit: 'contain', borderRadius: 6, boxShadow: '0 6px 30px rgba(0,0,0,0.4)' }} />
+      <button
+        onClick={onClose}
+        title="Close"
+        style={{ position: 'fixed', top: 16, right: 20, width: 32, height: 32, borderRadius: '50%', border: 'none', background: '#fff', color: '#23262b', fontSize: 16, cursor: 'pointer' }}
+      >
+        ×
+      </button>
+    </div>
+  );
+}
 /* ============================== main app ============================== */
 function FIMSApp() {
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -852,8 +869,13 @@ function FIMSApp() {
   // matches that snapshot exactly — any further edit or newly confirmed register row invalidates it,
   // requiring a fresh look before anything real gets written.
   const [reviewByCustomer, setReviewByCustomer] = useState({}); // { [customer]: { loading, error, tabs, existingTabNames } }
-  const [reviewEdits, setReviewEdits] = useState({}); // { [customer]: { [variantTitle]: { tabNameOverride, rowEdits: { [rowIndex]: {date,production,dispatch} } } } }
+  const [reviewEdits, setReviewEdits] = useState({}); // { [customer]: { [variantTitle]: { tabNameOverride, rowEdits: { [rowIndex]: {date,production,dispatch} }, deletedRows: { [rowIndex]: true } } } }
   const [approvedByCustomer, setApprovedByCustomer] = useState({}); // { [customer]: JSON string of the approved itemGroups }
+  // Inline "+ Add row" form state for the review screen, keyed by `${customer}::${variantTitle}`.
+  const [newRowForms, setNewRowForms] = useState({});
+  const updateNewRowForm = (key, field, value) => setNewRowForms(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
+  // Per-row "move to a different customer" selection, keyed by `${customer}::${variantTitle}::${rowIndex}`.
+  const [moveTargets, setMoveTargets] = useState({});
   const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
   const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch };
   useEffect(() => {
@@ -996,6 +1018,7 @@ function FIMSApp() {
   const [docType, setDocType] = useState(DOCUMENT_TYPES[0].key);
   const [preview, setPreview] = useState(null);
   const [base64Img, setBase64Img] = useState(null);
+  const [zoomedImage, setZoomedImage] = useState(null); // full-size lightbox for the upload preview, so tiny handwriting is actually legible
   const [queuedPages, setQueuedPages] = useState([]); // [{id, dataUrl, base64, label}] — one entry per image file, or per PDF page
   const [skippedPages, setSkippedPages] = useState([]); // pages auto-detected as a non-original copy / e-Way Bill — never sent to the API
   const [queuedIndex, setQueuedIndex] = useState(0);
@@ -1606,25 +1629,32 @@ function FIMSApp() {
   // Applies whatever's staged in reviewEdits[customer] on top of the freshly computed itemGroups —
   // used both to regenerate the diff shown on screen and to build the exact payload Push actually
   // sends, so there's no way for what got approved to differ from what gets written. Edits live ONLY
-  // here — a changed date/production/dispatch value, or a reassigned tab, is never written back into
-  // `production`/`customerDispatch`, so the original register stays exactly as scanned or entered.
+  // here — a changed date/production/dispatch value, a deleted row, or a reassigned tab, is never
+  // written back into `production`/`customerDispatch`, so the original register stays exactly as
+  // scanned or entered. (A CREATED row is the one exception — see addManualStockRow below, which adds
+  // a real confirmed register entry instead of a fake payload-only row, so its opening/closing balance
+  // comes out right without reimplementing that math here.)
   const applyReviewEdits = (itemGroups, editsForCustomer) => {
     if (!editsForCustomer || !Object.keys(editsForCustomer).length) return itemGroups;
     const regrouped = {};
     itemGroups.forEach(g => (g.variants || []).forEach(v => {
       const e = editsForCustomer[v.title];
       const finalTab = (e && e.tabNameOverride && e.tabNameOverride.trim()) ? e.tabNameOverride.trim() : g.tabName;
-      const rows = (v.rows || []).map((r, i) => {
-        const re = e && e.rowEdits && e.rowEdits[i];
-        if (!re) return r;
-        return [
-          re.date !== undefined ? re.date : r[0],
-          r[1],
-          (re.production !== undefined && re.production !== '') ? Number(re.production) : r[2],
-          (re.dispatch !== undefined && re.dispatch !== '') ? Number(re.dispatch) : r[3],
-          r[4],
-        ];
-      });
+      const deletedRows = (e && e.deletedRows) || {};
+      const rows = (v.rows || [])
+        .map((r, i) => {
+          if (deletedRows[i]) return null;
+          const re = e && e.rowEdits && e.rowEdits[i];
+          if (!re) return r;
+          return [
+            re.date !== undefined ? re.date : r[0],
+            r[1],
+            (re.production !== undefined && re.production !== '') ? Number(re.production) : r[2],
+            (re.dispatch !== undefined && re.dispatch !== '') ? Number(re.dispatch) : r[3],
+            r[4],
+          ];
+        })
+        .filter(Boolean);
       if (!regrouped[finalTab]) regrouped[finalTab] = [];
       regrouped[finalTab].push({ ...v, rows });
     }));
@@ -1677,6 +1707,83 @@ function FIMSApp() {
       forCustomer[variantTitle] = { ...(forCustomer[variantTitle] || {}), tabNameOverride: tabName };
       return { ...prev, [customer]: forCustomer };
     });
+  };
+  // Deleting a row here only excludes it from what gets pushed for THIS customer's sheet — same
+  // non-destructive philosophy as the date/production/dispatch edits above. Toggle-able, so unchecking
+  // "delete" on the same row (before the review refreshes and the index shifts) undoes it.
+  const setRowDeleted = (customer, variantTitle, rowIndex, deleted) => {
+    setReviewEdits(prev => {
+      const forCustomer = { ...(prev[customer] || {}) };
+      const forVariant = { ...(forCustomer[variantTitle] || {}) };
+      const deletedRows = { ...(forVariant.deletedRows || {}) };
+      if (deleted) deletedRows[rowIndex] = true; else delete deletedRows[rowIndex];
+      forVariant.deletedRows = deletedRows;
+      forCustomer[variantTitle] = forVariant;
+      return { ...prev, [customer]: forCustomer };
+    });
+  };
+  // "Discard changes" for a specific customer sheet — wipes every staged edit/deletion/tab-override
+  // for that customer (and its approval snapshot, since the payload it was approved against no longer
+  // applies), reverting the review screen back to the freshly computed diff. Never touches the
+  // Production Register / Customer Dispatch Bills registers themselves.
+  const discardCustomerReview = (customer) => {
+    setReviewEdits(prev => { const next = { ...prev }; delete next[customer]; return next; });
+    setApprovedByCustomer(prev => { const next = { ...prev }; delete next[customer]; return next; });
+  };
+  // "Create a row" in the review screen. A synthetic row bolted directly onto the push payload would
+  // need its own opening/closing balance math duplicating what customerStockGroups already does
+  // correctly from real register data — instead, this adds a genuine CONFIRMED entry to the
+  // Production Register and/or Customer Dispatch Bills register (whichever quantity was filled in,
+  // or both), tagged to this customer and item. It then flows through the exact same pipeline as an
+  // extracted-and-confirmed row, so balances come out right automatically, and the new row stays
+  // visible/editable on its own register tab afterward too — not stuck as a review-only artifact.
+  const addManualStockRow = (customer, variantTitle, date, productionQty, dispatchQty) => {
+    const d = normalizeDateToDots((date || '').trim());
+    const prodQty = num(productionQty);
+    const dispQty = num(dispatchQty);
+    if (!d || (!prodQty && !dispQty)) return;
+    if (prodQty) {
+      const row = { id: genId(), date: d, party: customer, description: variantTitle, customerHint: '', pieces: prodQty, dispatch: 0, stockConfirmed: true, confirmedCustomer: customer };
+      const next = [...production, row];
+      setProduction(next); persist('production', next);
+    }
+    if (dispQty) {
+      const row = { id: genId(), date: d, invoice_no: '', party: customer, buyer_order_no: '', description: variantTitle, quantity: dispQty, rate: '', amount: '', stockConfirmed: true, confirmedCustomer: customer };
+      const next = [...customerDispatch, row];
+      setCustomerDispatch(next); persist('customerDispatch', next);
+    }
+  };
+  // "Move a row to a different customer" — rare, but useful for fixing a misattributed entry without
+  // digging through the Production Register / Customer Dispatch Bills tabs by hand. Matches the
+  // underlying register row(s) by (customer, item, date) rather than an internal id — the id doesn't
+  // survive the trip through the ledger/payload arrays that feed this screen. A customer+item+date is
+  // effectively unique in practice; the one real exception (more than one dispatch bill for the same
+  // item on the same day) moves all of them together, which is flagged in the UI hint next to the
+  // control rather than silently guessing which one was meant.
+  const moveReviewRow = (customer, variantTitle, rowDate, toCustomer) => {
+    const target = (toCustomer || '').trim();
+    if (!target || target === customer) return false;
+    const d = normalizeDateToDots((rowDate || '').trim());
+    let movedAny = false;
+    ['production', 'customerDispatch'].forEach(registerKey => {
+      const rows = registerKey === 'production' ? production : customerDispatch;
+      let changed = false;
+      const next = rows.map(r => {
+        if (!r.stockConfirmed) return r;
+        if ((r.confirmedCustomer || '').trim() !== customer) return r;
+        const desc = stripPackCount(r.description) || r.description;
+        if (desc !== variantTitle) return r;
+        if (normalizeDateToDots(r.date) !== d) return r;
+        changed = true;
+        return { ...r, confirmedCustomer: target };
+      });
+      if (changed) {
+        movedAny = true;
+        registerSetters[registerKey](next);
+        persist(registerKey, next);
+      }
+    });
+    return movedAny;
   };
   const approveReview = (customer) => {
     const { itemGroups } = getEditedPayload(customer);
@@ -2213,7 +2320,7 @@ function FIMSApp() {
           background: #fff; cursor: pointer; transition: border-color 0.12s, background 0.12s;
         }
         .dropzone:hover { background: var(--accent-soft); border-color: var(--accent); }
-        .preview-img { max-width: 100%; max-height: 260px; border-radius: 6px; border: 1px solid var(--rule); margin-top: 12px; }
+        .preview-img { max-width: 100%; max-height: 70vh; object-fit: contain; border-radius: 6px; border: 1px solid var(--rule); margin-top: 12px; cursor: zoom-in; background: #fff; }
         .error-box { display: flex; gap: 8px; align-items: flex-start; background: var(--warn-soft); border: 1px solid var(--ledger-red); color: #6b241a; padding: 10px 12px; border-radius: 5px; font-size: 12.5px; margin: 10px 0; }
         .info-box { display: flex; gap: 8px; align-items: flex-start; background: var(--accent-soft); border: 1px solid var(--rule); color: var(--ink); padding: 10px 12px; border-radius: 5px; font-size: 12.5px; margin: 10px 0; }
         .field-row { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
@@ -2303,7 +2410,7 @@ function FIMSApp() {
                 </label>
                 <input id="fileInput" type="file" accept="image/*,application/pdf" multiple style={{ display: 'none' }} onChange={(e) => handleFiles(e.target.files)} />
                 {pdfLoading && <div className="doc-hint" style={{ marginTop: 10 }}><Loader2 size={13} className="spin" style={{ verticalAlign: 'middle', marginRight: 6 }} />Reading file(s)…</div>}
-                {preview && <img src={preview} alt="preview" className="preview-img" />}
+                {preview && <img src={preview} alt="preview" className="preview-img" title="Click to enlarge" onClick={() => setZoomedImage(preview)} />}
                 {queuedPages.length > 1 && (
                   <div style={{ marginTop: 10 }}>
                     <div className="doc-hint">{queuedIndex + 1} of {queuedPages.length}: {queuedPages[queuedIndex]?.label} — click a thumbnail to preview it, click × to drop it from the queue (works anytime, even mid-extraction), or extract everything at once.</div>
@@ -2909,14 +3016,21 @@ function FIMSApp() {
                             Review before push
                             {review.loading && <span className="doc-hint" style={{ marginLeft: 8, fontWeight: 400 }}><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle' }} /> checking against the real Sheet…</span>}
                           </h3>
-                          {hasAnyNewRows && (
-                            approved
-                              ? <span style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                                  <span className="doc-hint" style={{ color: 'var(--ok)' }}>✓ Approved — matches what Push will send</span>
-                                  <button className="btn btn-ghost" onClick={() => setApprovedByCustomer(prev => { const next = { ...prev }; delete next[customer]; return next; })}>Edit again</button>
-                                </span>
-                              : <button className="btn btn-primary" onClick={() => approveReview(customer)}><CheckCircle2 size={15} /> Approve these changes</button>
-                          )}
+                          <span style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                            {!!reviewEdits[customer] && Object.keys(reviewEdits[customer]).length > 0 && !approved && (
+                              <button className="btn btn-ghost" onClick={() => { if (window.confirm(`Discard every staged change (edited values, deleted rows, tab overrides) for ${customer}'s review? This never touches the Production Register or Customer Dispatch Bills — only what's staged here.`)) discardCustomerReview(customer); }}>
+                                <XCircle size={15} /> Discard changes
+                              </button>
+                            )}
+                            {hasAnyNewRows && (
+                              approved
+                                ? <span style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                    <span className="doc-hint" style={{ color: 'var(--ok)' }}>✓ Approved — matches what Push will send</span>
+                                    <button className="btn btn-ghost" onClick={() => setApprovedByCustomer(prev => { const next = { ...prev }; delete next[customer]; return next; })}>Edit again</button>
+                                  </span>
+                                : <button className="btn btn-primary" onClick={() => approveReview(customer)}><CheckCircle2 size={15} /> Approve these changes</button>
+                            )}
+                          </span>
                         </div>
                         {review.error && <div className="error-box"><AlertCircle size={16} /><span>{review.error}</span></div>}
                         {!review.error && !hasAnyNewRows && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet.</div>}
@@ -2967,6 +3081,8 @@ function FIMSApp() {
                                   <th style={{ padding: '2px 6px', fontWeight: 500 }}>Production</th>
                                   <th style={{ padding: '2px 6px', fontWeight: 500 }}>Dispatch</th>
                                   <th style={{ padding: '2px 6px', fontWeight: 500 }}>Closing</th>
+                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Move to</th>
+                                  <th style={{ padding: '2px 6px', fontWeight: 500 }} className="col-action"></th>
                                 </tr>
                               </thead>
                               <tbody>
@@ -2975,28 +3091,90 @@ function FIMSApp() {
                                     <td style={{ padding: '2px 6px' }}>{v.lastExisting.date}</td>
                                     <td style={{ padding: '2px 6px' }} colSpan={3}>(already in the Sheet)</td>
                                     <td style={{ padding: '2px 6px' }}>{v.lastExisting.closing}</td>
+                                    <td colSpan={2} />
                                   </tr>
                                 )}
                                 {v.rows.map((r, i) => {
-                                  const edit = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].rowEdits && reviewEdits[customer][v.title].rowEdits[i]) || {};
+                                  const variantEdits = (reviewEdits[customer] && reviewEdits[customer][v.title]) || {};
+                                  const edit = (variantEdits.rowEdits && variantEdits.rowEdits[i]) || {};
+                                  const isDeleted = !!(variantEdits.deletedRows && variantEdits.deletedRows[i]);
+                                  const moveKey = `${customer}::${v.title}::${i}`;
+                                  const rowDateValue = edit.date ?? r.date;
                                   return (
-                                    <tr key={i} style={{ background: 'rgba(214,163,80,0.14)' }}>
+                                    <tr key={i} style={{ background: isDeleted ? 'rgba(162,59,46,0.08)' : 'rgba(214,163,80,0.14)', opacity: isDeleted ? 0.55 : 1 }}>
                                       <td style={{ padding: '2px 6px' }}>
-                                        <input className="cell-input" style={{ width: 100 }} value={edit.date ?? r.date} onChange={e => setRowEdit(customer, v.title, i, 'date', e.target.value)} disabled={approved} />
+                                        <input className="cell-input" style={{ width: 100 }} value={rowDateValue} onChange={e => setRowEdit(customer, v.title, i, 'date', e.target.value)} disabled={approved || isDeleted} />
                                       </td>
                                       <td style={{ padding: '2px 6px' }}>{r.opening}</td>
                                       <td style={{ padding: '2px 6px' }}>
-                                        <input className="cell-input" style={{ width: 80 }} type="number" value={edit.production ?? r.production} onChange={e => setRowEdit(customer, v.title, i, 'production', e.target.value)} disabled={approved} />
+                                        <input className="cell-input" style={{ width: 80 }} type="number" value={edit.production ?? r.production} onChange={e => setRowEdit(customer, v.title, i, 'production', e.target.value)} disabled={approved || isDeleted} />
                                       </td>
                                       <td style={{ padding: '2px 6px' }}>
-                                        <input className="cell-input" style={{ width: 80 }} type="number" value={edit.dispatch ?? r.dispatch} onChange={e => setRowEdit(customer, v.title, i, 'dispatch', e.target.value)} disabled={approved} />
+                                        <input className="cell-input" style={{ width: 80 }} type="number" value={edit.dispatch ?? r.dispatch} onChange={e => setRowEdit(customer, v.title, i, 'dispatch', e.target.value)} disabled={approved || isDeleted} />
                                       </td>
                                       <td style={{ padding: '2px 6px' }}>{r.closing}</td>
+                                      <td style={{ padding: '2px 6px' }}>
+                                        <div style={{ display: 'flex', gap: 4 }}>
+                                          <input
+                                            list={`move-customers-${customer}`}
+                                            placeholder="Customer…"
+                                            style={{ width: 110, fontSize: 11.5 }}
+                                            className="cell-input"
+                                            value={moveTargets[moveKey] || ''}
+                                            onChange={e => setMoveTargets(prev => ({ ...prev, [moveKey]: e.target.value }))}
+                                            disabled={approved || isDeleted}
+                                          />
+                                          <button
+                                            className="icon-btn"
+                                            title={`Move this row (matched by date + item) to a different customer. If more than one dispatch bill shares this exact date and item, they all move together.`}
+                                            disabled={approved || isDeleted || !(moveTargets[moveKey] || '').trim()}
+                                            onClick={() => {
+                                              const target = (moveTargets[moveKey] || '').trim();
+                                              if (!target) return;
+                                              if (!window.confirm(`Move the ${rowDateValue} entry for "${v.title}" from ${customer} to ${target}?`)) return;
+                                              const moved = moveReviewRow(customer, v.title, rowDateValue, target);
+                                              if (!moved) { window.alert(`Couldn't find a matching Production/Dispatch register row for ${rowDateValue} · ${v.title} · ${customer} to move — it may already have been edited or moved.`); return; }
+                                              setMoveTargets(prev => { const next = { ...prev }; delete next[moveKey]; return next; });
+                                            }}
+                                          >
+                                            <RefreshCw size={13} />
+                                          </button>
+                                        </div>
+                                      </td>
+                                      <td style={{ padding: '2px 6px' }} className="col-action">
+                                        <button className="icon-btn" title={isDeleted ? 'Undo delete' : 'Delete this row (only from this push — never touches the register)'} onClick={() => setRowDeleted(customer, v.title, i, !isDeleted)} disabled={approved}>
+                                          {isDeleted ? <RefreshCw size={13} /> : <Trash2 size={13} />}
+                                        </button>
+                                      </td>
                                     </tr>
                                   );
                                 })}
                               </tbody>
                             </table>
+                            <datalist id={`move-customers-${customer}`}>
+                              {allCustomerTabNames.filter(c => c !== customer).map(c => <option value={c} key={c} />)}
+                            </datalist>
+                            {(() => {
+                              const formKey = `${customer}::${v.title}`;
+                              const form = newRowForms[formKey] || {};
+                              return (
+                                <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 8 }}>
+                                  <input className="cell-input" style={{ width: 100 }} placeholder="Date" value={form.date || ''} onChange={e => updateNewRowForm(formKey, 'date', e.target.value)} disabled={approved} />
+                                  <input className="cell-input" style={{ width: 90 }} type="number" placeholder="Production" value={form.production || ''} onChange={e => updateNewRowForm(formKey, 'production', e.target.value)} disabled={approved} />
+                                  <input className="cell-input" style={{ width: 90 }} type="number" placeholder="Dispatch" value={form.dispatch || ''} onChange={e => updateNewRowForm(formKey, 'dispatch', e.target.value)} disabled={approved} />
+                                  <button
+                                    className="btn btn-ghost"
+                                    disabled={approved || !form.date || (!form.production && !form.dispatch)}
+                                    onClick={() => {
+                                      addManualStockRow(customer, v.title, form.date, form.production, form.dispatch);
+                                      setNewRowForms(prev => { const next = { ...prev }; delete next[formKey]; return next; });
+                                    }}
+                                  >
+                                    <Plus size={13} /> Add row
+                                  </button>
+                                </div>
+                              );
+                            })()}
                           </div>
                         )))}
                       </div>
@@ -3030,6 +3208,7 @@ function FIMSApp() {
       </div>
     </div>
     {copyModal && <CopyExportModal data={copyModal} onClose={() => setCopyModal(null)} />}
+    {zoomedImage && <ImageZoomModal src={zoomedImage} onClose={() => setZoomedImage(null)} />}
     </>
   );
 }
