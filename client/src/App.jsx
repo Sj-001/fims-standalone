@@ -1928,21 +1928,43 @@ function FIMSApp() {
   // Customer Mapping keyword so this and any future row with the same description routes here
   // automatically. Then re-run the same reassignUnassignedRows() pass confirmSheetImport already
   // relies on to move this (and anything else now matching) off Unassigned immediately.
+  //
+  // Alias handling: `description` is the raw wording this row actually scanned as (e.g. "HANDLE
+  // LOCK"); `item` is whatever the person typed/picked in the Block field, which may be a DIFFERENT,
+  // already-known block name they're merging this row into (e.g. "Tijori Handle"). If those two
+  // differ, this is exactly the "an item got scanned under an alias" case — registering only the
+  // canonical `item` name would fix THIS row but leave the next dispatch bill that also says "HANDLE
+  // LOCK" falling right back into Unassigned. So both spellings get registered against the same
+  // customer + sheet tab: the raw alias text (so future rows with this exact wording route straight
+  // through) and the canonical block name (so it's tracked too, in case it wasn't already).
   const assignUnassignedGroup = (groupId, description) => {
     const form = assignForms[groupId] || {};
     const customer = (form.customer || '').trim();
     const sheetGroup = (form.sheetGroup || '').trim();
-    const item = (form.item || description || '').trim();
+    const rawAlias = (description || '').trim();
+    const item = (form.item || rawAlias).trim();
     if (!customer || !sheetGroup || !item) return;
+    const namesToRegister = Array.from(new Set([item, rawAlias].filter(Boolean)));
     const existingItems = new Set(productCatalog.map(c => catalogDedupKey(c.customer, c.item)));
-    if (!existingItems.has(catalogDedupKey(customer, item))) {
-      persistCatalog([...productCatalog, { id: genId(), customer, item, sheetGroup }]);
-    }
+    const seenCatalogKeys = new Set();
+    const newCatalogEntries = [];
+    namesToRegister.forEach(name => {
+      const key = catalogDedupKey(customer, name);
+      if (existingItems.has(key) || seenCatalogKeys.has(key)) return;
+      seenCatalogKeys.add(key);
+      newCatalogEntries.push({ id: genId(), customer, item: name, sheetGroup });
+    });
+    if (newCatalogEntries.length) persistCatalog([...productCatalog, ...newCatalogEntries]);
     const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
-    const exact = item.toLowerCase();
-    if (exact && !existingKeywords.has(exact)) {
-      persistCustomerMapping([{ id: genId(), keyword: exact, customer }, ...customerMapping]);
-    }
+    const seenKeywords = new Set();
+    const newMappingRules = [];
+    namesToRegister.forEach(name => {
+      const exact = name.toLowerCase();
+      if (!exact || existingKeywords.has(exact) || seenKeywords.has(exact)) return;
+      seenKeywords.add(exact);
+      newMappingRules.push({ id: genId(), keyword: exact, customer });
+    });
+    if (newMappingRules.length) persistCustomerMapping([...newMappingRules, ...customerMapping]);
     reassignUnassignedRows();
     setAssignForms(prev => { const next = { ...prev }; delete next[groupId]; return next; });
   };
