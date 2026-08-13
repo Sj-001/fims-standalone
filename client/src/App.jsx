@@ -3,7 +3,8 @@ import * as XLSX from 'xlsx';
 import {
   Upload, Image as ImageIcon, Package, Boxes, Search, Truck, ClipboardList,
   FileSpreadsheet, Download, CheckCircle2, XCircle, Trash2, Loader2,
-  AlertCircle, LayoutDashboard, FileText, Archive, ListChecks, Plus, RefreshCw, Link2, Info, Check
+  AlertCircle, LayoutDashboard, FileText, Archive, ListChecks, Plus, RefreshCw, Link2, Info, Check,
+  ChevronLeft, ChevronRight
 } from 'lucide-react';
 /* ============================== helpers ============================== */
 const num = (v) => {
@@ -1014,6 +1015,16 @@ function FIMSApp() {
       return next;
     });
   };
+  // Collapsible sidebar — mainly so the upload preview (and the review table next to it) has more
+  // room to breathe on a laptop-width screen. A pure UI preference, not app data, so it's kept in
+  // plain localStorage (not the Google-Sheets-backed window.storage shim used for real business data)
+  // and just falls back to expanded if that read ever fails.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try { return localStorage.getItem('fims_sidebar_collapsed') === '1'; } catch (e) { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('fims_sidebar_collapsed', sidebarCollapsed ? '1' : '0'); } catch (e) { /* noop */ }
+  }, [sidebarCollapsed]);
   /* -------- upload & extract state -------- */
   const [docType, setDocType] = useState(DOCUMENT_TYPES[0].key);
   const [preview, setPreview] = useState(null);
@@ -2213,14 +2224,26 @@ function FIMSApp() {
           display: flex;
           flex-direction: column;
           padding: 20px 0;
+          transition: width 0.15s ease;
         }
+        .sidebar.collapsed { width: 60px; }
+        .sidebar.collapsed .nav-item { justify-content: center; padding: 10px 0; }
+        .sidebar.collapsed .nav-item span { display: none; }
         .brand {
           padding: 0 18px 18px 18px;
           border-bottom: 1px solid rgba(255,255,255,0.12);
           margin-bottom: 10px;
         }
+        .sidebar.collapsed .brand { padding: 0 0 14px 0; text-align: center; }
         .brand h1 { font-size: 17px; line-height: 1.3; color: #f6f3ec; }
         .brand p { font-size: 11px; color: #a7a396; margin-top: 4px; letter-spacing: 0.04em; text-transform: uppercase; }
+        .sidebar-toggle {
+          margin: 10px auto 0 auto;
+          background: transparent; border: 1px solid rgba(255,255,255,0.18); color: #cfcabd;
+          border-radius: 6px; width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
+          cursor: pointer; flex-shrink: 0;
+        }
+        .sidebar-toggle:hover { background: rgba(255,255,255,0.08); color: #f6f3ec; }
         .nav-item {
           display: flex; align-items: center; gap: 10px;
           padding: 10px 18px;
@@ -2336,22 +2359,26 @@ function FIMSApp() {
         .spin { animation: fims-spin 1s linear infinite; }
         @keyframes fims-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
       `}</style>
-      <aside className="sidebar">
+      <aside className={`sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
         <div className="brand">
-          <h1>Shyam Adarsh Pack</h1>
-          <p>Inventory &amp; Production</p>
+          {sidebarCollapsed
+            ? <div style={{ fontSize: 13, fontWeight: 700, color: '#f6f3ec' }} title="Shyam Adarsh Pack — Inventory & Production">SA</div>
+            : <><h1>Shyam Adarsh Pack</h1><p>Inventory &amp; Production</p></>}
         </div>
         {NAV.map(item => {
           const Icon = item.icon;
           const count = counts[item.key];
           return (
-            <div key={item.key} className={`nav-item ${activeTab === item.key ? 'active' : ''}`} onClick={() => setActiveTab(item.key)}>
+            <div key={item.key} className={`nav-item ${activeTab === item.key ? 'active' : ''}`} onClick={() => setActiveTab(item.key)} title={sidebarCollapsed ? item.label : undefined}>
               <Icon size={16} />
               <span>{item.label}</span>
-              {typeof count === 'number' && <span className="nav-count">{count}</span>}
+              {!sidebarCollapsed && typeof count === 'number' && <span className="nav-count">{count}</span>}
             </div>
           );
         })}
+        <button className="sidebar-toggle" onClick={() => setSidebarCollapsed(v => !v)} title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
+          {sidebarCollapsed ? <ChevronRight size={15} /> : <ChevronLeft size={15} />}
+        </button>
       </aside>
       <div className="main">
         <div className="topbar">
