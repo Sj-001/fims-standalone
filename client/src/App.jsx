@@ -290,6 +290,19 @@ const CUSTOMER_SHEET_IDS_KEY = 'fims_customer_sheet_ids';
 // empty along with the catalog above; importing a customer sheet adds both an exact-name rule per
 // item and a broader fallback rule automatically (see confirmSheetImport).
 const FALLBACK_CUSTOMER_MAPPING = [];
+// Word-level shorthand a person can teach the app themselves ("J" -> "Jumbo", "CONT" -> "Container")
+// instead of asking for a code change every time a new abbreviation shows up on a handwritten sheet.
+// Applied in two places: (1) fed into the extraction prompt so Claude writes the expanded form
+// directly into "description" when it recognizes one of these, and (2) run as a text substitution
+// inside normalizeVariant/normalizeForCatalogMatch below, so even an entry that DIDN'T get expanded
+// at extraction time (typed by hand, or extracted before this abbreviation was taught) still matches
+// the right catalog item / customer-stock variant. Starts empty — nothing is assumed.
+const ABBREVIATIONS_KEY = 'fims_abbreviations';
+const DEFAULT_ABBREVIATIONS = [];
+function buildAbbreviationsText(abbreviations) {
+  if (!abbreviations || !abbreviations.length) return '  (none taught yet)';
+  return abbreviations.map(a => `  "${a.short}" = "${a.long}"`).join('\n');
+}
 // The mapping actually used: one EXACT-item-name rule per catalog entry (checked first, most reliable),
 // then the broader fallback keywords above for anything that doesn't hit an exact match.
 const DEFAULT_CUSTOMER_MAPPING = [
@@ -540,6 +553,8 @@ STYLE B — product ledger style: each line has a DATE and a product DESCRIPTION
 - Reference catalog of known exact item names (case as shown), grouped by customer for your own matching confidence only — still extract just the item name into "description", not the customer name:
 {{PRODUCT_CATALOG}}
   (This list isn't exhaustive — other legitimate products exist too. Only use it to correct obvious misreads of these specific items, never to force an unrelated line into matching one of them.)
+- Word abbreviations this factory uses that a person has taught the app — expand these to their full form wherever they appear inside "description" (e.g. write "IT 500 Jumbo Container", not "IT 500 J Cont"), so the same item is always written the same way no matter which shorthand a given page happened to use:
+{{ABBREVIATIONS}}
 - IMPORTANT: a customer name is sometimes written in brackets right next to the item name, either before or after it — e.g. "(Diamond) Cream Burst 30g x140" or "Cream Burst 30g x140 (Diamond)". Pull that bracketed name OUT into its own "customer_hint" field and do NOT leave it inside "description" — "description" should be just the clean item name with no bracket in it.
 - Dates are VERY often written once then repeated below with a ditto mark for every following row that shares that same date — this could be a tick, a quote mark ("), the digits 11, two short slashes (//), the word "do", a dash, or any other short repeat-symbol instead of an actual date. Whenever a row's date cell is anything other than a clearly legible date, treat it as a ditto mark and resolve it to the SAME date as the row directly above it — copy that exact date into "date_override" for the row. Never leave a row's date blank or output the ditto symbol itself just because it wasn't written out in full.
 - Some pages have a single "Quantity" column — put that value into "pieces". Other pages have TWO numeric columns side by side for the same row (regardless of what they're headed with, e.g. small letters like S/D, two batch tallies, etc.) — both of these are PRODUCTION quantities, never a dispatch quantity. If a row has a number in only one of the two columns, put that number in "pieces". If a row genuinely has a number in BOTH columns, add them together into "pieces" — do not put the second column's number into "dispatch". The "dispatch" field on this register is rare — only use it if the page has an explicit, separately-written note that some of that day's production was sent out immediately (e.g. an actual word like "dispatch"/"bheja" next to a number), never just because a second quantity column exists.
@@ -574,6 +589,8 @@ Extract (only from the Original page):
 - "party": the Buyer (Bill to) name — the actual company name, e.g. "BINDAL TECHNOPOLYMER PVT. LTD." or "ANMOL INDUSTRIES LTD." — copy it as printed
 - "buyer_order_no": the Buyer's Order No. / PO reference if printed, else empty string
 - "items": one entry per line under "Description of Goods". Each line typically shows "CORRUGATED BOX" as a generic heading with the real product name in italics underneath (e.g. "IT 500 CONT", "HANDLE LOCK", "N 100 JUMBO XL CONT", "JEERA DHAMAL 35G x 144PKT") — use that italic sub-line as the description, NOT the generic "CORRUGATED BOX" text. Ignore the "(BOX:- N*M = total)" annotation underneath — it's just arithmetic, not part of the item name. "quantity" is the Quantity column value (e.g. 500 from "500.0 nos.").
+- Word abbreviations this factory uses that a person has taught the app — expand these to their full form wherever they appear inside "description" (e.g. write "IT 500 Jumbo Container", not "IT 500 J Cont"), so the same item is always written the same way no matter which shorthand a given invoice happened to print:
+{{ABBREVIATIONS}}
 Return ONLY one JSON object: {"invoice_no":"","date":"","party":"","buyer_order_no":"","items":[{"description":"","quantity":number,"rate":number,"amount":number}]}`,
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
@@ -908,6 +925,7 @@ function FIMSApp() {
   const [trainingExamples, setTrainingExamples] = useState({});
   const [customerMapping, setCustomerMapping] = useState(DEFAULT_CUSTOMER_MAPPING);
   const [productCatalog, setProductCatalog] = useState(DEFAULT_PRODUCT_CATALOG);
+  const [abbreviations, setAbbreviations] = useState(DEFAULT_ABBREVIATIONS); // [{id, short, long}]
   const [customerSheetIds, setCustomerSheetIds] = useState([]); // [{id, customer, sheetId}]
   const [pushStatus, setPushStatus] = useState({}); // { [customer]: { state: 'idle'|'pushing'|'done'|'error', message, unmatched } }
   const [serviceAccountEmail, setServiceAccountEmail] = useState('');
@@ -948,6 +966,10 @@ function FIMSApp() {
         const r3 = await window.storage.get(CUSTOMER_SHEET_IDS_KEY, false);
         if (r3 && r3.value) setCustomerSheetIds(JSON.parse(r3.value));
       } catch (e) { /* keep empty — nothing pushed yet */ }
+      try {
+        const r5 = await window.storage.get(ABBREVIATIONS_KEY, false);
+        if (r5 && r5.value) setAbbreviations(JSON.parse(r5.value));
+      } catch (e) { /* keep empty — none taught yet */ }
       try {
         const r4 = await fetch('/api/service-account-email', { credentials: 'include' });
         if (r4.ok) { const j = await r4.json(); setServiceAccountEmail(j.email || ''); }
@@ -1010,6 +1032,7 @@ function FIMSApp() {
     { key: 'dabur', label: 'Dabur (Specs, PO, Dispatch)', registerKeys: ['daburSpecs', 'daburPO', 'daburDispatch'] },
     { key: 'catalogMapping', label: 'Product Catalog & Customer Mapping', catalogMapping: true },
     { key: 'sheetIds', label: 'Customer Sheet IDs (tracked links to customer sheets — the sheets themselves are untouched)', sheetIds: true },
+    { key: 'abbreviations', label: 'Word Abbreviations', abbreviations: true },
   ];
   const [clearSelected, setClearSelected] = useState({});
   const [clearBusy, setClearBusy] = useState(false);
@@ -1033,6 +1056,8 @@ function FIMSApp() {
           setCustomerMapping([]); await window.storage.set(CUSTOMER_MAPPING_KEY, JSON.stringify([]), false);
         } else if (g.sheetIds) {
           setCustomerSheetIds([]); await window.storage.set(CUSTOMER_SHEET_IDS_KEY, JSON.stringify([]), false);
+        } else if (g.abbreviations) {
+          setAbbreviations([]); await window.storage.set(ABBREVIATIONS_KEY, JSON.stringify([]), false);
         }
       }
       setClearMessage(`Cleared: ${summary}.`);
@@ -1248,7 +1273,7 @@ function FIMSApp() {
     });
     setActiveResultIndex(queuedIndex);
     try {
-      const basePrompt = activeConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog));
+      const basePrompt = activeConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog)).replace('{{ABBREVIATIONS}}', buildAbbreviationsText(abbreviations));
       const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[docType]);
       const { raw, truncated } = await extractWithRateLimitBackoff(promptWithTraining, base64Img, abortControllerRef.current.signal, (waitMs, attempt, total) => {
         setErrorMsg(`Rate limit hit — waiting ${Math.round(waitMs / 1000)}s and retrying automatically (attempt ${attempt} of ${total})… Click Cancel below if you'd rather stop.`);
@@ -1282,7 +1307,7 @@ function FIMSApp() {
     setExtracting(true); setErrorMsg(''); setCancelRequested(false);
     abortControllerRef.current = new AbortController();
     const signal = abortControllerRef.current.signal;
-    const basePrompt = activeConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog));
+    const basePrompt = activeConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog)).replace('{{ABBREVIATIONS}}', buildAbbreviationsText(abbreviations));
     const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[docType]);
     const gapMs = BATCH_REQUEST_GAP_MS;
     let anySucceeded = false;
@@ -1472,6 +1497,30 @@ function FIMSApp() {
   const addMappingRow = () => persistCustomerMapping([...customerMapping, { id: genId(), keyword: '', customer: '' }]);
   const updateMappingRow = (id, field, value) => persistCustomerMapping(customerMapping.map(r => r.id === id ? { ...r, [field]: value } : r));
   const deleteMappingRow = (id) => persistCustomerMapping(customerMapping.filter(r => r.id !== id));
+  /* -------- word abbreviations (editable; "J" -> "Jumbo", "CONT" -> "Container", etc.) -------- */
+  const persistAbbreviations = (next) => {
+    setAbbreviations(next);
+    scheduleSave('abbreviations', () => window.storage.set(ABBREVIATIONS_KEY, JSON.stringify(next), false).catch(() => {}));
+  };
+  const addAbbreviationRow = () => persistAbbreviations([...abbreviations, { id: genId(), short: '', long: '' }]);
+  const updateAbbreviationRow = (id, field, value) => persistAbbreviations(abbreviations.map(a => a.id === id ? { ...a, [field]: value } : a));
+  const deleteAbbreviationRow = (id) => persistAbbreviations(abbreviations.filter(a => a.id !== id));
+  // Whole-word, case-insensitive replacement of every taught abbreviation — used both to normalize
+  // descriptions for catalog/variant matching (see normalizeForCatalogMatch/normalizeVariant below)
+  // and available for anything else that wants a "read as the person would say it" version of a raw
+  // description. Word-boundary matching so "J" only matches the standalone letter, never part of a
+  // longer word.
+  const applyAbbreviations = (s) => {
+    let out = s || '';
+    abbreviations.forEach(a => {
+      const short = (a.short || '').trim();
+      const long = (a.long || '').trim();
+      if (!short || !long) return;
+      const escaped = short.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      out = out.replace(new RegExp(`\\b${escaped}\\b`, 'gi'), long);
+    });
+    return out;
+  };
   /* -------- product catalog (editable; populated via Customer Sheets tab's Sheet-ID import) -------- */
   const persistCatalog = (next) => {
     setProductCatalog(next);
@@ -1592,7 +1641,10 @@ function FIMSApp() {
   // instead of erasing it, and only strip words that are genuinely never part of an item's identity
   // (pure packaging/count units).
   const normalizeVariant = (description) => {
-    let s = stripPackCount(description).toLowerCase();
+    // Expand taught abbreviations FIRST — "IT 500 J Cont" and "IT 500 Jumbo Cont" are the same real
+    // item written two different ways, and should land in the same group; without this they normalize
+    // to different keys and silently fragment into two "different" items.
+    let s = stripPackCount(applyAbbreviations(description)).toLowerCase();
     s = s.replace(/\(diamond\)/g, '');
     s = s.replace(/\bcorrugated box\b/g, '');
     s = s.replace(/\bcont\.?\b/g, 'container');
@@ -1704,7 +1756,7 @@ function FIMSApp() {
   // (or "×<digits>") ONLY at the end of the string, so it's safe against catalog items whose own name
   // legitimately ends in a pack count written the OTHER way round ("64gm * 60pkt", "32g*144pkt" —
   // neither has a literal "x" immediately before the trailing digits, so neither is touched).
-  const normalizeForCatalogMatch = (s) => (s || '')
+  const normalizeForCatalogMatch = (s) => applyAbbreviations(s || '')
     .toLowerCase()
     .replace(/\s*[x×]\s*\d+\s*$/i, '')
     .replace(/\bcont\.?\b/g, 'container')
@@ -3201,6 +3253,32 @@ function FIMSApp() {
           )}
           {loaded && activeTab === 'aliases' && (
             <div>
+              <div className="panel">
+                <div className="panel-header">
+                  <div>
+                    <h2>Word Abbreviations</h2>
+                    <p className="subtitle">Shorthand this factory writes on real pages — "J" for "Jumbo", "CONT" for "Container", and so on. Teach the app once here and it applies everywhere from then on: extraction writes the item name out in full going forward, and matching (so an item routes to the right Sheet tab / customer stock group) treats the short and long forms as the same thing, even for entries already extracted before you added the rule. No code changes needed for a new abbreviation — just add it below.</p>
+                  </div>
+                  <button className="btn btn-primary" onClick={addAbbreviationRow}><Plus size={15} /> Add abbreviation</button>
+                </div>
+                {!abbreviations.length && <div className="empty-state">None taught yet — add one above, e.g. short "J", full "Jumbo".</div>}
+                {!!abbreviations.length && (
+                  <div className="table-wrap">
+                    <table>
+                      <thead><tr><th>Short form (as written)</th><th>Full word</th><th className="col-action"></th></tr></thead>
+                      <tbody>
+                        {abbreviations.map(a => (
+                          <tr key={a.id}>
+                            <td><input className="cell-input" placeholder="J" value={a.short} onChange={e => updateAbbreviationRow(a.id, 'short', e.target.value)} /></td>
+                            <td><input className="cell-input" placeholder="Jumbo" value={a.long} onChange={e => updateAbbreviationRow(a.id, 'long', e.target.value)} /></td>
+                            <td className="col-action"><button className="icon-btn danger" onClick={() => deleteAbbreviationRow(a.id)}><Trash2 size={15} /></button></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Aliases</h2>
                 <p className="subtitle" style={{ marginBottom: 14 }}>An alias is an alternate spelling/wording for an item that should route to the same customer and the same Sheet tab as the "real" name — e.g. a dispatch bill written as "HANDLE LOCK" that should really land under Diamond's "Tijori Handle" block. Adding one here does two things together, kept in sync: it adds a Product Catalog entry (so it lands in the right Sheet tab) and an exact-match Customer Mapping keyword rule (so it routes to the right customer). Editing or deleting an alias updates both. This is the same data shown under Customer Mapping → Known Product Catalog — just a dedicated, add-capable view of it.</p>
