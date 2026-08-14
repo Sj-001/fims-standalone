@@ -803,7 +803,27 @@ function CustomerSuggestCell({ value, guess, isKnownGuess, knownCustomers, onCha
     </select>
   );
 }
-function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false }) {
+// One dropdown per real-world invoice/party, above the itemized Pending Review table, so picking a
+// customer for a multi-line bill doesn't mean repeating the same pick on every one of its rows.
+// Applying it sets every row in the group at once; "Confirm all N" then confirms just this group
+// without waiting for (or being blocked by) anything else still pending elsewhere in the table.
+function PendingGroupBar({ group, guess, isKnownGuess, knownCustomers, onBulkChange, onConfirmGroup }) {
+  const values = Array.from(new Set(group.rows.map(r => (r.confirmedCustomer || '').trim())));
+  const commonValue = values.length === 1 ? values[0] : '';
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 10px', border: '1px dashed var(--accent)', borderRadius: 6, marginBottom: 6, flexWrap: 'wrap', background: 'var(--accent-soft)' }}>
+      <span style={{ fontSize: 12, flex: '1 1 auto', minWidth: 120 }}>{group.rows.length} rows — <strong>{group.key}</strong></span>
+      <CustomerSuggestCell value={commonValue} guess={guess} isKnownGuess={isKnownGuess} knownCustomers={knownCustomers}
+        onChange={v => onBulkChange(group.rows.map(r => r.id), v)} />
+      <button type="button" className="btn btn-ghost" style={{ padding: '4px 8px', fontSize: 12 }} disabled={!commonValue}
+        title={commonValue ? `Confirm all ${group.rows.length} rows as ${commonValue}` : 'Pick a customer above first'}
+        onClick={onConfirmGroup}>
+        <CheckCircle2 size={13} /> Confirm all {group.rows.length}
+      </button>
+    </div>
+  );
+}
+function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow }) {
   if (!rows.length) return <div className="empty-state">{emptyLabel}</div>;
   return (
     <div className="table-wrap">
@@ -813,7 +833,10 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
         </thead>
         <tbody>
           {rows.map(row => (
-            <tr key={row.id} className={(!suppressFlags && row.flagged) ? 'flagged-row' : ''}>
+            <tr key={row.id} className={[
+              (!suppressFlags && row.flagged) ? 'flagged-row' : '',
+              (highlightRow && highlightRow(row)) ? 'needs-customer-row' : '',
+            ].filter(Boolean).join(' ')}>
               {columns.map((c, ci) => (
                 <td key={c.key}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -841,7 +864,7 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
     </div>
   );
 }
-function RegisterPanel({ title, subtitle, columns, rows, onUpdate, onDelete, onExport, extra, suppressFlags = false }) {
+function RegisterPanel({ title, subtitle, columns, rows, onUpdate, onDelete, onExport, extra, suppressFlags = false, highlightRow }) {
   return (
     <div className="panel">
       <div className="panel-header">
@@ -852,7 +875,7 @@ function RegisterPanel({ title, subtitle, columns, rows, onUpdate, onDelete, onE
         <button className="btn btn-ghost" onClick={onExport}><Download size={15} /> Export this table</button>
       </div>
       {extra}
-      <EditableTable columns={columns} rows={rows} onUpdate={onUpdate} onDelete={onDelete} suppressFlags={suppressFlags} />
+      <EditableTable columns={columns} rows={rows} onUpdate={onUpdate} onDelete={onDelete} suppressFlags={suppressFlags} highlightRow={highlightRow} />
     </div>
   );
 }
@@ -1800,9 +1823,38 @@ function FIMSApp() {
       return next;
     });
   };
+  // Same real-world invoice/party almost always means several pending rows in a row — picking a
+  // customer separately for each line item of the same bill is exactly the busywork this avoids. Rows
+  // are grouped by the raw text that produced them (customerHint for production, Party/customerHint
+  // for dispatch; falls back to Invoice No if that's blank), so one dropdown pick applies to every
+  // line of that same bill at once.
+  const groupKeyForRow = (row) => (row.customerHint || '').trim() || (row.invoice_no || '').trim();
+  const buildPendingGroups = (rows) => {
+    const map = {};
+    rows.forEach(row => {
+      const key = groupKeyForRow(row);
+      if (!key) return;
+      if (!map[key]) map[key] = [];
+      map[key].push(row);
+    });
+    // Only surface groups that actually need the help: more than one row, sharing a raw hint, with at
+    // least one row still lacking both an explicit pick and a resolvable automatic guess — otherwise
+    // "Confirm all suggested" already handles it without any extra UI.
+    return Object.entries(map)
+      .map(([key, groupRows]) => ({ key, rows: groupRows }))
+      .filter(g => g.rows.length > 1 && g.rows.some(r => !r.confirmedCustomer && !isKnownCustomerGuess(r)));
+  };
+  const updatePendingCustomerBulk = (registerKey) => (ids, value) => {
+    registerSetters[registerKey](prev => {
+      const idSet = new Set(ids);
+      const next = prev.map(r => idSet.has(r.id) ? { ...r, confirmedCustomer: value } : r);
+      persist(registerKey, next);
+      return next;
+    });
+  };
   const customerStockGroups = (() => {
     const groups = {};
-    const addEntry = (row, pieces, dispatchQty) => {
+    const addEntry = (row, pieces, dispatchQty, source) => {
       const customer = row.confirmedCustomer || matchCustomer(row);
       const variantKey = normalizeVariant(row.description);
       const key = `${customer}||${variantKey}`;
@@ -1811,10 +1863,14 @@ function FIMSApp() {
       // label (and the Sheet tab this pushes to) would be whatever pack count was on THAT entry,
       // e.g. "Kaju Bake 65g x60" forever, even on a day production ran a batch of 40 instead.
       if (!groups[key]) groups[key] = { id: key, customer, description: stripPackCount(row.description) || row.description, entries: [] };
-      groups[key].entries.push({ id: row.id, date: row.date, pieces, dispatch: dispatchQty });
+      // `source` (which register the underlying row actually lives in) travels with each ledger entry
+      // so a "Delete" button on a Customer Stock ledger row knows whether to delete from Production
+      // Register or Customer Dispatch Bills — the ledger blends both into one table, but the real row
+      // only exists in one place.
+      groups[key].entries.push({ id: row.id, date: row.date, pieces, dispatch: dispatchQty, source });
     };
-    confirmedProductionRows.forEach(row => addEntry(row, num(row.pieces), num(row.dispatch)));
-    confirmedDispatchRows.forEach(row => addEntry(row, 0, num(row.quantity)));
+    confirmedProductionRows.forEach(row => addEntry(row, num(row.pieces), num(row.dispatch), 'production'));
+    confirmedDispatchRows.forEach(row => addEntry(row, 0, num(row.quantity), 'customerDispatch'));
     return Object.values(groups).map(g => {
       const sorted = [...g.entries].sort((a, b) => dateSortKey(a.date).localeCompare(dateSortKey(b.date)));
       let running = 0;
@@ -1861,6 +1917,17 @@ function FIMSApp() {
   const isKnownCustomerGuess = (row) => {
     const guess = (row.confirmedCustomer || matchCustomer(row)).trim();
     return guess === 'Unassigned' || allCustomerTabNames.includes(guess);
+  };
+  // Row-level highlight for the Production Register and Customer Dispatch Bills tabs themselves — so
+  // a row that's confirmed-but-Unassigned, or still pending with no resolvable customer, is easy to
+  // spot right there (and delete, if that's the right call) without having to go hunt for it on the
+  // Customer Stock tab. Clears itself the instant the row gets a real customer — nothing to "undo" by
+  // hand. Rows with no description are the shade/size/GSM style entries that never feed Customer Stock
+  // at all, so they're never in scope for this.
+  const needsCustomerHighlight = (row) => {
+    if (!(row.description || '').trim()) return false;
+    if (row.stockConfirmed) return (row.confirmedCustomer || '').trim() === 'Unassigned';
+    return !isKnownCustomerGuess(row);
   };
   // Groups this customer's variant ledgers under the tab name (sheetGroup) their catalog entry
   // says they belong to. A variant whose description doesn't exactly match any catalog item for
@@ -2687,6 +2754,11 @@ function FIMSApp() {
         .preview-img { max-width: 100%; max-height: 70vh; object-fit: contain; border-radius: 6px; border: 1px solid var(--rule); margin-top: 12px; cursor: zoom-in; background: #fff; }
         .error-box { display: flex; gap: 8px; align-items: flex-start; background: var(--warn-soft); border: 1px solid var(--ledger-red); color: #6b241a; padding: 10px 12px; border-radius: 5px; font-size: 12.5px; margin: 10px 0; }
         .flagged-row { background: var(--warn-soft) !important; }
+        /* A different tone than .flagged-row on purpose — flagged-row means "extraction wasn't
+           confident," this means "confirmed, but no real customer attached yet" (still Unassigned, or
+           a suggestion that didn't match anyone known). Disappears automatically the moment the row
+           gets a real customer, so it's always safe to leave a row highlighted until you get to it. */
+        .needs-customer-row { background: var(--accent-soft) !important; }
         .info-box { display: flex; gap: 8px; align-items: flex-start; background: var(--accent-soft); border: 1px solid var(--rule); color: var(--ink); padding: 10px 12px; border-radius: 5px; font-size: 12.5px; margin: 10px 0; }
         .field-row { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
         .text-input { padding: 8px 10px; border-radius: 5px; border: 1px solid var(--rule); font: inherit; font-size: 13px; }
@@ -2953,11 +3025,11 @@ function FIMSApp() {
           )}
           {loaded && activeTab === 'production' && (
             <RegisterPanel title="Production Register" subtitle="From handwritten daily production sheets — covers both the shade/size/GSM style and the product-description style. Rows from the description style also feed the Customer Stock tab. Dispatch bills do NOT land here — see the Customer Dispatch Bills tab." columns={COLUMNS.production} rows={production}
-              onUpdate={updateRow('production')} onDelete={deleteRow('production')} onExport={() => exportSheet('Production_Register', production, COLUMNS.production)} suppressFlags />
+              onUpdate={updateRow('production')} onDelete={deleteRow('production')} onExport={() => exportSheet('Production_Register', production, COLUMNS.production)} suppressFlags highlightRow={needsCustomerHighlight} />
           )}
           {loaded && activeTab === 'customerDispatch' && (
             <RegisterPanel title="Customer Dispatch Bills" subtitle="From dispatch bills / tax invoices sent to customers (Bindal, Diamond, Anmol, or otherwise) — kept separate from the Production Register. Once confirmed on the Customer Stock tab, these reduce that customer's balance there and in the Order Availability Check." columns={COLUMNS.customerDispatch} rows={customerDispatch}
-              onUpdate={updateRow('customerDispatch')} onDelete={deleteRow('customerDispatch')} onExport={() => exportSheet('Customer_Dispatch_Bills', customerDispatch, COLUMNS.customerDispatch)} />
+              onUpdate={updateRow('customerDispatch')} onDelete={deleteRow('customerDispatch')} onExport={() => exportSheet('Customer_Dispatch_Bills', customerDispatch, COLUMNS.customerDispatch)} highlightRow={needsCustomerHighlight} />
           )}
           {loaded && activeTab === 'orderCheck' && (
             <div className="panel">
@@ -3039,6 +3111,12 @@ function FIMSApp() {
                     <div><h2>Pending Production Review ({pendingProductionRows.length})</h2><p className="subtitle">New Production Register entries not yet reflected in the customer stock totals below. Check or fix the suggested customer, then confirm — nothing here counts toward balances until you do.</p></div>
                     <button className="btn btn-primary" onClick={confirmAllPendingProduction}><CheckCircle2 size={15} /> Confirm all suggested</button>
                   </div>
+                  {buildPendingGroups(pendingProductionRows).map(group => (
+                    <PendingGroupBar key={group.key} group={group} guess={matchCustomer(group.rows[0])}
+                      isKnownGuess={isKnownCustomerGuess(group.rows[0])} knownCustomers={allCustomerTabNames}
+                      onBulkChange={updatePendingCustomerBulk('production')}
+                      onConfirmGroup={() => group.rows.forEach(r => confirmStockRow('production', r))} />
+                  ))}
                   <div className="table-wrap">
                     <table>
                       <thead><tr><th>Date</th><th>Description</th><th>Pieces</th><th>Suggested Customer</th><th className="col-action"></th></tr></thead>
@@ -3069,6 +3147,12 @@ function FIMSApp() {
                     <div><h2>Pending Dispatch Bill Review ({pendingDispatchRows.length})</h2><p className="subtitle">New Customer Dispatch Bill entries not yet reflected in the customer stock totals below. Check or fix the suggested customer, then confirm — nothing here counts toward balances until you do.</p></div>
                     <button className="btn btn-primary" onClick={confirmAllPendingDispatch}><CheckCircle2 size={15} /> Confirm all suggested</button>
                   </div>
+                  {buildPendingGroups(pendingDispatchRows).map(group => (
+                    <PendingGroupBar key={group.key} group={group} guess={matchCustomer(group.rows[0])}
+                      isKnownGuess={isKnownCustomerGuess(group.rows[0])} knownCustomers={allCustomerTabNames}
+                      onBulkChange={updatePendingCustomerBulk('customerDispatch')}
+                      onConfirmGroup={() => group.rows.forEach(r => confirmStockRow('customerDispatch', r))} />
+                  ))}
                   <div className="table-wrap">
                     <table>
                       <thead><tr><th>Date</th><th>Invoice No</th><th>Description</th><th>Quantity</th><th>Suggested Customer</th><th className="col-action"></th></tr></thead>
@@ -3117,7 +3201,7 @@ function FIMSApp() {
                         <div className="section-label">{g.description} — closing balance: <Pill tone={g.closingBalance >= 0 ? 'ok' : 'warn'}>{g.closingBalance}</Pill></div>
                         <div className="table-wrap">
                           <table>
-                            <thead><tr><th>Date</th><th>Opening</th><th>Production</th><th>Dispatch</th><th>Closing</th></tr></thead>
+                            <thead><tr><th>Date</th><th>Opening</th><th>Production</th><th>Dispatch</th><th>Closing</th><th className="col-action"></th></tr></thead>
                             <tbody>
                               {g.ledger.map((e, i) => (
                                 <tr key={i}>
@@ -3126,6 +3210,9 @@ function FIMSApp() {
                                   <td style={{ padding: '6px 10px' }}>{e.pieces || ''}</td>
                                   <td style={{ padding: '6px 10px' }}>{e.dispatch || ''}</td>
                                   <td style={{ padding: '6px 10px' }}>{e.closing}</td>
+                                  <td className="col-action">
+                                    <button className="icon-btn danger" title="Delete this row from the real register/log" onClick={() => deleteRow(e.source)(e.id)}><Trash2 size={14} /></button>
+                                  </td>
                                 </tr>
                               ))}
                             </tbody>
@@ -3276,6 +3363,7 @@ function FIMSApp() {
                                         <th style={{ padding: '2px 6px', fontWeight: 500 }}>Production</th>
                                         <th style={{ padding: '2px 6px', fontWeight: 500 }}>Dispatch</th>
                                         <th style={{ padding: '2px 6px', fontWeight: 500 }}>Closing</th>
+                                        <th style={{ padding: '2px 6px' }}></th>
                                       </tr>
                                     </thead>
                                     <tbody>
@@ -3286,6 +3374,9 @@ function FIMSApp() {
                                           <td style={{ padding: '2px 6px' }}>{e.pieces || ''}</td>
                                           <td style={{ padding: '2px 6px' }}>{e.dispatch || ''}</td>
                                           <td style={{ padding: '2px 6px' }}>{e.closing}</td>
+                                          <td style={{ padding: '2px 6px' }}>
+                                            <button className="icon-btn danger" title="Delete this row from the real register/log" onClick={() => deleteRow(e.source)(e.id)}><Trash2 size={13} /></button>
+                                          </td>
                                         </tr>
                                       ))}
                                     </tbody>
