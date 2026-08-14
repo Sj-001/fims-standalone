@@ -285,6 +285,12 @@ const CUSTOMER_MAPPING_KEY = 'fims_customer_mapping';
 // doubles as the "already imported" registry for the Customer Sheets CRUD workflow (tracks when
 // each customer's sheet was last imported from / pushed to).
 const CUSTOMER_SHEET_IDS_KEY = 'fims_customer_sheet_ids';
+// Maps the raw text a dispatch bill's Party field (or a production row's bracketed customer) was
+// actually written as, to the one real known customer it means — e.g. "Bindal technopolymer pvt.
+// ltd." really is "BINDAL STOCK 1.08.26". Checked before the fuzzy substring-containment guess in
+// matchCustomer, so once taught, a legal-name variant resolves straight to the right customer
+// instead of spinning up a disconnected duplicate with no Sheet ID and no visible data anywhere.
+const CUSTOMER_NAME_ALIASES_KEY = 'fims_customer_name_aliases';
 // Lower-priority fallback keywords — only used when a ledger entry doesn't exactly match one of the
 // catalog's known item names above (e.g. a pack-size variant that isn't in the catalog yet). Starts
 // empty along with the catalog above; importing a customer sheet adds both an exact-name rule per
@@ -764,6 +770,39 @@ const GUIDE_STEPS = [
 function Pill({ tone = 'neutral', children }) {
   return <span className={`pill pill-${tone}`}>{children}</span>;
 }
+// "Suggested Customer" cell on the Pending Production/Dispatch Review tables. Replaces a free-text
+// input with a dropdown of customers the app already knows about, plus an explicit "+ New customer"
+// option — so a dispatch bill's Party field (or a production row's bracketed name) that doesn't match
+// anyone known can never silently spin up a duplicate, disconnected customer the way a free-text field
+// pre-filled with a guess could. When the guess IS a real known customer (an alias hit, a mapping-rule
+// match, or a fuzzy legal-name match against an existing customer), it's pre-selected as before so the
+// already-reliable flows aren't disrupted — only a genuinely unresolved hint forces an explicit pick.
+function CustomerSuggestCell({ value, guess, isKnownGuess, knownCustomers, onChange }) {
+  const [customMode, setCustomMode] = useState(false);
+  const current = value || (isKnownGuess ? guess : '');
+  const isCustomValue = !!current && current !== 'Unassigned' && !knownCustomers.includes(current);
+  if (customMode || isCustomValue) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+        <input className="cell-input" placeholder="Type new customer name" value={current}
+          onChange={e => onChange(e.target.value)} />
+        <button type="button" className="icon-btn" title="Pick from existing customers instead"
+          onClick={() => { setCustomMode(false); onChange(''); }}><XCircle size={14} /></button>
+      </div>
+    );
+  }
+  return (
+    <select className="cell-input" value={current} onChange={e => {
+      if (e.target.value === '__new__') { setCustomMode(true); onChange(''); return; }
+      onChange(e.target.value);
+    }}>
+      <option value="" disabled>Select customer…</option>
+      {knownCustomers.map(c => <option key={c} value={c}>{c}</option>)}
+      <option value="Unassigned">Unassigned</option>
+      <option value="__new__">+ New customer…</option>
+    </select>
+  );
+}
 function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false }) {
   if (!rows.length) return <div className="empty-state">{emptyLabel}</div>;
   return (
@@ -927,6 +966,7 @@ function FIMSApp() {
   const [productCatalog, setProductCatalog] = useState(DEFAULT_PRODUCT_CATALOG);
   const [abbreviations, setAbbreviations] = useState(DEFAULT_ABBREVIATIONS); // [{id, short, long}]
   const [customerSheetIds, setCustomerSheetIds] = useState([]); // [{id, customer, sheetId}]
+  const [customerNameAliases, setCustomerNameAliases] = useState([]); // [{id, alias, customer}]
   const [pushStatus, setPushStatus] = useState({}); // { [customer]: { state: 'idle'|'pushing'|'done'|'error', message, unmatched } }
   const [serviceAccountEmail, setServiceAccountEmail] = useState('');
   // Review-before-push: reviewByCustomer holds the last fetched diff (a dry run against the customer's
@@ -969,6 +1009,10 @@ function FIMSApp() {
       try {
         const r5 = await window.storage.get(ABBREVIATIONS_KEY, false);
         if (r5 && r5.value) setAbbreviations(JSON.parse(r5.value));
+      } catch (e) { /* keep empty — none taught yet */ }
+      try {
+        const r6 = await window.storage.get(CUSTOMER_NAME_ALIASES_KEY, false);
+        if (r6 && r6.value) setCustomerNameAliases(JSON.parse(r6.value));
       } catch (e) { /* keep empty — none taught yet */ }
       try {
         const r4 = await fetch('/api/service-account-email', { credentials: 'include' });
@@ -1505,6 +1549,49 @@ function FIMSApp() {
   const addAbbreviationRow = () => persistAbbreviations([...abbreviations, { id: genId(), short: '', long: '' }]);
   const updateAbbreviationRow = (id, field, value) => persistAbbreviations(abbreviations.map(a => a.id === id ? { ...a, [field]: value } : a));
   const deleteAbbreviationRow = (id) => persistAbbreviations(abbreviations.filter(a => a.id !== id));
+  /* -------- customer name aliases (a dispatch bill's/register's raw "as written" customer text ->
+     the one real known customer it means, e.g. "Bindal technopolymer pvt. ltd." -> "BINDAL STOCK
+     1.08.26") -------- */
+  const persistCustomerNameAliases = (next) => {
+    setCustomerNameAliases(next);
+    scheduleSave('customerNameAliases', () => window.storage.set(CUSTOMER_NAME_ALIASES_KEY, JSON.stringify(next), false).catch(() => {}));
+  };
+  const registerCustomerNameAlias = (alias, customer) => {
+    const a = (alias || '').trim();
+    const c = (customer || '').trim();
+    if (!a || !c || a.toLowerCase() === c.toLowerCase()) return;
+    const key = a.toLowerCase();
+    if (customerNameAliases.some(x => (x.alias || '').trim().toLowerCase() === key)) return;
+    persistCustomerNameAliases([...customerNameAliases, { id: genId(), alias: a, customer: c }]);
+  };
+  // Recovery tool for exactly the "phantom customer" situation the dropdown above now mostly prevents
+  // going forward: an existing bucket of confirmed Production/Dispatch rows sitting under a name that
+  // turned out to be a duplicate/misspelling of a real customer (e.g. "Bindal technopolymer pvt. ltd."
+  // instead of "BINDAL STOCK 1.08.26"). Reassigns every confirmed row, catalog entry, mapping rule, and
+  // Sheet ID from one name to the other, then teaches the alias so the same raw text never creates a
+  // new duplicate again. Nothing in the underlying Production Register or Dispatch Bills is deleted —
+  // only which customer each row is attributed to changes.
+  const mergeCustomerInto = (fromCustomer, toCustomer) => {
+    const from = (fromCustomer || '').trim();
+    const to = (toCustomer || '').trim();
+    if (!from || !to || from.toLowerCase() === to.toLowerCase()) return;
+    if (!window.confirm(`Merge everything under "${from}" into "${to}"?\n\nThis moves all their confirmed Production Register and Dispatch Bill rows, Product Catalog entries, Customer Mapping rules, and Sheet ID (if any) over to "${to}", and remembers "${from}" as an alias for "${to}" going forward. The underlying register/dispatch rows themselves are never deleted — only the customer they're attributed to changes.`)) return;
+    ['production', 'customerDispatch'].forEach(key => {
+      registerSetters[key](prev => {
+        const next = prev.map(r => r.confirmedCustomer === from ? { ...r, confirmedCustomer: to } : r);
+        persist(key, next);
+        return next;
+      });
+    });
+    if (productCatalog.some(c => c.customer === from)) persistCatalog(productCatalog.map(c => c.customer === from ? { ...c, customer: to } : c));
+    if (customerMapping.some(r => r.customer === from)) persistCustomerMapping(customerMapping.map(r => r.customer === from ? { ...r, customer: to } : r));
+    if (customerSheetIds.some(c => c.customer === from) && !getCustomerSheetId(to).trim()) {
+      persistCustomerSheetIds(customerSheetIds.map(c => c.customer === from ? { ...c, customer: to } : c));
+    } else if (customerSheetIds.some(c => c.customer === from)) {
+      persistCustomerSheetIds(customerSheetIds.filter(c => c.customer !== from));
+    }
+    registerCustomerNameAlias(from, to);
+  };
   // Whole-word, case-insensitive replacement of every taught abbreviation — used both to normalize
   // descriptions for catalog/variant matching (see normalizeForCatalogMatch/normalizeVariant below)
   // and available for anything else that wants a "read as the person would say it" version of a raw
@@ -1619,6 +1706,10 @@ function FIMSApp() {
       // code change needed — only a genuinely new customer still lands here as "new," and
       // that just needs a Customer Mapping keyword rule (added from the UI, not code).
       const hintLower = hint.toLowerCase();
+      // Explicit, exact alias someone has already taught (see Customer Name Aliases) — checked before
+      // the fuzzy guess below since it's unambiguous by construction.
+      const aliasHit = customerNameAliases.find(a => (a.alias || '').trim().toLowerCase() === hintLower);
+      if (aliasHit) return aliasHit.customer;
       const knownCustomers = new Set([
         ...customerSheetIds.map(c => c.customer),
         ...customerMapping.map(r => r.customer),
@@ -1673,14 +1764,35 @@ function FIMSApp() {
     // string, not null/undefined), so `??` would treat that '' as "already chosen" and never fall
     // through to the matched suggestion, silently confirming everything as Unassigned.
     const customer = (chosenCustomer || row.confirmedCustomer || matchCustomer(row)).trim() || 'Unassigned';
+    // A dispatch bill's Party field (or a production row's bracketed name) is "as written" real-world
+    // text — a legal-name variant, a typo, whatever. Whenever confirming lands this row on a REAL
+    // customer that's spelled differently from that raw text, remember the mapping so the next bill
+    // that says the exact same thing routes straight there next time, no re-picking needed. No-ops
+    // automatically when the hint already IS the customer name, or when there's nothing to learn.
+    const rawHint = (row.customerHint || '').trim();
+    if (rawHint && customer !== 'Unassigned') registerCustomerNameAlias(rawHint, customer);
     registerSetters[registerKey](prev => {
       const next = prev.map(r => r.id === row.id ? { ...r, confirmedCustomer: customer, stockConfirmed: true } : r);
       persist(registerKey, next);
       return next;
     });
   };
-  const confirmAllPendingProduction = () => { pendingProductionRows.forEach(r => confirmStockRow('production', r)); };
-  const confirmAllPendingDispatch = () => { pendingDispatchRows.forEach(r => confirmStockRow('customerDispatch', r)); };
+  // "Confirm all suggested" must never silently confirm a row onto a fabricated new-customer guess —
+  // only rows that are either already explicitly picked (row.confirmedCustomer set via the dropdown)
+  // or whose automatic guess is a real known customer get bulk-confirmed. Anything genuinely
+  // unresolved is left pending and reported, so it gets a deliberate pick instead of a phantom customer.
+  const confirmAllPendingProduction = () => {
+    const resolved = pendingProductionRows.filter(r => r.confirmedCustomer || isKnownCustomerGuess(r));
+    const skipped = pendingProductionRows.length - resolved.length;
+    resolved.forEach(r => confirmStockRow('production', r));
+    if (skipped > 0) window.alert(`Confirmed ${resolved.length} row${resolved.length === 1 ? '' : 's'}. Skipped ${skipped} row${skipped === 1 ? '' : 's'} whose customer couldn't be matched automatically — pick a customer in the dropdown for ${skipped === 1 ? 'it' : 'them'}, then confirm.`);
+  };
+  const confirmAllPendingDispatch = () => {
+    const resolved = pendingDispatchRows.filter(r => r.confirmedCustomer || isKnownCustomerGuess(r));
+    const skipped = pendingDispatchRows.length - resolved.length;
+    resolved.forEach(r => confirmStockRow('customerDispatch', r));
+    if (skipped > 0) window.alert(`Confirmed ${resolved.length} row${resolved.length === 1 ? '' : 's'}. Skipped ${skipped} row${skipped === 1 ? '' : 's'} whose customer couldn't be matched automatically — pick a customer in the dropdown for ${skipped === 1 ? 'it' : 'them'}, then confirm.`);
+  };
   const updatePendingCustomer = (registerKey) => (id, value) => {
     registerSetters[registerKey](prev => {
       const next = prev.map(r => r.id === id ? { ...r, confirmedCustomer: value } : r);
@@ -1740,6 +1852,16 @@ function FIMSApp() {
     ...productCatalog.map(c => c.customer),
     ...customerNames,
   ])).filter(c => c && c !== 'Unassigned');
+  // A guess is "known" when matchCustomer resolved the row to a real, already-tracked customer (an
+  // alias hit, a Customer Mapping rule, or a fuzzy legal-name match) or explicitly to 'Unassigned'.
+  // It's "unknown" only in the one fallback case matchCustomer has left: a hint that didn't match
+  // anything, title-cased and returned as-is — a fabricated new-customer guess that should never be
+  // silently confirmed. Used to decide whether the Pending Review dropdown can safely pre-select the
+  // guess, or must force an explicit pick instead.
+  const isKnownCustomerGuess = (row) => {
+    const guess = (row.confirmedCustomer || matchCustomer(row)).trim();
+    return guess === 'Unassigned' || allCustomerTabNames.includes(guess);
+  };
   // Groups this customer's variant ledgers under the tab name (sheetGroup) their catalog entry
   // says they belong to. A variant whose description doesn't exactly match any catalog item for
   // this customer falls back to using its own description as the tab name AND is flagged in
@@ -2927,8 +3049,9 @@ function FIMSApp() {
                             <td style={{ padding: '6px 10px' }}>{row.description}</td>
                             <td style={{ padding: '6px 10px' }}>{row.pieces || ''}</td>
                             <td>
-                              <input className="cell-input" value={row.confirmedCustomer || matchCustomer(row)}
-                                onChange={e => updatePendingCustomer('production')(row.id, e.target.value)} />
+                              <CustomerSuggestCell value={row.confirmedCustomer} guess={matchCustomer(row)}
+                                isKnownGuess={isKnownCustomerGuess(row)} knownCustomers={allCustomerTabNames}
+                                onChange={v => updatePendingCustomer('production')(row.id, v)} />
                             </td>
                             <td className="col-action">
                               <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm this row" onClick={() => confirmStockRow('production', row)}><CheckCircle2 size={16} /></button>
@@ -2957,8 +3080,9 @@ function FIMSApp() {
                             <td style={{ padding: '6px 10px' }}>{row.description}</td>
                             <td style={{ padding: '6px 10px' }}>{row.quantity || ''}</td>
                             <td>
-                              <input className="cell-input" value={row.confirmedCustomer || matchCustomer(row)}
-                                onChange={e => updatePendingCustomer('customerDispatch')(row.id, e.target.value)} />
+                              <CustomerSuggestCell value={row.confirmedCustomer} guess={matchCustomer(row)}
+                                isKnownGuess={isKnownCustomerGuess(row)} knownCustomers={allCustomerTabNames}
+                                onChange={v => updatePendingCustomer('customerDispatch')(row.id, v)} />
                             </td>
                             <td className="col-action">
                               <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm this row" onClick={() => confirmStockRow('customerDispatch', row)}><CheckCircle2 size={16} /></button>
@@ -3070,8 +3194,14 @@ function FIMSApp() {
                 // plus the Push button itself. Only customers with something to actually show (an item
                 // that needs routing, or a fetched diff) get a panel — no empty shells for customers
                 // that don't have a Sheet ID set up yet (that setup still happens on Customer Sheets).
+                // A customer with confirmed stock data but no Sheet ID set up yet must still show up
+                // here — that's exactly the bug that made confirmed dispatch-bill rows disappear
+                // entirely when they landed under a customer nobody had connected a Sheet for yet.
+                // Sheet ID is still required for customers with NOTHING confirmed against them (no
+                // point showing an empty shell), but never for ones with real data.
                 const customersToShow = allCustomerTabNames.filter(customer => {
-                  if (!getCustomerSheetId(customer).trim()) return false;
+                  const hasStockData = customerStockGroups.some(g => g.customer === customer);
+                  if (!hasStockData && !getCustomerSheetId(customer).trim()) return false;
                   const { unmatched } = buildCustomerSheetPayload(customer);
                   return unmatched.length > 0 || !!reviewByCustomer[customer];
                 });
@@ -3085,11 +3215,23 @@ function FIMSApp() {
                         <h2>{customer}</h2>
                         <p className="subtitle">Per-item ledger and what's about to go to their Sheet — fix anything here, then push from the Customer Sheets tab.</p>
                       </div>
-                      {!!reviewEdits[customer] && Object.keys(reviewEdits[customer]).length > 0 && (
-                        <button className="btn btn-ghost" onClick={() => { if (window.confirm(`Discard every staged change (edited values, deleted rows, tab overrides) for ${customer}'s review? This never touches the Production Register or Customer Dispatch Bills — only what's staged here.`)) discardCustomerReview(customer); }}>
-                          <XCircle size={15} /> Discard changes
-                        </button>
-                      )}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <select
+                          className="cell-input"
+                          style={{ fontSize: 12, width: 160 }}
+                          value=""
+                          onChange={e => { const target = e.target.value; e.target.value = ''; if (target) mergeCustomerInto(customer, target); }}
+                          title={`If "${customer}" is actually a duplicate or misspelling of another customer, merge everything here into the real one instead of fixing it by hand.`}
+                        >
+                          <option value="">Merge into…</option>
+                          {allCustomerTabNames.filter(c => c !== customer).sort().map(c => <option key={c} value={c}>{c}</option>)}
+                        </select>
+                        {!!reviewEdits[customer] && Object.keys(reviewEdits[customer]).length > 0 && (
+                          <button className="btn btn-ghost" onClick={() => { if (window.confirm(`Discard every staged change (edited values, deleted rows, tab overrides) for ${customer}'s review? This never touches the Production Register or Customer Dispatch Bills — only what's staged here.`)) discardCustomerReview(customer); }}>
+                            <XCircle size={15} /> Discard changes
+                          </button>
+                        )}
+                      </div>
                     </div>
                     {(() => {
                       const { unmatched } = buildCustomerSheetPayload(customer);
