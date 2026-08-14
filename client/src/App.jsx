@@ -1775,7 +1775,9 @@ function FIMSApp() {
     // end of the string in cases like "65g x 70 pkt", which previously survived untouched because the
     // string ended in "pkt", not a digit.
     .replace(/pkt\.?/g, '')
-    .replace(/\s*[x×]\s*\d+\s*$/i, '')
+    // Trailing pack-count separator — Sheet block titles write this as "x", "×", or a bare "*"
+    // ("35g*144", as opposed to the register's "35g x144"). All three mean the same thing here.
+    .replace(/\s*[x×*]\s*\d+\s*$/i, '')
     // "gm" and "g" both mean grams — real Sheet block titles and the handwritten register don't agree
     // on which one to use for the same item ("64gm" vs "64g"), so fold "gm" down to "g" wherever it's
     // written immediately after a digit, before the final alphanumeric-only strip below would otherwise
