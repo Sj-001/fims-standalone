@@ -362,12 +362,27 @@ function parseExistingBlocks(grid) {
       if (normalizeCellStr(v)) { title = normalizeCellStr(v); break; }
     }
     const existingDates = new Set();
+    // Per-date production/dispatch actually sitting in the real sheet — lets a caller tell "this date
+    // already has a row AND it's the same numbers" apart from "this date already has a row, but it
+    // disagrees with what we're about to send." A date-only match used to be treated as good enough,
+    // which is exactly how two real dispatch bills that happened to share a date with an
+    // already-present row got silently dropped forever, never pushed and never flagged. Left
+    // unset for a date when the block is too narrow (width < 4) to even have a dispatch column —
+    // that's "can't verify," not "matches," and is handled as such by classifyIncomingRows.
+    const existingValuesByDate = new Map();
     let nextRowIdx = headerRowIdx + 1;
     let lastRowValues = null;
     for (let r = headerRowIdx + 1; r < rows.length; r++) {
       const dateStr = normalizeDateCell((rows[r] || [])[startCol]);
       if (!dateStr) break; // first blank date cell ends this block's existing data
-      existingDates.add(canonicalDateKey((rows[r] || [])[startCol]));
+      const dateKey = canonicalDateKey((rows[r] || [])[startCol]);
+      existingDates.add(dateKey);
+      if (width >= 4) {
+        existingValuesByDate.set(dateKey, {
+          production: Number((rows[r] || [])[startCol + 2]) || 0,
+          dispatch: Number((rows[r] || [])[startCol + 3]) || 0,
+        });
+      }
       nextRowIdx = r + 1;
       lastRowValues = [];
       for (let c = startCol; c < startCol + width; c++) {
@@ -375,9 +390,31 @@ function parseExistingBlocks(grid) {
         lastRowValues.push(c === startCol ? dateStr : raw);
       }
     }
-    return { title, startCol, width, nextRowIdx, existingDates, lastRowValues };
+    return { title, startCol, width, nextRowIdx, existingDates, existingValuesByDate, lastRowValues };
   });
   return { headerRowIdx, blocks };
+}
+
+// Shared by both the dry-run preview and the real push, so the two can never disagree about which
+// incoming rows are genuinely new, which are correctly already-there, and which are a MISMATCH — a
+// date that already has a row in the real sheet, but with different production/dispatch numbers than
+// what we're about to send. A mismatch is never pushed (existing rows are never touched) and never
+// silently treated as "already handled" either — it's reported back so a person can look at the real
+// sheet and decide, the same way an unmatched item gets flagged instead of guessed at.
+function classifyIncomingRows(match, incomingRows) {
+  const newRows = [];
+  const mismatches = [];
+  (Array.isArray(incomingRows) ? incomingRows : []).forEach(r => {
+    const row = r || [];
+    const dateKey = canonicalDateKey(row[0]);
+    if (!match || !match.existingDates.has(dateKey)) { newRows.push(row); return; }
+    const expected = { production: Number(row[2]) || 0, dispatch: Number(row[3]) || 0 };
+    const existingVals = match.existingValuesByDate.get(dateKey);
+    if (!existingVals) { mismatches.push({ date: row[0], reason: 'unverifiable', expected }); return; }
+    if (existingVals.production === expected.production && existingVals.dispatch === expected.dispatch) return;
+    mismatches.push({ date: row[0], reason: 'value_mismatch', existing: existingVals, expected });
+  });
+  return { newRows, mismatches };
 }
 
 // Grows an EXISTING tab's grid instead of replacing it — this is the "merge, never touch existing
@@ -448,6 +485,9 @@ function computeMergePatches(existingGrid, variants) {
   // caller building a summary-tab formula reference (generateCustomerSheetStructure) point at a precise
   // cell without re-deriving this same column/row math itself.
   const placements = [];
+  // Collected across every variant — a date that already has a row but disagrees with what we
+  // computed. Never pushed (existing rows are never touched), always reported.
+  const mismatches = [];
 
   (Array.isArray(variants) ? variants : []).forEach(v => {
     const key = normalizeTabKey(v.title);
@@ -456,7 +496,8 @@ function computeMergePatches(existingGrid, variants) {
     const incomingRows = Array.isArray(v.rows) ? v.rows : [];
 
     if (match) {
-      const newRows = incomingRows.filter(r => !match.existingDates.has(canonicalDateKey((r || [])[0])));
+      const { newRows, mismatches: variantMismatches } = classifyIncomingRows(match, incomingRows);
+      if (variantMismatches.length) mismatches.push({ title: v.title, mismatches: variantMismatches });
       if (!newRows.length) return;
       const openingCol = colLetter(match.startCol + 1);
       const prodCol = colLetter(match.startCol + 2);
@@ -495,7 +536,11 @@ function computeMergePatches(existingGrid, variants) {
       // them. Advancing the block's own bookkeeping here — same object `blocks.find` will return next
       // time — is what makes that safe.
       match.nextRowIdx += newRows.length;
-      newRows.forEach(r => match.existingDates.add(canonicalDateKey((r || [])[0])));
+      newRows.forEach(r => {
+        const k = canonicalDateKey((r || [])[0]);
+        match.existingDates.add(k);
+        match.existingValuesByDate.set(k, { production: Number((r || [])[2]) || 0, dispatch: Number((r || [])[3]) || 0 });
+      });
     } else {
       const startCol = rightmostCol === -1 ? 0 : rightmostCol + 1;
       const width = Math.max(header.length, ...incomingRows.map(r => (r || []).length), 1);
@@ -524,10 +569,10 @@ function computeMergePatches(existingGrid, variants) {
       if (values.length) patches.push({ startRow0: dataStartRow0, startCol0: startCol, values });
       placements.push({ title: v.title, startCol0: startCol, width, lastWrittenRow1: dataStartRow0 + values.length });
       rightmostCol = startCol + width;
-      blocks.push({ title: v.title, startCol, width, nextRowIdx: dataStartRow0 + values.length, existingDates: new Set(), lastRowValues: null });
+      blocks.push({ title: v.title, startCol, width, nextRowIdx: dataStartRow0 + values.length, existingDates: new Set(), existingValuesByDate: new Map(), lastRowValues: null });
     }
   });
-  return { patches, placements };
+  return { patches, placements, mismatches };
 }
 
 // Highlight color for the "what's new since last push" formatting below — a warm tint matching this
@@ -686,7 +731,7 @@ async function pushCustomerSheet(spreadsheetId, itemGroups) {
   const patchesByTab = {};
   for (const plan of tabPlans) {
     const previousGrid = previousValuesByTab[plan.tabName] || [];
-    const { patches, placements } = computeMergePatches(previousGrid, plan.variants);
+    const { patches, placements, mismatches } = computeMergePatches(previousGrid, plan.variants);
     patchesByTab[plan.tabName] = patches;
     patches.forEach(p => {
       const startColL = colLetter(p.startCol0);
@@ -698,7 +743,10 @@ async function pushCustomerSheet(spreadsheetId, itemGroups) {
     // structure for a brand-new customer (generateCustomerSheetStructure) can construct a precise
     // summary-tab formula reference per item without re-deriving this column/row math itself. Ignored
     // by every other existing caller of pushCustomerSheet.
-    results.push({ tab: plan.tabName, ok: true, newRows: patches.reduce((s, p) => s + p.values.length, 0), placements });
+    // mismatches: dates that already had a row in the sheet whose numbers didn't match what we sent —
+    // never written (existing rows are never touched), always reported, so a push can never silently
+    // report success while quietly leaving a real discrepancy behind.
+    results.push({ tab: plan.tabName, ok: true, newRows: patches.reduce((s, p) => s + p.values.length, 0), placements, mismatches });
   }
   if (dataUpdates.length) {
     try {
@@ -877,7 +925,7 @@ function previewCustomerSheet(previousValuesByTab, tabPlans, missing) {
       const key = normalizeTabKey(v.title);
       const match = blocks.find(b => normalizeTabKey(b.title) === key);
       const incomingRows = Array.isArray(v.rows) ? v.rows : [];
-      const newRows = match ? incomingRows.filter(r => !match.existingDates.has(canonicalDateKey((r || [])[0]))) : incomingRows;
+      const { newRows, mismatches } = classifyIncomingRows(match, incomingRows);
       const lastExisting = (match && match.lastRowValues)
         ? { date: match.lastRowValues[0], closing: Number(match.lastRowValues[match.width - 1]) || 0 }
         : null;
@@ -895,13 +943,20 @@ function previewCustomerSheet(previousValuesByTab, tabPlans, missing) {
       // running balance continues from here instead of the real sheet's last row, and so it doesn't
       // re-offer the same dates as "new".
       if (match && rows.length) {
-        newRows.forEach(r => match.existingDates.add(canonicalDateKey((r || [])[0])));
+        newRows.forEach(r => {
+          const k = canonicalDateKey((r || [])[0]);
+          match.existingDates.add(k);
+          match.existingValuesByDate.set(k, { production: Number((r || [])[2]) || 0, dispatch: Number((r || [])[3]) || 0 });
+        });
         const synthesized = new Array(match.width).fill(null);
         synthesized[0] = rows[rows.length - 1].date;
         synthesized[match.width - 1] = rows[rows.length - 1].closing;
         match.lastRowValues = synthesized;
       }
-      return { title: v.title, isNewBlock: !match, lastExisting, rows };
+      // mismatches: dates already in the real sheet whose production/dispatch numbers don't match
+      // what we computed — surfaced right alongside the new rows so they're impossible to miss on the
+      // review screen, never silently treated as "already handled."
+      return { title: v.title, isNewBlock: !match, lastExisting, rows, mismatches };
     });
     return { tabName: plan.tabName, isNewTab: missing.includes(plan.tabName), variants };
   });

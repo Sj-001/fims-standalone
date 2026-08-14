@@ -770,6 +770,18 @@ const GUIDE_STEPS = [
 function Pill({ tone = 'neutral', children }) {
   return <span className={`pill pill-${tone}`}>{children}</span>;
 }
+// Bold section separator used on Customer Stock to keep its three very different zones (needs your
+// input, nobody's claimed this at all, and the running per-customer ledgers) from blurring into one
+// long wall of similar-looking panels.
+function SectionDivider({ icon: Icon, label, hint }) {
+  return (
+    <div className="stock-section-divider">
+      {Icon && <Icon size={15} />}
+      <span className="stock-section-divider-label">{label}</span>
+      {hint && <span className="doc-hint">{hint}</span>}
+    </div>
+  );
+}
 // "Suggested Customer" cell on the Pending Production/Dispatch Review tables. Replaces a free-text
 // input with a dropdown of customers the app already knows about, plus an explicit "+ New customer"
 // option — so a dispatch bill's Party field (or a production row's bracketed name) that doesn't match
@@ -2521,7 +2533,13 @@ function FIMSApp() {
       if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return; }
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.ok) {
-        setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Pushed ${itemGroups.length} item tab${itemGroups.length === 1 ? '' : 's'} just now.`, unmatched } }));
+        // A push can succeed (every genuinely new row written fine) while ALSO leaving some dates
+        // unresolved — a date already had a row in the sheet, but with different numbers than what we
+        // sent, so nothing was written for it (existing rows are never touched). That's not a failure,
+        // but it must never look like a silent, complete success either.
+        const mismatchCount = (data.results || []).reduce((s, r) => s + (r.mismatches || []).reduce((s2, m) => s2 + ((m.mismatches || []).length), 0), 0);
+        const mismatchNote = mismatchCount ? ` ${mismatchCount} date${mismatchCount === 1 ? '' : 's'} already had a row with different numbers and ${mismatchCount === 1 ? "wasn't" : "weren't"} touched — see the Preview below for details.` : '';
+        setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Pushed ${itemGroups.length} item tab${itemGroups.length === 1 ? '' : 's'} just now.${mismatchNote}`, unmatched } }));
         patchCustomerSheetEntry(customer, { sheetId, lastPushedAt: new Date().toISOString() });
         // The staged edits were for THIS specific diff — once it's actually written, their values are
         // now baked into the real rows the app just appended, so clear them and pull a fresh diff.
@@ -2770,6 +2788,25 @@ function FIMSApp() {
         .review-box { border: 1px solid var(--accent); border-radius: 6px; padding: 16px; background: #fff; margin-top: 18px; }
         .review-actions { display: flex; gap: 10px; margin-top: 14px; }
         .section-label { font-size: 13px; font-weight: 700; margin: 18px 0 8px 0; color: var(--ink); }
+        /* Customer Stock's per-customer panels are collapsible <details> so a customer with nothing
+           to look at collapses to one line instead of taking up the same space as one that needs a
+           decision — the page used to be a long wall of identical-looking tables no matter how much
+           (or little) actually needed attention; this is the fix for that. */
+        .customer-review-summary { list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+        .customer-review-summary::-webkit-details-marker { display: none; }
+        .customer-review-summary-main { display: flex; align-items: center; gap: 8px; }
+        .customer-review-summary-main h2 { margin: 0; }
+        .customer-review-summary-badges { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+        .details-chevron { flex-shrink: 0; color: var(--ink-soft); transition: transform 0.12s; }
+        .customer-review-panel[open] > .customer-review-summary .details-chevron { transform: rotate(90deg); }
+        .customer-review-panel:not([open]) { padding-bottom: 20px; }
+        /* Bold, high-contrast dividers between the three very different kinds of things Customer
+           Stock shows (things waiting on a decision, things nobody's claimed at all, and the running
+           per-customer ledgers) — distinct enough in weight that the eye can jump straight to the
+           right zone instead of parsing every panel in order to find it. */
+        .stock-section-divider { display: flex; align-items: baseline; gap: 10px; margin: 28px 0 12px 0; padding-bottom: 8px; border-bottom: 2px solid var(--ink); }
+        .stock-section-divider:first-child { margin-top: 0; }
+        .stock-section-divider-label { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink); }
         .spin { animation: fims-spin 1s linear infinite; }
         @keyframes fims-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
       `}</style>
@@ -3105,6 +3142,9 @@ function FIMSApp() {
                 <h2 style={{ marginBottom: 6 }}>Customer Stock</h2>
                 <p className="subtitle">Review new Production Register and Customer Dispatch Bill entries here and confirm which customer they belong to — that's the only thing that still lives on this tab. Once confirmed, matching is done by the Customer Mapping tab, plus anything literally bracketed next to the item name. The actual per-customer ledger, the diff against each customer's real Sheet, and pushing now all live in the Customer Sheets tab.</p>
               </div>
+              {(pendingProductionRows.length > 0 || pendingDispatchRows.length > 0) && (
+                <SectionDivider icon={ListChecks} label="Needs your input" hint="New entries whose customer isn't confirmed yet — nothing here counts toward any balance until you confirm it." />
+              )}
               {pendingProductionRows.length > 0 && (
                 <div className="panel" style={{ borderColor: 'var(--accent)' }}>
                   <div className="panel-header">
@@ -3189,6 +3229,8 @@ function FIMSApp() {
                 const unassignedGroups = customerStockGroups.filter(g => g.customer === 'Unassigned');
                 if (!unassignedGroups.length) return null;
                 return (
+                  <>
+                  <SectionDivider icon={AlertCircle} label="Unassigned" hint="Confirmed, but no customer at all — nobody's claimed these yet." />
                   <div className="panel" style={{ borderColor: 'var(--ledger-red)' }}>
                     <div className="panel-header">
                       <div>
@@ -3272,6 +3314,7 @@ function FIMSApp() {
                       </div>
                     ))}
                   </div>
+                  </>
                 );
               })()}
               {(() => {
@@ -3295,13 +3338,37 @@ function FIMSApp() {
                 if (!pendingProductionRows.length && !pendingDispatchRows.length && !customerStockGroups.filter(g => g.customer === 'Unassigned').length && !customersToShow.length) {
                   return <div className="empty-state">Nothing pending review right now.</div>;
                 }
-                return customersToShow.map(customer => (
-                  <div className="panel" key={`stock-review-${customer}`}>
-                    <div className="panel-header">
-                      <div>
+                if (!customersToShow.length) return null;
+                return (
+                <>
+                <SectionDivider icon={Boxes} label="Customer ledgers" hint="Items already attributed to a real customer — routed items push cleanly; anything below still needs a Sheet tab or has a discrepancy to look at." />
+                {customersToShow.map(customer => {
+                  // Counted up front (not just for display) so the panel can decide, on its own,
+                  // whether it deserves to be open by default. A customer with nothing to look at
+                  // shouldn't take up the same visual weight as one that genuinely needs a decision —
+                  // that's what was making this page feel like one long undifferentiated wall.
+                  const { unmatched: unmatchedForCount } = buildCustomerSheetPayload(customer);
+                  const reviewForCustomer = reviewByCustomer[customer];
+                  const reviewTabsForCount = (reviewForCustomer && reviewForCustomer.tabs) || [];
+                  const mismatchCountForCustomer = reviewTabsForCount.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + ((v.mismatches || []).length), 0), 0);
+                  const newRowsCountForCustomer = reviewTabsForCount.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + ((v.rows || []).length), 0), 0);
+                  const needsAttention = unmatchedForCount.length > 0 || mismatchCountForCustomer > 0;
+                  return (
+                  <details className="panel customer-review-panel" key={`stock-review-${customer}`} open={needsAttention}>
+                    <summary className="customer-review-summary">
+                      <div className="customer-review-summary-main">
+                        <ChevronRight size={16} className="details-chevron" />
                         <h2>{customer}</h2>
-                        <p className="subtitle">Per-item ledger and what's about to go to their Sheet — fix anything here, then push from the Customer Sheets tab.</p>
                       </div>
+                      <div className="customer-review-summary-badges">
+                        {unmatchedForCount.length > 0 && <Pill tone="warn">{unmatchedForCount.length} not routed</Pill>}
+                        {mismatchCountForCustomer > 0 && <Pill tone="warn">{mismatchCountForCustomer} discrepanc{mismatchCountForCustomer === 1 ? 'y' : 'ies'}</Pill>}
+                        {newRowsCountForCustomer > 0 && <Pill tone="ok">{newRowsCountForCustomer} ready to push</Pill>}
+                        {!needsAttention && newRowsCountForCustomer === 0 && <Pill tone="neutral">All caught up</Pill>}
+                      </div>
+                    </summary>
+                    <div className="panel-header" style={{ marginTop: 12 }}>
+                      <p className="subtitle">Per-item ledger and what's about to go to their Sheet — fix anything here, then push from the Customer Sheets tab.</p>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                         <select
                           className="cell-input"
@@ -3393,12 +3460,16 @@ function FIMSApp() {
                       if (!review) return null;
                       const reviewTabs = review.tabs || [];
                       const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => v.rows.length > 0));
+                      const mismatchCount = reviewTabs.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + ((v.mismatches || []).length), 0), 0);
                       return (
                         <div>
                           {review.loading && <div className="doc-hint"><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle', marginRight: 6 }} />checking against the real Sheet…</div>}
                           {review.error && <div className="error-box"><AlertCircle size={16} /><span>{review.error}</span></div>}
-                          {!review.error && !hasAnyNewRows && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet.</div>}
-                          {reviewTabs.map(tab => (tab.variants || []).filter(v => v.rows.length > 0).map(v => (
+                          {!review.error && !hasAnyNewRows && !mismatchCount && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet.</div>}
+                          {!review.error && !!mismatchCount && (
+                            <div className="error-box"><AlertCircle size={16} /><span>{mismatchCount} date{mismatchCount === 1 ? '' : 's'} already {mismatchCount === 1 ? 'has' : 'have'} a row in the real Sheet, but the numbers don't match what's on record here — nothing was pushed for {mismatchCount === 1 ? 'it' : 'them'}. Details below.</span></div>
+                          )}
+                          {reviewTabs.map(tab => (tab.variants || []).filter(v => v.rows.length > 0 || (v.mismatches || []).length > 0).map(v => (
                             <div key={`${tab.tabName}::${v.title}`} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
                               <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
                                 <strong>{v.title}</strong>
@@ -3438,6 +3509,18 @@ function FIMSApp() {
                                       <td colSpan={2} />
                                     </tr>
                                   )}
+                                  {(v.mismatches || []).map((m, mi) => (
+                                    <tr key={`mismatch-${mi}`} style={{ background: 'var(--warn-soft)' }}>
+                                      <td style={{ padding: '2px 6px', whiteSpace: 'nowrap' }}>
+                                        <AlertCircle size={12} color="var(--ledger-red)" style={{ verticalAlign: 'middle', marginRight: 4 }} />{m.date}
+                                      </td>
+                                      <td style={{ padding: '2px 6px' }} colSpan={6}>
+                                        {m.reason === 'unverifiable'
+                                          ? `Already has a row for this date, but its Production/Dispatch columns couldn't be read to check — verify by hand. On record here: production ${m.expected.production}, dispatch ${m.expected.dispatch}.`
+                                          : `Already has a row for this date, but the numbers don't match. Sheet has: production ${m.existing.production}, dispatch ${m.existing.dispatch}. On record here: production ${m.expected.production}, dispatch ${m.expected.dispatch}.`}
+                                      </td>
+                                    </tr>
+                                  ))}
                                   {v.rows.map((r, i) => {
                                     const variantEdits = (reviewEdits[customer] && reviewEdits[customer][v.title]) || {};
                                     const edit = (variantEdits.rowEdits && variantEdits.rowEdits[i]) || {};
@@ -3524,8 +3607,11 @@ function FIMSApp() {
                         </div>
                       );
                     })()}
-                  </div>
-                ));
+                  </details>
+                  );
+                })}
+                </>
+                );
               })()}
             </div>
           )}
@@ -3765,6 +3851,7 @@ function FIMSApp() {
                 const review = reviewByCustomer[customer];
                 const reviewTabs = (review && review.tabs) || [];
                 const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => v.rows.length > 0));
+                const mismatchCount = reviewTabs.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + ((v.mismatches || []).length), 0), 0);
                 return (
                   <div className="panel" key={customer}>
                     <div className="panel-header">
@@ -3802,9 +3889,12 @@ function FIMSApp() {
                           {review.loading && <span className="doc-hint" style={{ marginLeft: 8, fontWeight: 400 }}><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle' }} /> checking against the real Sheet…</span>}
                         </h3>
                         {review.error && <div className="error-box"><AlertCircle size={16} /><span>{review.error}</span></div>}
-                        {!review.error && !hasAnyNewRows && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet. Need to fix something first? See the Customer Stock tab.</div>}
+                        {!review.error && !hasAnyNewRows && !mismatchCount && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet. Need to fix something first? See the Customer Stock tab.</div>}
+                        {!review.error && !!mismatchCount && (
+                          <div className="error-box"><AlertCircle size={16} /><span>{mismatchCount} date{mismatchCount === 1 ? '' : 's'} already {mismatchCount === 1 ? 'has' : 'have'} a row in the real Sheet, but the numbers don't match what's on record here — nothing was pushed for {mismatchCount === 1 ? 'it' : 'them'}. Details below; fix on the Customer Stock tab.</span></div>
+                        )}
                         {hasAnyNewRows && <p className="doc-hint" style={{ marginBottom: 8 }}>Read-only — to edit, delete, add, or move a row before pushing, use the Customer Stock tab.</p>}
-                        {reviewTabs.map(tab => (tab.variants || []).filter(v => v.rows.length > 0).map(v => (
+                        {reviewTabs.map(tab => (tab.variants || []).filter(v => v.rows.length > 0 || (v.mismatches || []).length > 0).map(v => (
                           <div key={`${tab.tabName}::${v.title}`} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
                             <div style={{ marginBottom: 6 }}>
                               <strong>{v.title}</strong>{' '}
@@ -3831,6 +3921,18 @@ function FIMSApp() {
                                     <td style={{ padding: '2px 6px' }}>{v.lastExisting.closing}</td>
                                   </tr>
                                 )}
+                                {(v.mismatches || []).map((m, mi) => (
+                                  <tr key={`mismatch-${mi}`} style={{ background: 'var(--warn-soft)' }}>
+                                    <td style={{ padding: '2px 6px', whiteSpace: 'nowrap' }}>
+                                      <AlertCircle size={12} color="var(--ledger-red)" style={{ verticalAlign: 'middle', marginRight: 4 }} />{m.date}
+                                    </td>
+                                    <td style={{ padding: '2px 6px' }} colSpan={4}>
+                                      {m.reason === 'unverifiable'
+                                        ? `Already has a row for this date, but its Production/Dispatch columns couldn't be read to check — verify by hand. On record here: production ${m.expected.production}, dispatch ${m.expected.dispatch}.`
+                                        : `Already has a row for this date, but the numbers don't match. Sheet has: production ${m.existing.production}, dispatch ${m.existing.dispatch}. On record here: production ${m.expected.production}, dispatch ${m.expected.dispatch}.`}
+                                    </td>
+                                  </tr>
+                                ))}
                                 {v.rows.map((r, i) => {
                                   const variantEdits = (reviewEdits[customer] && reviewEdits[customer][v.title]) || {};
                                   const edit = (variantEdits.rowEdits && variantEdits.rowEdits[i]) || {};
