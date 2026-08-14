@@ -3913,7 +3913,7 @@ function FIMSApp() {
                 const registryEntry = customerSheetIds.find(c => c.customer === customer);
                 const review = reviewByCustomer[customer];
                 const reviewTabs = (review && review.tabs) || [];
-                const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => (v.rows || []).some(r => r.status === 'new')));
+                const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => (v.rows || []).some(r => r.status === 'new' || r.status === 'fillable')));
                 const mismatchCount = reviewTabs.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'mismatch' || r.status === 'unverifiable').length, 0), 0);
                 return (
                   <div className="panel" key={customer}>
