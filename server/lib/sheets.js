@@ -378,9 +378,17 @@ function parseExistingBlocks(grid) {
       const dateKey = canonicalDateKey((rows[r] || [])[startCol]);
       existingDates.add(dateKey);
       if (width >= 4) {
+        // productionBlank distinguishes a genuinely empty cell (nothing entered — a real gap, safe to
+        // fill in later) from a cell that literally holds "0" (a real, deliberate value that must never
+        // be silently overwritten). Production is expected to be known the same day a row is created,
+        // so a blank production cell almost always means the row was created before that day's number
+        // was on hand — a gap worth filling, not a conflict worth flagging.
+        const productionCell = (rows[r] || [])[startCol + 2];
         existingValuesByDate.set(dateKey, {
-          production: Number((rows[r] || [])[startCol + 2]) || 0,
+          production: Number(productionCell) || 0,
           dispatch: Number((rows[r] || [])[startCol + 3]) || 0,
+          productionBlank: normalizeCellStr(productionCell) === '',
+          rowIdx: r,
         });
       }
       nextRowIdx = r + 1;
@@ -396,20 +404,25 @@ function parseExistingBlocks(grid) {
 }
 
 // Shared by both the dry-run preview and the real push, so the two can never disagree about which
-// incoming rows are genuinely new, which are correctly already-there, and which are a MISMATCH — a
-// date that already has a row in the real sheet, but with different production/dispatch numbers than
-// what we're about to send. A mismatch is never pushed (existing rows are never touched) and never
-// silently treated as "already handled" either. Every single incoming row gets a status back — nothing
-// is ever dropped from the result — so the UI can show the real entry for every row, always, and just
-// flag the ones that need a second look instead of hiding them behind a summary.
+// incoming rows are genuinely new, which are correctly already-there, which have a real gap worth
+// filling, and which are a MISMATCH — a date that already has a row in the real sheet, but with
+// different numbers than what we're about to send. A mismatch is never pushed (an existing NON-BLANK
+// cell is never touched) and never silently treated as "already handled" either. Every single incoming
+// row gets a status back — nothing is ever dropped from the result — so the UI can show the real entry
+// for every row, always, and just flag the ones that need a second look instead of hiding them behind
+// a summary.
 //
-// A column only counts as a real conflict when the sheet ALREADY has something recorded there
-// (non-zero) that disagrees with what we have. Dispatch in particular is routinely 0 in the sheet
-// until the truck actually leaves — often days after production gets logged — so a 0 there just means
-// "not filled in yet," not a disagreement. Flagging that as a mismatch would be crying wolf on the
-// completely normal case of dispatch catching up later. If nothing in the row is a real conflict, it's
-// treated as 'duplicate' (won't be pushed either way, since the date already has a row) rather than
-// flagged.
+// Production and dispatch are judged by different rules, on purpose — they're filled in at different
+// times in real life, not together:
+//   - Production is known the same day a row is created. A blank production cell almost always means
+//     the row existed before that day's number was on hand — a real gap, safe to fill in later without
+//     asking, since there's nothing there to lose. A production cell that already holds ANY value
+//     (including a deliberate "0") and disagrees with what we have is a genuine conflict — flagged,
+//     never auto-touched.
+//   - Dispatch routinely stays 0 in the sheet until the truck actually leaves, often days after
+//     production gets logged, so a 0 there just means "not dispatched yet," not a disagreement — never
+//     flagged, never auto-filled either (dispatch timing is a real-world fact this app doesn't try to
+//     guess at). Only a dispatch cell that already holds a non-zero value and disagrees is a conflict.
 function classifyIncomingRows(match, incomingRows) {
   return (Array.isArray(incomingRows) ? incomingRows : []).map(r => {
     const row = r || [];
@@ -418,10 +431,13 @@ function classifyIncomingRows(match, incomingRows) {
     const expected = { production: Number(row[2]) || 0, dispatch: Number(row[3]) || 0 };
     const existingVals = match.existingValuesByDate.get(dateKey);
     if (!existingVals) return { row, status: 'unverifiable', expected };
-    const productionConflict = existingVals.production !== 0 && existingVals.production !== expected.production;
+    const productionConflict = !existingVals.productionBlank && existingVals.production !== expected.production;
     const dispatchConflict = existingVals.dispatch !== 0 && existingVals.dispatch !== expected.dispatch;
     if (productionConflict || dispatchConflict) {
       return { row, status: 'mismatch', existing: existingVals, expected };
+    }
+    if (existingVals.productionBlank && expected.production !== 0) {
+      return { row, status: 'fillable', existing: existingVals, expected, rowIdx: existingVals.rowIdx };
     }
     return { row, status: 'duplicate', existing: existingVals };
   });
@@ -512,6 +528,19 @@ function computeMergePatches(existingGrid, variants) {
         .filter(c => c.status === 'mismatch' || c.status === 'unverifiable')
         .map(c => ({ date: c.row[0], reason: c.status === 'unverifiable' ? 'unverifiable' : 'value_mismatch', existing: c.existing, expected: c.expected }));
       if (variantMismatches.length) mismatches.push({ title: v.title, mismatches: variantMismatches });
+      // Fillable: the sheet already has a row for this date with a genuinely blank Production cell —
+      // write ONLY that one cell, exactly like a person filling in a gap by hand. Never touches
+      // Opening, Dispatch, or Closing on that row, so a live Closing formula referencing that
+      // Production cell just recalculates on its own. Computed here (not skipped when there happen to
+      // be no brand-new rows this push) since a variant can be 100% "old dates with a gap to fill" and
+      // nothing new at all.
+      classified.filter(c => c.status === 'fillable').forEach(c => {
+        const prodCol0 = match.startCol + 2;
+        patches.push({ startRow0: c.rowIdx, startCol0: prodCol0, values: [[c.expected.production]] });
+        const k = canonicalDateKey(c.row[0]);
+        const prevVals = match.existingValuesByDate.get(k);
+        match.existingValuesByDate.set(k, { ...prevVals, production: c.expected.production, productionBlank: false });
+      });
       if (!newRows.length) return;
       const openingCol = colLetter(match.startCol + 1);
       const prodCol = colLetter(match.startCol + 2);
@@ -964,6 +993,10 @@ function previewCustomerSheet(previousValuesByTab, tabPlans, missing) {
           const k = canonicalDateKey(c.row[0]);
           match.existingDates.add(k);
           if (c.status === 'new') match.existingValuesByDate.set(k, { production: Number(c.row[2]) || 0, dispatch: Number(c.row[3]) || 0 });
+          if (c.status === 'fillable') {
+            const prevVals = match.existingValuesByDate.get(k);
+            match.existingValuesByDate.set(k, { ...prevVals, production: Number(c.row[2]) || 0, productionBlank: false });
+          }
         });
         const last = rows[rows.length - 1];
         const synthesized = new Array(match.width).fill(null);

@@ -3351,7 +3351,7 @@ function FIMSApp() {
                   const reviewForCustomer = reviewByCustomer[customer];
                   const reviewTabsForCount = (reviewForCustomer && reviewForCustomer.tabs) || [];
                   const mismatchCountForCustomer = reviewTabsForCount.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'mismatch' || r.status === 'unverifiable').length, 0), 0);
-                  const newRowsCountForCustomer = reviewTabsForCount.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'new').length, 0), 0);
+                  const newRowsCountForCustomer = reviewTabsForCount.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'new' || r.status === 'fillable').length, 0), 0);
                   const needsAttention = unmatchedForCount.length > 0 || mismatchCountForCustomer > 0;
                   return (
                   <details className="panel customer-review-panel" key={`stock-review-${customer}`} open={needsAttention}>
@@ -3459,7 +3459,7 @@ function FIMSApp() {
                       const review = reviewByCustomer[customer];
                       if (!review) return null;
                       const reviewTabs = review.tabs || [];
-                      const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => (v.rows || []).some(r => r.status === 'new')));
+                      const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => (v.rows || []).some(r => r.status === 'new' || r.status === 'fillable')));
                       const mismatchCount = reviewTabs.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'mismatch' || r.status === 'unverifiable').length, 0), 0);
                       return (
                         <div>
@@ -3517,6 +3517,7 @@ function FIMSApp() {
                                     const rowBg = isDeleted ? 'rgba(162,59,46,0.08)'
                                       : r.status === 'mismatch' || r.status === 'unverifiable' ? 'var(--warn-soft)'
                                       : isDuplicate ? 'rgba(0,0,0,0.03)'
+                                      : r.status === 'fillable' ? 'var(--ok-soft)'
                                       : 'rgba(214,163,80,0.14)';
                                     return (
                                       <tr key={i} style={{ background: rowBg, opacity: rowDisabled ? 0.55 : 1 }}>
@@ -3533,6 +3534,7 @@ function FIMSApp() {
                                         <td style={{ padding: '2px 6px' }}>{r.closing}</td>
                                         <td style={{ padding: '2px 6px' }}>
                                           {r.status === 'new' && <Pill tone="ok">New</Pill>}
+                                          {r.status === 'fillable' && <Pill tone="ok" title={`This date already has a row in the Sheet, but its Production cell is blank — will fill in just that one cell (${r.production}) without touching anything else on the row.`}>Fills gap</Pill>}
                                           {isDuplicate && <Pill tone="neutral" title={`Already in the Sheet — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed again, so this row is disabled.`}>Duplicate</Pill>}
                                           {r.status === 'mismatch' && <Pill tone="warn" title={`Sheet already has a recorded value here that disagrees — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed unless you fix it here.`}>Mismatch</Pill>}
                                           {r.status === 'unverifiable' && <Pill tone="warn" title="Sheet already has this date, but its columns couldn't be read to check. Won't be pushed — verify by hand.">Can't verify</Pill>}
@@ -3920,6 +3922,7 @@ function FIMSApp() {
                                   const isDuplicate = r.status === 'duplicate';
                                   const rowBg = r.status === 'mismatch' || r.status === 'unverifiable' ? 'var(--warn-soft)'
                                     : isDuplicate ? 'rgba(0,0,0,0.03)'
+                                    : r.status === 'fillable' ? 'var(--ok-soft)'
                                     : 'rgba(214,163,80,0.14)';
                                   return (
                                     <tr key={i} style={{ background: rowBg, opacity: isDuplicate ? 0.55 : 1 }}>
@@ -3930,6 +3933,7 @@ function FIMSApp() {
                                       <td style={{ padding: '2px 6px' }}>{r.closing}</td>
                                       <td style={{ padding: '2px 6px' }}>
                                         {r.status === 'new' && <Pill tone="ok">New</Pill>}
+                                        {r.status === 'fillable' && <Pill tone="ok" title={`This date already has a row in the Sheet, but its Production cell is blank — will fill in just that one cell (${r.production}) without touching anything else on the row.`}>Fills gap</Pill>}
                                         {isDuplicate && <Pill tone="neutral" title={`Already in the Sheet — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed again.`}>Duplicate</Pill>}
                                         {r.status === 'mismatch' && <Pill tone="warn" title={`Sheet already has a recorded value here that disagrees — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}.`}>Mismatch</Pill>}
                                         {r.status === 'unverifiable' && <Pill tone="warn" title="Sheet already has this date, but its columns couldn't be read to check.">Can't verify</Pill>}
