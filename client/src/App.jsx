@@ -764,7 +764,7 @@ const GUIDE_STEPS = [
 function Pill({ tone = 'neutral', children }) {
   return <span className={`pill pill-${tone}`}>{children}</span>;
 }
-function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.' }) {
+function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false }) {
   if (!rows.length) return <div className="empty-state">{emptyLabel}</div>;
   return (
     <div className="table-wrap">
@@ -774,11 +774,11 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
         </thead>
         <tbody>
           {rows.map(row => (
-            <tr key={row.id} className={row.flagged ? 'flagged-row' : ''}>
+            <tr key={row.id} className={(!suppressFlags && row.flagged) ? 'flagged-row' : ''}>
               {columns.map((c, ci) => (
                 <td key={c.key}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                    {ci === 0 && row.flagged && (
+                    {ci === 0 && !suppressFlags && row.flagged && (
                       <AlertCircle size={13} color="var(--ledger-red)" style={{ flexShrink: 0 }} title={row.flagReason || 'Flagged during extraction — the model wasn\'t confident about this row. Check it against the original document.'} />
                     )}
                     <input
@@ -802,7 +802,7 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
     </div>
   );
 }
-function RegisterPanel({ title, subtitle, columns, rows, onUpdate, onDelete, onExport, extra }) {
+function RegisterPanel({ title, subtitle, columns, rows, onUpdate, onDelete, onExport, extra, suppressFlags = false }) {
   return (
     <div className="panel">
       <div className="panel-header">
@@ -813,7 +813,7 @@ function RegisterPanel({ title, subtitle, columns, rows, onUpdate, onDelete, onE
         <button className="btn btn-ghost" onClick={onExport}><Download size={15} /> Export this table</button>
       </div>
       {extra}
-      <EditableTable columns={columns} rows={rows} onUpdate={onUpdate} onDelete={onDelete} />
+      <EditableTable columns={columns} rows={rows} onUpdate={onUpdate} onDelete={onDelete} suppressFlags={suppressFlags} />
     </div>
   );
 }
@@ -1517,7 +1517,17 @@ function FIMSApp() {
       const long = (a.long || '').trim();
       if (!short || !long) return;
       const escaped = short.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      out = out.replace(new RegExp(`\\b${escaped}\\b`, 'gi'), long);
+      let pattern = `\\b${escaped}\\b`;
+      // Most real abbreviations are the long form's own opening word ("Jeera" -> "Jeera Dhamal",
+      // "CONT" -> "Container") — without this guard, text that was ALREADY written out in full gets
+      // re-expanded on top of itself ("Jeera Dhamal 35g" -> "Jeera Dhamal Dhamal 35g"), which then fails
+      // to match anything. So if the long form starts with the short form, skip an occurrence that's
+      // already immediately followed by the rest of the long form — it's already expanded.
+      if (long.length > short.length && long.toLowerCase().startsWith(short.toLowerCase())) {
+        const rest = long.slice(short.length).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        pattern += `(?!${rest})`;
+      }
+      out = out.replace(new RegExp(pattern, 'gi'), long);
     });
     return out;
   };
@@ -1758,7 +1768,19 @@ function FIMSApp() {
   // neither has a literal "x" immediately before the trailing digits, so neither is touched).
   const normalizeForCatalogMatch = (s) => applyAbbreviations(s || '')
     .toLowerCase()
+    // "pkt"/"pkt." is pure packaging noise (pack-count units), not part of an item's identity — strip
+    // the word itself first (no word-boundary requirement, since it's routinely glued straight onto a
+    // digit with no space: "40pkt", "70pkt"). Stripping it here — rather than trying to match the whole
+    // "x<N> pkt" phrase as one pattern — is what lets the trailing x<N> strip below actually reach the
+    // end of the string in cases like "65g x 70 pkt", which previously survived untouched because the
+    // string ended in "pkt", not a digit.
+    .replace(/pkt\.?/g, '')
     .replace(/\s*[x×]\s*\d+\s*$/i, '')
+    // "gm" and "g" both mean grams — real Sheet block titles and the handwritten register don't agree
+    // on which one to use for the same item ("64gm" vs "64g"), so fold "gm" down to "g" wherever it's
+    // written immediately after a digit, before the final alphanumeric-only strip below would otherwise
+    // let that one-letter difference silently keep them apart.
+    .replace(/(\d)\s*gm\b/g, '$1g')
     .replace(/\bcont\.?\b/g, 'container')
     .replace(/[^a-z0-9]/g, '');
   // Every real customer Sheet writes dates as dot-separated D.M.YY ("5.1.24", "26.1.24") — never with
@@ -2053,16 +2075,11 @@ function FIMSApp() {
         id: genId(), item: it.item, sheetGroup: it.sheetGroup || it.item, include: true,
         isNew: !existingItemNames.has(String(it.item || '').toLowerCase().trim()),
       }));
-      let skippedExisting = 0;
-      if (mode === 'resync') {
-        skippedExisting = items.filter(it => !it.isNew).length;
-        items = items.filter(it => it.isNew); // additive-only re-sync — never re-offer/overwrite items already in the catalog
-      }
-      if (mode === 'resync' && !items.length) {
-        setImportResultMessage(`${customerName}: re-synced — no new items found (${skippedExisting} already in the catalog).`);
-        patchCustomerSheetEntry(customerName, { sheetId: id, lastImportedAt: new Date().toISOString() });
-        return;
-      }
+      // Full re-sync now: show every item currently in the Sheet, not just new ones — confirming below
+      // REPLACES this customer's whole catalog + auto-generated mapping with exactly this list, so
+      // anything stale (a block that got renamed or removed in the Sheet) drops out too, instead of
+      // piling up forever. isNew is kept per item just so the review can show what's actually changed.
+      const skippedExisting = mode === 'resync' ? items.filter(it => !it.isNew).length : 0;
       setSheetReview({ spreadsheetId: id, spreadsheetTitle: data.spreadsheetTitle || '', customerName, mode, resyncCustomer, items, skippedExisting });
     } catch (e) {
       setSheetImportError(e.message || 'Network error — could not reach the server.');
@@ -2082,32 +2099,76 @@ function FIMSApp() {
     if (!sheetReview || !sheetReview.customerName.trim()) return;
     const customer = sheetReview.customerName.trim();
     const included = sheetReview.items.filter(it => it.include && it.item.trim());
-    const existingItems = new Set(productCatalog.map(c => catalogDedupKey(c.customer, c.item)));
-    const newCatalogEntries = included
-      .filter(it => !existingItems.has(catalogDedupKey(customer, it.item)))
-      .map(it => ({ id: genId(), customer, item: it.item.trim(), sheetGroup: (it.sheetGroup || it.item).trim() }));
-    const nextCatalog = [...productCatalog, ...newCatalogEntries];
+    const isFullResync = sheetReview.mode === 'resync';
+    const oldCustomerItems = productCatalog.filter(c => c.customer === customer);
+    const staleRemovedCount = isFullResync
+      ? oldCustomerItems.filter(c => !included.some(it => catalogDedupKey(customer, it.item.trim()) === catalogDedupKey(customer, c.item))).length
+      : 0;
+    if (isFullResync) {
+      // Destructive — the Sheet becomes the source of truth for this customer's catalog from here on,
+      // so anything currently there that isn't in `included` is about to be dropped. Confirm first,
+      // same as every other real write in this app (Push to Sheet, Discard changes, Clear Data).
+      if (!window.confirm(`Re-sync ${customer}: replace all ${oldCustomerItems.length} existing catalog item${oldCustomerItems.length === 1 ? '' : 's'} for this customer with the ${included.length} item${included.length === 1 ? '' : 's'} currently in their Sheet${staleRemovedCount ? ` (${staleRemovedCount} no longer there will be removed)` : ''}? A manually-added alias whose exact wording isn't a block title in the Sheet will be removed too unless it's also written there.`)) return;
+    }
+    let nextCatalog;
+    let nextMapping;
+    let addedCount;
+    if (isFullResync) {
+      // Only auto-generated keyword rules (exact item name + the digit-stripped fallback) tied to the
+      // OLD item list get dropped — a keyword rule typed by hand for some other reason is left alone,
+      // since a full re-sync has no way to tell that one was deliberate.
+      const oldGeneratedKeywords = new Set();
+      oldCustomerItems.forEach(c => {
+        const exact = mappingDedupKey(c.item);
+        if (exact) oldGeneratedKeywords.add(exact);
+        const fallback = exact.replace(/[\d].*$/, '').trim();
+        if (fallback && fallback.length > 2) oldGeneratedKeywords.add(fallback);
+      });
+      const freshEntries = included.map(it => ({ id: genId(), customer, item: it.item.trim(), sheetGroup: (it.sheetGroup || it.item).trim() }));
+      addedCount = freshEntries.length;
+      nextCatalog = [...productCatalog.filter(c => c.customer !== customer), ...freshEntries];
+      const survivingMapping = customerMapping.filter(r => !(r.customer === customer && oldGeneratedKeywords.has(mappingDedupKey(r.keyword))));
+      const existingKeywords = new Set(survivingMapping.map(r => mappingDedupKey(r.keyword)));
+      const exactRules = [];
+      const fallbackRules = [];
+      included.forEach(it => {
+        const exact = mappingDedupKey(it.item);
+        if (exact && !existingKeywords.has(exact)) { exactRules.push({ id: genId(), keyword: exact, customer }); existingKeywords.add(exact); }
+        const fallback = exact.replace(/[\d].*$/, '').trim();
+        if (fallback && fallback.length > 2 && !existingKeywords.has(fallback)) { fallbackRules.push({ id: genId(), keyword: fallback, customer }); existingKeywords.add(fallback); }
+      });
+      nextMapping = [...exactRules, ...survivingMapping, ...fallbackRules];
+    } else {
+      const existingItems = new Set(productCatalog.map(c => catalogDedupKey(c.customer, c.item)));
+      const newCatalogEntries = included
+        .filter(it => !existingItems.has(catalogDedupKey(customer, it.item)))
+        .map(it => ({ id: genId(), customer, item: it.item.trim(), sheetGroup: (it.sheetGroup || it.item).trim() }));
+      addedCount = newCatalogEntries.length;
+      nextCatalog = [...productCatalog, ...newCatalogEntries];
+      const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
+      const exactRules = [];
+      const fallbackRules = [];
+      included.forEach(it => {
+        const exact = it.item.trim().toLowerCase();
+        if (exact && !existingKeywords.has(exact)) { exactRules.push({ id: genId(), keyword: exact, customer }); existingKeywords.add(exact); }
+        const fallback = exact.replace(/[\d].*$/, '').trim();
+        if (fallback && fallback.length > 2 && !existingKeywords.has(fallback)) { fallbackRules.push({ id: genId(), keyword: fallback, customer }); existingKeywords.add(fallback); }
+      });
+      nextMapping = [...exactRules, ...customerMapping, ...fallbackRules];
+    }
     persistCatalog(nextCatalog);
-    const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
-    const exactRules = [];
-    const fallbackRules = [];
-    included.forEach(it => {
-      const exact = it.item.trim().toLowerCase();
-      if (exact && !existingKeywords.has(exact)) { exactRules.push({ id: genId(), keyword: exact, customer }); existingKeywords.add(exact); }
-      const fallback = exact.replace(/[\d].*$/, '').trim();
-      if (fallback && fallback.length > 2 && !existingKeywords.has(fallback)) { fallbackRules.push({ id: genId(), keyword: fallback, customer }); existingKeywords.add(fallback); }
-    });
-    persistCustomerMapping([...exactRules, ...customerMapping, ...fallbackRules]);
+    persistCustomerMapping(nextMapping);
     patchCustomerSheetEntry(customer, {
       sheetId: sheetReview.spreadsheetId,
       lastImportedAt: new Date().toISOString(),
       itemCount: nextCatalog.filter(c => c.customer === customer).length,
     });
     const reassignedCount = reassignUnassignedRows();
-    const verb = sheetReview.mode === 'resync' ? 'Re-synced' : sheetReview.mode === 'generate' ? 'Generated' : 'Imported';
+    const verb = isFullResync ? 'Re-synced' : sheetReview.mode === 'generate' ? 'Generated' : 'Imported';
     setImportResultMessage(
-      `${verb} ${customer}: added ${newCatalogEntries.length} new catalog item${newCatalogEntries.length === 1 ? '' : 's'}` +
-      (sheetReview.skippedExisting ? ` (${sheetReview.skippedExisting} already known, skipped)` : '') +
+      `${verb} ${customer}: ${isFullResync ? `catalog now has ${addedCount} item${addedCount === 1 ? '' : 's'}` : `added ${addedCount} new catalog item${addedCount === 1 ? '' : 's'}`}` +
+      (isFullResync && staleRemovedCount ? `, removed ${staleRemovedCount} stale item${staleRemovedCount === 1 ? '' : 's'}` : '') +
+      (!isFullResync && sheetReview.skippedExisting ? ` (${sheetReview.skippedExisting} already known, skipped)` : '') +
       (reassignedCount ? `, reassigned ${reassignedCount} previously-Unassigned row${reassignedCount === 1 ? '' : 's'} to ${customer}` : '') + '.'
     );
     setSheetReview(null);
@@ -2768,7 +2829,7 @@ function FIMSApp() {
           )}
           {loaded && activeTab === 'production' && (
             <RegisterPanel title="Production Register" subtitle="From handwritten daily production sheets — covers both the shade/size/GSM style and the product-description style. Rows from the description style also feed the Customer Stock tab. Dispatch bills do NOT land here — see the Customer Dispatch Bills tab." columns={COLUMNS.production} rows={production}
-              onUpdate={updateRow('production')} onDelete={deleteRow('production')} onExport={() => exportSheet('Production_Register', production, COLUMNS.production)} />
+              onUpdate={updateRow('production')} onDelete={deleteRow('production')} onExport={() => exportSheet('Production_Register', production, COLUMNS.production)} suppressFlags />
           )}
           {loaded && activeTab === 'customerDispatch' && (
             <RegisterPanel title="Customer Dispatch Bills" subtitle="From dispatch bills / tax invoices sent to customers (Bindal, Diamond, Anmol, or otherwise) — kept separate from the Production Register. Once confirmed on the Customer Stock tab, these reduce that customer's balance there and in the Order Availability Check." columns={COLUMNS.customerDispatch} rows={customerDispatch}
@@ -3388,7 +3449,7 @@ function FIMSApp() {
                 {sheetReview && (
                   <div className="review-box">
                     <p className="subtitle" style={{ marginBottom: 6 }}>
-                      {sheetReview.mode === 'resync' ? `Re-syncing ${sheetReview.customerName} — showing only items not already in the catalog.`
+                      {sheetReview.mode === 'resync' ? `Re-syncing ${sheetReview.customerName} — this is EVERY item currently in the Sheet. Confirming replaces this customer's whole catalog with exactly this list, so anything removed or renamed there drops out too.`
                         : sheetReview.mode === 'generate' ? `Structure built in the Sheet for "${sheetReview.customerName}" — every tab, item block, and the summary tab are already written and live.`
                         : `Imported from "${sheetReview.spreadsheetTitle || sheetReview.spreadsheetId}".`}
                     </p>
@@ -3396,7 +3457,11 @@ function FIMSApp() {
                       <span style={{ fontSize: 13, fontWeight: 600 }}>Customer name:</span>
                       <input className="text-input" value={sheetReview.customerName} disabled={sheetReview.mode === 'resync'} onChange={e => setSheetReview(prev => ({ ...prev, customerName: e.target.value }))} />
                     </div>
-                    <p className="subtitle" style={{ marginBottom: 10 }}>{sheetReview.items.length} new item{sheetReview.items.length === 1 ? '' : 's'} found{sheetReview.skippedExisting ? ` (${sheetReview.skippedExisting} already known, not shown)` : ''}. Uncheck anything that isn't really a product, fix any typos, adjust which Sheet Tab each lands under, then confirm.</p>
+                    <p className="subtitle" style={{ marginBottom: 10 }}>
+                      {sheetReview.mode === 'resync'
+                        ? `${sheetReview.items.length} item${sheetReview.items.length === 1 ? '' : 's'} found in the Sheet${sheetReview.skippedExisting ? ` (${sheetReview.skippedExisting} already known)` : ''}. Uncheck anything that isn't really a product, fix any typos, adjust which Sheet Tab each lands under, then confirm the replace.`
+                        : `${sheetReview.items.length} new item${sheetReview.items.length === 1 ? '' : 's'} found${sheetReview.skippedExisting ? ` (${sheetReview.skippedExisting} already known, not shown)` : ''}. Uncheck anything that isn't really a product, fix any typos, adjust which Sheet Tab each lands under, then confirm.`}
+                    </p>
                     <div className="table-wrap">
                       <table>
                         <thead><tr><th style={{ width: 34 }}></th><th>Item name</th><th>Sheet Tab (item group)</th></tr></thead>
@@ -3412,7 +3477,7 @@ function FIMSApp() {
                       </table>
                     </div>
                     <div className="review-actions">
-                      <button className="btn btn-primary" onClick={confirmSheetImport} disabled={!sheetReview.customerName.trim()}><CheckCircle2 size={15} /> Add to catalog &amp; mapping</button>
+                      <button className="btn btn-primary" onClick={confirmSheetImport} disabled={!sheetReview.customerName.trim()}><CheckCircle2 size={15} /> {sheetReview.mode === 'resync' ? 'Replace catalog with Sheet' : 'Add to catalog & mapping'}</button>
                       <button className="btn btn-ghost" onClick={() => setSheetReview(null)}><XCircle size={15} /> Discard</button>
                     </div>
                   </div>
@@ -3476,7 +3541,7 @@ function FIMSApp() {
                         </p>
                       </div>
                       <div style={{ display: 'flex', gap: 8 }}>
-                        <button className="btn btn-ghost" onClick={() => importSheetById(sheetId, { mode: 'resync', resyncCustomer: customer })} disabled={sheetImportBusy || !sheetId.trim()} title="Re-check this customer's Sheet for newly added items and add them to the catalog">
+                        <button className="btn btn-ghost" onClick={() => importSheetById(sheetId, { mode: 'resync', resyncCustomer: customer })} disabled={sheetImportBusy || !sheetId.trim()} title="Re-read this customer's Sheet fresh and replace their catalog with exactly what's in it now (removes anything renamed or deleted there) — you'll see a review + confirm before anything changes">
                           <RefreshCw size={15} /> Re-sync
                         </button>
                         <button className="btn btn-primary" onClick={() => pushCustomerSheetNow(customer)} disabled={status.state === 'pushing' || !sheetId.trim() || !hasAnyNewRows} title={!hasAnyNewRows ? 'Nothing new to push right now' : ''}>
@@ -3562,6 +3627,15 @@ function FIMSApp() {
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Clear App Data</h2>
                 <p className="subtitle" style={{ marginBottom: 14 }}>Pick exactly what to wipe, then confirm — nothing happens until you click "Clear selected," and there's a confirmation prompt listing exactly what you picked before anything is actually deleted. This only clears data inside this app's own registers; it never touches any customer's real Google Sheet.</p>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, paddingBottom: 10, borderBottom: '1px solid var(--border)', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={CLEAR_GROUPS.every(g => !!clearSelected[g.key])}
+                    ref={el => { if (el) el.indeterminate = CLEAR_GROUPS.some(g => !!clearSelected[g.key]) && !CLEAR_GROUPS.every(g => !!clearSelected[g.key]); }}
+                    onChange={e => setClearSelected(CLEAR_GROUPS.every(g => !!clearSelected[g.key]) ? {} : Object.fromEntries(CLEAR_GROUPS.map(g => [g.key, true])))}
+                  />
+                  <span style={{ fontSize: 13.5, fontWeight: 600 }}>Select all</span>
+                </label>
                 {CLEAR_GROUPS.map(g => (
                   <label key={g.key} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, cursor: 'pointer' }}>
                     <input type="checkbox" checked={!!clearSelected[g.key]} onChange={() => toggleClearGroup(g.key)} />
