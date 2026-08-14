@@ -422,30 +422,21 @@ function parseExistingBlocks(grid) {
 // that ALREADY holds a real, non-zero value that disagrees with what we have is a genuine mismatch —
 // flagged, never auto-touched. A column sitting at 0/blank with a real incoming value is "fillable":
 // safe to write into later, without ever overwriting anything that was actually there.
-//
-// A row's own production/dispatch cell can be `null` — not 0 — meaning this specific upload has NO
-// opinion on that column at all (a dispatch bill has no production figure on it, full stop; a
-// production-only entry has no dispatch figure). That's different from a genuine, confirmed 0, and
-// must never be compared against the real sheet as if it were one — a pure dispatch upload disagreeing
-// with the sheet's real production number would otherwise get flagged as a "mismatch" for a column it
-// never actually claimed anything about.
 function classifyIncomingRows(match, incomingRows) {
   return (Array.isArray(incomingRows) ? incomingRows : []).map(r => {
     const row = r || [];
     const dateKey = canonicalDateKey(row[0]);
     if (!match || !match.existingDates.has(dateKey)) return { row, status: 'new' };
-    const hasProduction = row[2] !== null && row[2] !== undefined && row[2] !== '';
-    const hasDispatch = row[3] !== null && row[3] !== undefined && row[3] !== '';
     const expected = { production: Number(row[2]) || 0, dispatch: Number(row[3]) || 0 };
     const existingVals = match.existingValuesByDate.get(dateKey);
     if (!existingVals) return { row, status: 'unverifiable', expected };
-    const productionConflict = hasProduction && existingVals.production !== 0 && existingVals.production !== expected.production;
-    const dispatchConflict = hasDispatch && existingVals.dispatch !== 0 && existingVals.dispatch !== expected.dispatch;
+    const productionConflict = existingVals.production !== 0 && existingVals.production !== expected.production;
+    const dispatchConflict = existingVals.dispatch !== 0 && existingVals.dispatch !== expected.dispatch;
     if (productionConflict || dispatchConflict) {
       return { row, status: 'mismatch', existing: existingVals, expected };
     }
-    const fillProduction = hasProduction && existingVals.production === 0 && expected.production !== 0;
-    const fillDispatch = hasDispatch && existingVals.dispatch === 0 && expected.dispatch !== 0;
+    const fillProduction = existingVals.production === 0 && expected.production !== 0;
+    const fillDispatch = existingVals.dispatch === 0 && expected.dispatch !== 0;
     if (fillProduction || fillDispatch) {
       return { row, status: 'fillable', existing: existingVals, expected, fillProduction, fillDispatch, rowIdx: existingVals.rowIdx };
     }
@@ -570,97 +561,52 @@ function computeMergePatches(existingGrid, variants) {
   // Collected across every variant — a date that already has a row but disagrees with what we
   // computed. Never pushed (existing rows are never touched), always reported.
   const mismatches = [];
-  // Real "insert N blank rows before row X" structural requests — one per contiguous group of new rows
-  // that has to land somewhere other than the very end of the block, so the block stays in TRUE
-  // chronological order instead of new dates always landing after whatever's already there regardless
-  // of date. Turned into actual Sheets API requests by the caller (pushCustomerSheet), which has the
-  // tab's real numeric sheetId; this function only knows column/row math.
-  const insertRequests = [];
 
-  // Processes every variant that resolves to the SAME block TOGETHER, as one combined batch, rather
-  // than one at a time — critical for correctness, not just tidiness: if variant A gets its rows
-  // placed first and variant B (sharing the same block) later needs to insert a row chronologically
-  // BEFORE one of A's already-placed rows, A's Opening formula must reference B's new row as its real
-  // predecessor. Handling them one at a time and patching row numbers afterward would shift WHERE a
-  // row lands but leave its formula still pointing at the wrong (pre-insert) predecessor, silently
-  // dropping B's row out of the balance chain. Treating every entry destined for this block as one
-  // unified list of new rows before computing any formula avoids that entirely.
-  function processBlockGroup(match, entries) {
-    const perEntry = entries.map(({ v, incomingRows }) => ({ v, classified: classifyIncomingRows(match, incomingRows) }));
-    perEntry.forEach(({ v, classified }) => {
+  (Array.isArray(variants) ? variants : []).forEach(v => {
+    const key = normalizeTabKey(v.title);
+    const match = blocks.find(b => normalizeTabKey(b.title) === key);
+    const header = (v.header && v.header.length) ? v.header : ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'];
+    const incomingRows = Array.isArray(v.rows) ? v.rows : [];
+
+    if (match) {
+      const classified = classifyIncomingRows(match, incomingRows);
+      const newRows = classified.filter(c => c.status === 'new').map(c => c.row);
       const variantMismatches = classified
         .filter(c => c.status === 'mismatch' || c.status === 'unverifiable')
         .map(c => ({ date: c.row[0], reason: c.status === 'unverifiable' ? 'unverifiable' : 'value_mismatch', existing: c.existing, expected: c.expected }));
       if (variantMismatches.length) mismatches.push({ title: v.title, mismatches: variantMismatches });
-    });
-
-    // Every 'new' row across every entry sharing this block, combined into one chronological placement
-    // pass — tagged with which entry (vi) it came from, purely so `placements` can still report a
-    // separate lastWrittenRow1 per original variant/title afterward.
-    const allNew = [];
-    perEntry.forEach(({ classified }, vi) => {
-      classified.filter(c => c.status === 'new').forEach(c => allNew.push({ row: c.row, dateKey: canonicalDateKey(c.row[0]), vi }));
-    });
-
-    const hasRealPriorRow = match.existingDates.size > 0;
-    const groups = planChronologicalInserts(match.existingRowsOrdered, allNew);
-    const { totalInserted, adjustExistingRowIdx } = finalizeInsertPlacement(match.nextRowIdx, groups);
-
-    // Fillable: the sheet already has a row for this date with a genuinely blank/0 Production and/or
-    // Dispatch cell — write ONLY that one cell, exactly like a person filling in a gap by hand. Never
-    // touches Opening or the other column on that row, so a live Closing formula recalculates on its
-    // own. Its original rowIdx has to be adjusted for any inserts landing above it from this same
-    // combined batch.
-    perEntry.forEach(({ classified }) => {
+      // Fillable: the sheet already has a row for this date with a genuinely blank Production cell —
+      // write ONLY that one cell, exactly like a person filling in a gap by hand. Never touches
+      // Opening, Dispatch, or Closing on that row, so a live Closing formula referencing that
+      // Production cell just recalculates on its own. Computed here (not skipped when there happen to
+      // be no brand-new rows this push) since a variant can be 100% "old dates with a gap to fill" and
+      // nothing new at all.
       classified.filter(c => c.status === 'fillable').forEach(c => {
-        const finalRowIdx = adjustExistingRowIdx(c.rowIdx);
+        const prodCol0 = match.startCol + 2;
+        patches.push({ startRow0: c.rowIdx, startCol0: prodCol0, values: [[c.expected.production]] });
         const k = canonicalDateKey(c.row[0]);
         const prevVals = match.existingValuesByDate.get(k);
-        const nextVals = { ...prevVals };
-        if (c.fillProduction) {
-          patches.push({ startRow0: finalRowIdx, startCol0: match.startCol + 2, values: [[c.expected.production]] });
-          nextVals.production = c.expected.production;
-        }
-        if (c.fillDispatch) {
-          patches.push({ startRow0: finalRowIdx, startCol0: match.startCol + 3, values: [[c.expected.dispatch]] });
-          nextVals.dispatch = c.expected.dispatch;
-        }
-        match.existingValuesByDate.set(k, nextVals);
+        match.existingValuesByDate.set(k, { ...prevVals, production: c.expected.production, productionBlank: false });
       });
-    });
-
-    if (!allNew.length) return;
-    const openingCol = colLetter(match.startCol + 1);
-    const prodCol = colLetter(match.startCol + 2);
-    const dispCol = colLetter(match.startCol + 3);
-    const closingCol = colLetter(match.startCol + match.width - 1);
-
-    // Reversed on purpose: groups are in ascending (chronological) order, but each insert physically
-    // shifts everything below its own target down, so executing them bottom-to-top (highest original
-    // row index first) is what keeps every OTHER group's original target index valid when its own
-    // turn comes — the caller issues insertRequests in exactly this array order, in one batchUpdate.
-    [...groups].reverse().forEach(g => {
-      if (g.beforeRowIdx !== null) {
-        insertRequests.push({ startCol0: match.startCol, width: match.width, beforeRowIdx: g.beforeRowIdx, count: g.rows.length });
-      }
-    });
-
-    const values = [];
-    const newExistingRows = []; // {rowIdx, dateKey} for every newly-written row, at its FINAL position
-    const lastRow0ByEntry = {};
-    groups.forEach((g, gi) => {
-      g.rows.forEach((nr, ri) => {
-        const row = nr.row || [];
-        const row0 = g.finalStartRow + ri;
-        const thisRow1 = row0 + 1;
-        // Only the very first row ever written into a genuinely empty block has no real row above it
-        // to reference — every other row, whether inserted mid-block or appended at the end, always
-        // has SOMETHING correct directly above it once the real inserts have physically happened
-        // (Sheets auto-adjusts every formula that referenced a shifted cell, so referencing by FINAL
-        // row number here is always correct — and since every row from every entry sharing this block
-        // was placed in this SAME pass, that's true across entries too, not just within one).
-        const isVeryFirstOfBlock = gi === 0 && ri === 0 && !hasRealPriorRow;
-        const opening = isVeryFirstOfBlock ? 0 : `=${closingCol}${thisRow1 - 1}`;
+      if (!newRows.length) return;
+      const openingCol = colLetter(match.startCol + 1);
+      const prodCol = colLetter(match.startCol + 2);
+      const dispCol = colLetter(match.startCol + 3);
+      const closingCol = colLetter(match.startCol + match.width - 1);
+      // A block can be "found" here (its title+header exist) while having ZERO real data rows yet —
+      // exactly what generateCustomerSheetStructure creates for a brand-new customer, ahead of any
+      // real transaction. In that case there's no real previous row to reference: nextRowIdx just
+      // points at the row right after the header, so `=${closingCol}${match.nextRowIdx}` would
+      // reference the HEADER row's cell (literally the text "Closing"), not a balance. The first row
+      // of a truly empty block needs a literal 0 opening balance, same as a brand-new block created
+      // from scratch below; only rows after that (whether pre-existing or added earlier in this same
+      // push) can safely reference a previous row.
+      const hasRealPriorRow = match.existingDates.size > 0;
+      let prevRow1 = match.nextRowIdx; // 0-indexed row (match.nextRowIdx - 1) -> 1-indexed = match.nextRowIdx
+      const values = newRows.map((r, i) => {
+        const row = r || [];
+        const thisRow1 = match.nextRowIdx + i + 1;
+        const opening = (i === 0 && !hasRealPriorRow) ? 0 : `=${closingCol}${prevRow1}`;
         const out = [
           forceTextValue(row[0] || ''),
           opening,
@@ -669,64 +615,23 @@ function computeMergePatches(existingGrid, variants) {
           `=${openingCol}${thisRow1}+${prodCol}${thisRow1}-${dispCol}${thisRow1}`,
         ];
         for (let ci = 5; ci < row.length; ci++) out.push(row[ci]);
-        values.push({ row0, out });
-        newExistingRows.push({ rowIdx: row0, dateKey: nr.dateKey });
-        lastRow0ByEntry[nr.vi] = row0;
+        prevRow1 = thisRow1;
+        return out;
       });
-    });
-    // Each new row is its own single-row patch (rather than one contiguous block) since chronological
-    // insertion can scatter them across several disjoint gaps in the same block, not just one
-    // trailing range.
-    values.forEach(({ row0, out }) => patches.push({ startRow0: row0, startCol0: match.startCol, values: [out] }));
-
-    perEntry.forEach(({ v }, vi) => {
-      const lastRow0 = lastRow0ByEntry[vi] !== undefined ? lastRow0ByEntry[vi] : match.nextRowIdx - 1;
-      placements.push({ title: v.title, startCol0: match.startCol, width: match.width, lastWrittenRow1: lastRow0 + 1 });
-    });
-
-    // If a LATER variant in this same push also resolves to this block via the "brand new title"
-    // path below (blocks.find picking up a block created earlier in THIS push), it needs to see this
-    // block's TRUE post-insert state — including every existing row's shifted position — not the
-    // pre-insert snapshot. Advancing the same `match` object here (the same one `blocks.find` returns
-    // next time) is what makes that safe.
-    match.nextRowIdx += totalInserted;
-    match.existingRowsOrdered = match.existingRowsOrdered
-      .map(er => ({ rowIdx: adjustExistingRowIdx(er.rowIdx), dateKey: er.dateKey }))
-      .concat(newExistingRows)
-      .sort((a, b) => a.rowIdx - b.rowIdx);
-    allNew.forEach(nr => {
-      match.existingDates.add(nr.dateKey);
-      match.existingValuesByDate.set(nr.dateKey, { production: Number((nr.row || [])[2]) || 0, dispatch: Number((nr.row || [])[3]) || 0 });
-    });
-  }
-
-  // Group every variant that already matches a real block upfront, so two variants sharing one block
-  // (two catalog entries mapped to the same real item, or two differently-worded register lines) are
-  // always processed together via processBlockGroup — see its comment for why that matters.
-  const existingGroups = new Map(); // match -> [{ v, incomingRows }]
-  const rest = [];
-  (Array.isArray(variants) ? variants : []).forEach(v => {
-    const key = normalizeTabKey(v.title);
-    const match = blocks.find(b => normalizeTabKey(b.title) === key);
-    const incomingRows = Array.isArray(v.rows) ? v.rows : [];
-    if (match) {
-      if (!existingGroups.has(match)) existingGroups.set(match, []);
-      existingGroups.get(match).push({ v, incomingRows });
+      patches.push({ startRow0: match.nextRowIdx, startCol0: match.startCol, values });
+      placements.push({ title: v.title, startCol0: match.startCol, width: match.width, lastWrittenRow1: match.nextRowIdx + newRows.length });
+      // If a SECOND variant in this same push also resolves to this block (two catalog entries
+      // mapped to the same real block, or two differently-worded register lines for the same item),
+      // it must continue appending after THESE rows, not start over at the same spot and overwrite
+      // them. Advancing the block's own bookkeeping here — same object `blocks.find` will return next
+      // time — is what makes that safe.
+      match.nextRowIdx += newRows.length;
+      newRows.forEach(r => {
+        const k = canonicalDateKey((r || [])[0]);
+        match.existingDates.add(k);
+        match.existingValuesByDate.set(k, { production: Number((r || [])[2]) || 0, dispatch: Number((r || [])[3]) || 0 });
+      });
     } else {
-      rest.push({ v, incomingRows });
-    }
-  });
-  existingGroups.forEach((entries, match) => processBlockGroup(match, entries));
-
-  rest.forEach(({ v, incomingRows }) => {
-    const key = normalizeTabKey(v.title);
-    const header = (v.header && v.header.length) ? v.header : ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'];
-    // A PRECEDING variant with no pre-existing block, but the SAME title, may have already created
-    // this exact block earlier in this same loop (matching the original append-only behavior) — route
-    // it through the normal combined-block path instead of creating a second, duplicate block.
-    const rematch = blocks.find(b => normalizeTabKey(b.title) === key);
-    if (rematch) { processBlockGroup(rematch, [{ v, incomingRows }]); return; }
-    {
       const startCol = rightmostCol === -1 ? 0 : rightmostCol + 1;
       const width = Math.max(header.length, ...incomingRows.map(r => (r || []).length), 1);
       const openingCol = colLetter(startCol + 1);
@@ -754,16 +659,10 @@ function computeMergePatches(existingGrid, variants) {
       if (values.length) patches.push({ startRow0: dataStartRow0, startCol0: startCol, values });
       placements.push({ title: v.title, startCol0: startCol, width, lastWrittenRow1: dataStartRow0 + values.length });
       rightmostCol = startCol + width;
-      const newExistingRows = incomingRows.map((r, i) => ({ rowIdx: dataStartRow0 + i, dateKey: canonicalDateKey((r || [])[0]) }));
-      const newExistingValues = new Map(incomingRows.map((r, i) => [canonicalDateKey((r || [])[0]), { production: Number((r || [])[2]) || 0, dispatch: Number((r || [])[3]) || 0, rowIdx: dataStartRow0 + i }]));
-      blocks.push({
-        title: v.title, startCol, width, nextRowIdx: dataStartRow0 + values.length,
-        existingDates: new Set(newExistingRows.map(er => er.dateKey)), existingValuesByDate: newExistingValues,
-        existingRowsOrdered: newExistingRows, lastRowValues: null,
-      });
+      blocks.push({ title: v.title, startCol, width, nextRowIdx: dataStartRow0 + values.length, existingDates: new Set(), existingValuesByDate: new Map(), lastRowValues: null });
     }
   });
-  return { patches, placements, mismatches, insertRequests };
+  return { patches, placements, mismatches };
 }
 
 // Highlight color for the "what's new since last push" formatting below — a warm tint matching this
@@ -920,25 +819,10 @@ async function pushCustomerSheet(spreadsheetId, itemGroups) {
   const formatRequests = [];
   const dataUpdates = [];
   const patchesByTab = {};
-  const structuralInsertRequests = [];
   for (const plan of tabPlans) {
     const previousGrid = previousValuesByTab[plan.tabName] || [];
-    const { patches, placements, mismatches, insertRequests } = computeMergePatches(previousGrid, plan.variants);
+    const { patches, placements, mismatches } = computeMergePatches(previousGrid, plan.variants);
     patchesByTab[plan.tabName] = patches;
-    // Real "make room" requests — inserting blank rows so a chronologically-earlier new date lands
-    // BEFORE whatever's already physically below it, instead of always after. Must happen (and finish)
-    // before any values get written, since every row target in `patches` already assumes these inserts
-    // have already happened. Scoped to the exact column range of the block they belong to, so a block
-    // sitting side-by-side with others in the same tab never shifts rows that aren't its own.
-    const sheetId = existingMeta[plan.tabName] && existingMeta[plan.tabName].sheetId;
-    (insertRequests || []).forEach(ir => {
-      structuralInsertRequests.push({
-        insertRange: {
-          range: { sheetId, startRowIndex: ir.beforeRowIdx, endRowIndex: ir.beforeRowIdx + ir.count, startColumnIndex: ir.startCol0, endColumnIndex: ir.startCol0 + ir.width },
-          shiftDimension: 'ROWS',
-        },
-      });
-    });
     patches.forEach(p => {
       const startColL = colLetter(p.startCol0);
       const endColL = colLetter(p.startCol0 + Math.max(0, ...p.values.map(r => r.length)) - 1);
@@ -953,14 +837,6 @@ async function pushCustomerSheet(spreadsheetId, itemGroups) {
     // never written (existing rows are never touched), always reported, so a push can never silently
     // report success while quietly leaving a real discrepancy behind.
     results.push({ tab: plan.tabName, ok: true, newRows: patches.reduce((s, p) => s + p.values.length, 0), placements, mismatches });
-  }
-  if (structuralInsertRequests.length) {
-    try {
-      await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: structuralInsertRequests } });
-    } catch (e) {
-      const msg = friendlyGoogleError(e);
-      return tabPlans.map(plan => ({ tab: plan.tabName, ok: false, error: msg }));
-    }
   }
   if (dataUpdates.length) {
     try {
@@ -1133,116 +1009,49 @@ async function generateCustomerSheetStructureHandler(req, res) {
 // tagged with its status ('new' / 'duplicate' / 'mismatch' / 'unverifiable'), so the review screen can
 // show the real entry for every single row and just flag the ones that need a look, instead of ever
 // summarizing a row away as plain text.
-// Builds the exact display rows for one variant, in TRUE chronological order — merging our own
-// classified rows with the sheet's real timeline. This is what makes "fetch the opening/production
-// from the real row instead of computing it" and "a brand-new row's opening comes from whatever
-// precedes it chronologically" both true on the preview screen, not just on the actual push:
-//   - A date we already have a classified row for (any status) shows the SHEET's own opening/closing
-//     directly (never this app's from-scratch running total) — a 'fillable' column shows what we're
-//     about to write there instead of the sheet's current 0/blank, with Closing recomputed only enough
-//     to reflect that one fill, exactly like the real Closing formula will once the write lands.
-//   - A brand-new date chains its Opening off whatever the closing balance truly was immediately
-//     before it — which might be another new row earlier in this same batch, or a real sheet row this
-//     app has never confirmed a matching entry for at all (a hand-typed row with no ledger counterpart
-//     still has to be walked past so its closing carries forward correctly, even though it isn't shown
-//     as one of "our" rows).
-function buildDisplayRows(match, classified) {
-  const rows = [];
-  const classifiedByDate = new Map(classified.map(c => [canonicalDateKey(c.row[0]), c]));
-  const sheetOnlyDates = (match ? match.existingRowsOrdered : [])
-    .map(er => er.dateKey)
-    .filter(dk => !classifiedByDate.has(dk));
-  const timeline = classified.map(c => canonicalDateKey(c.row[0]))
-    .concat(sheetOnlyDates)
-    .sort((a, b) => a.localeCompare(b));
-  let lastClosing = 0;
-  timeline.forEach(dateKey => {
-    const c = classifiedByDate.get(dateKey);
-    if (!c) {
-      // A real sheet row for a date we have no ledger entry for at all — nothing of ours to show, but
-      // its closing balance still has to carry forward into whatever we chain after it.
-      const vals = match.existingValuesByDate.get(dateKey);
-      if (vals && vals.closing !== undefined) lastClosing = vals.closing;
-      return;
-    }
-    const row = c.row;
-    const production0 = Number(row[2]) || 0;
-    const dispatch0 = Number(row[3]) || 0;
-    if (c.status === 'new') {
-      const opening = lastClosing;
-      const closing = opening + production0 - dispatch0;
-      rows.push({ date: row[0] || '', opening, production: production0, dispatch: dispatch0, closing, status: c.status, existing: null });
-      lastClosing = closing;
-    } else {
-      const ex = c.existing || {};
-      const production = c.fillProduction ? c.expected.production : (ex.production !== undefined ? ex.production : production0);
-      const dispatch = c.fillDispatch ? c.expected.dispatch : (ex.dispatch !== undefined ? ex.dispatch : dispatch0);
-      const opening = ex.opening !== undefined ? ex.opening : lastClosing;
-      const closing = c.status === 'fillable' ? (opening + production - dispatch) : (ex.closing !== undefined ? ex.closing : (opening + production - dispatch));
-      rows.push({ date: row[0] || '', opening, production, dispatch, closing, status: c.status, existing: c.existing || null, fillProduction: !!c.fillProduction, fillDispatch: !!c.fillDispatch });
-      lastClosing = closing;
-    }
-  });
-  return rows;
-}
-
 function previewCustomerSheet(previousValuesByTab, tabPlans, missing) {
   return tabPlans.map(plan => {
     const previousGrid = previousValuesByTab[plan.tabName] || [];
     const { blocks } = parseExistingBlocks(previousGrid);
-    // Same reasoning as computeMergePatches: two variants that resolve to the SAME real block (two
-    // catalog entries for one item, or two differently-worded register lines) have to be walked as ONE
-    // combined chronological timeline, not one at a time — otherwise a variant processed first could
-    // show a stale Opening/Closing that never accounts for the other variant's date landing in between,
-    // even though preview and an actual push must never disagree about what the real numbers are.
-    const resultByVariant = new Map(); // v -> rows[]
-    const existingGroups = new Map(); // match -> [v, ...]
-    const restVariants = [];
-    (plan.variants || []).forEach(v => {
-      const key = normalizeTabKey(v.title);
-      const match = blocks.find(b => normalizeTabKey(b.title) === key);
-      if (match) {
-        if (!existingGroups.has(match)) existingGroups.set(match, []);
-        existingGroups.get(match).push(v);
-      } else {
-        restVariants.push(v);
-      }
-    });
-    const processGroup = (match, vs) => {
-      const combined = [];
-      vs.forEach((v, vi) => {
-        const incomingRows = Array.isArray(v.rows) ? v.rows : [];
-        classifyIncomingRows(match, incomingRows).forEach(c => combined.push({ ...c, vi }));
-      });
-      combined.sort((a, b) => canonicalDateKey(a.row[0]).localeCompare(canonicalDateKey(b.row[0])));
-      const rows = buildDisplayRows(match, combined);
-      vs.forEach((v, vi) => resultByVariant.set(v, rows.filter((r, i) => combined[i].vi === vi)));
-      // Preview never issues a real Sheets write, so the exact row index doesn't matter here
-      // (rowIdx: -1) — only the dateKey ordering classifyIncomingRows/planChronologicalInserts rely on.
-      if (match && rows.length) {
-        rows.forEach((r, i) => {
-          const k = canonicalDateKey(combined[i].row[0]);
-          match.existingDates.add(k);
-          match.existingValuesByDate.set(k, { production: r.production, dispatch: r.dispatch, opening: r.opening, closing: r.closing, rowIdx: -1 });
-        });
-        const newDateKeys = combined.filter(c => c.status === 'new').map(c => canonicalDateKey(c.row[0]));
-        match.existingRowsOrdered = match.existingRowsOrdered
-          .concat(newDateKeys.map(dateKey => ({ rowIdx: -1, dateKey })))
-          .sort((a, b) => a.dateKey.localeCompare(b.dateKey));
-      }
-    };
-    existingGroups.forEach((vs, match) => processGroup(match, vs));
-    restVariants.forEach(v => {
-      const key = normalizeTabKey(v.title);
-      const rematch = blocks.find(b => normalizeTabKey(b.title) === key);
-      if (rematch) { processGroup(rematch, [v]); return; }
-      const incomingRows = Array.isArray(v.rows) ? v.rows : [];
-      resultByVariant.set(v, buildDisplayRows(null, classifyIncomingRows(null, incomingRows)));
-    });
     const variants = (plan.variants || []).map(v => {
       const key = normalizeTabKey(v.title);
       const match = blocks.find(b => normalizeTabKey(b.title) === key);
-      return { title: v.title, isNewBlock: !match, rows: resultByVariant.get(v) || [] };
+      const incomingRows = Array.isArray(v.rows) ? v.rows : [];
+      const classified = classifyIncomingRows(match, incomingRows);
+      // Running balance is OUR chain — computed from every row we know about, in order — continuing
+      // from the real sheet's last existing closing balance so it lines up visually with what's
+      // already there. A 'mismatch' row still carries what the sheet itself has for that date
+      // (existing), shown right alongside our own numbers, so nothing has to be taken on faith.
+      let running = (match && match.lastRowValues) ? (Number(match.lastRowValues[match.width - 1]) || 0) : 0;
+      const rows = classified.map(c => {
+        const row = c.row;
+        const opening = running;
+        const production = Number(row[2]) || 0;
+        const dispatch = Number(row[3]) || 0;
+        running = opening + production - dispatch;
+        return { date: row[0] || '', opening, production, dispatch, closing: running, status: c.status, existing: c.existing || null };
+      });
+      // Same reasoning as computeMergePatches: if another variant in this same customer's payload
+      // also resolves to this block, it needs to see these rows as already staged — both so its own
+      // running balance continues from here instead of the real sheet's last row, and so it doesn't
+      // re-offer the same dates as "new".
+      if (match && rows.length) {
+        classified.forEach(c => {
+          const k = canonicalDateKey(c.row[0]);
+          match.existingDates.add(k);
+          if (c.status === 'new') match.existingValuesByDate.set(k, { production: Number(c.row[2]) || 0, dispatch: Number(c.row[3]) || 0 });
+          if (c.status === 'fillable') {
+            const prevVals = match.existingValuesByDate.get(k);
+            match.existingValuesByDate.set(k, { ...prevVals, production: Number(c.row[2]) || 0, productionBlank: false });
+          }
+        });
+        const last = rows[rows.length - 1];
+        const synthesized = new Array(match.width).fill(null);
+        synthesized[0] = last.date;
+        synthesized[match.width - 1] = last.closing;
+        match.lastRowValues = synthesized;
+      }
+      return { title: v.title, isNewBlock: !match, rows };
     });
     return { tabName: plan.tabName, isNewTab: missing.includes(plan.tabName), variants };
   });
@@ -1436,4 +1245,4 @@ async function putBlocksTab(req, res) {
   }
 }
 
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler };
+module.exports = { planChronologicalInserts, finalizeInsertPlacement, classifyIncomingRows, parseExistingBlocks, computeMergePatches, previewCustomerSheet, canonicalDateKey, readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler };

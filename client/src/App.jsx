@@ -770,6 +770,22 @@ const GUIDE_STEPS = [
 function Pill({ tone = 'neutral', children, title }) {
   return <span className={`pill pill-${tone}`} title={title}>{children}</span>;
 }
+// A 'fillable' row's Sheet already has a row for this date — just missing production, missing dispatch,
+// or missing both — so the label always says exactly which column(s) will actually get written, instead
+// of a generic "gap" that could mean either.
+function fillableLabel(r) {
+  if (r.fillProduction && r.fillDispatch) return 'Fills gap (both)';
+  if (r.fillProduction) return 'Fills production';
+  if (r.fillDispatch) return 'Fills dispatch';
+  return 'Fills gap';
+}
+function fillableTitle(r) {
+  const parts = [];
+  if (r.fillProduction) parts.push(`Production (${r.production})`);
+  if (r.fillDispatch) parts.push(`Dispatch (${r.dispatch})`);
+  const cols = parts.length ? parts.join(' and ') : 'this cell';
+  return `This date already has a row in the Sheet, but ${cols} ${parts.length > 1 ? 'were' : 'was'} blank — will fill in just ${parts.length > 1 ? 'those cells' : 'that cell'}, without touching anything else on the row.`;
+}
 // Bold section separator used on Customer Stock to keep its three very different zones (needs your
 // input, nobody's claimed this at all, and the running per-customer ledgers) from blurring into one
 // long wall of similar-looking panels.
@@ -1887,16 +1903,22 @@ function FIMSApp() {
       if (!groups[key]) groups[key] = { id: key, customer, description: stripPackCount(row.description) || row.description, byDate: {} };
       const dateKey = dateSortKey(row.date);
       if (!groups[key].byDate[dateKey]) {
-        groups[key].byDate[dateKey] = { date: row.date, pieces: 0, dispatch: 0, productionIds: [], dispatchIds: [] };
+        groups[key].byDate[dateKey] = { date: row.date, pieces: 0, dispatch: 0, productionIds: [], dispatchIds: [], hasDispatch: false };
       }
       const entry = groups[key].byDate[dateKey];
       if (source === 'production') {
         entry.pieces += num(row.pieces);
-        entry.dispatch += num(row.dispatch); // the Production Register's own handwritten dispatch column, if noted
         entry.productionIds.push(row.id);
+        // The Production Register's own handwritten dispatch column, if noted — a second, independent
+        // source of dispatch for the same date. Only counts as a real dispatch opinion when it's
+        // actually non-zero; a blank/0 handwritten field isn't "we know dispatch was zero," it's just
+        // that column going unused, same as everywhere else in this app.
+        const handDispatch = num(row.dispatch);
+        if (handDispatch) { entry.dispatch += handDispatch; entry.hasDispatch = true; }
       } else {
         entry.dispatch += num(row.quantity);
         entry.dispatchIds.push(row.id);
+        entry.hasDispatch = true;
       }
     };
     confirmedProductionRows.forEach(row => addEntry(row, 'production'));
@@ -2030,7 +2052,17 @@ function FIMSApp() {
       tabsMap[sheetGroup].push({
         title: g.description || 'Item',
         header: ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
-        rows: g.ledger.map(e => [normalizeDateToDots(e.date), e.opening, e.pieces || 0, e.dispatch || 0, e.closing]),
+        // null (not 0) whenever this date has NO real production/dispatch entry behind it at all — a
+        // dispatch bill has no opinion on production, and vice versa. Sending a literal 0 in that case
+        // would read as "confirmed zero," which the server would then compare against whatever the real
+        // Sheet already has for that column — exactly the false "mismatch" a pure dispatch-only upload
+        // must never trigger just because it has nothing to say about production.
+        rows: g.ledger.map(e => [
+          normalizeDateToDots(e.date), e.opening,
+          (e.productionIds && e.productionIds.length) ? (e.pieces || 0) : null,
+          e.hasDispatch ? (e.dispatch || 0) : null,
+          e.closing,
+        ]),
       });
     });
     const itemGroups = Object.entries(tabsMap).map(([tabName, variants]) => ({ tabName, variants }));
@@ -3566,7 +3598,7 @@ function FIMSApp() {
                                         <td style={{ padding: '2px 6px' }}>{r.closing}</td>
                                         <td style={{ padding: '2px 6px' }}>
                                           {r.status === 'new' && <Pill tone="ok">New</Pill>}
-                                          {r.status === 'fillable' && <Pill tone="ok" title={`This date already has a row in the Sheet, but its Production cell is blank — will fill in just that one cell (${r.production}) without touching anything else on the row.`}>Fills gap</Pill>}
+                                          {r.status === 'fillable' && <Pill tone="ok" title={fillableTitle(r)}>{fillableLabel(r)}</Pill>}
                                           {isDuplicate && <Pill tone="neutral" title={`Already in the Sheet — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed again, so this row is disabled.`}>Duplicate</Pill>}
                                           {r.status === 'mismatch' && <Pill tone="warn" title={`Sheet already has a recorded value here that disagrees — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed unless you fix it here.`}>Mismatch</Pill>}
                                           {r.status === 'unverifiable' && <Pill tone="warn" title="Sheet already has this date, but its columns couldn't be read to check. Won't be pushed — verify by hand.">Can't verify</Pill>}
@@ -3965,7 +3997,7 @@ function FIMSApp() {
                                       <td style={{ padding: '2px 6px' }}>{r.closing}</td>
                                       <td style={{ padding: '2px 6px' }}>
                                         {r.status === 'new' && <Pill tone="ok">New</Pill>}
-                                        {r.status === 'fillable' && <Pill tone="ok" title={`This date already has a row in the Sheet, but its Production cell is blank — will fill in just that one cell (${r.production}) without touching anything else on the row.`}>Fills gap</Pill>}
+                                        {r.status === 'fillable' && <Pill tone="ok" title={fillableTitle(r)}>{fillableLabel(r)}</Pill>}
                                         {isDuplicate && <Pill tone="neutral" title={`Already in the Sheet — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed again.`}>Duplicate</Pill>}
                                         {r.status === 'mismatch' && <Pill tone="warn" title={`Sheet already has a recorded value here that disagrees — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}.`}>Mismatch</Pill>}
                                         {r.status === 'unverifiable' && <Pill tone="warn" title="Sheet already has this date, but its columns couldn't be read to check.">Can't verify</Pill>}
