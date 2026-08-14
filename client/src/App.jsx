@@ -767,8 +767,8 @@ const GUIDE_STEPS = [
   },
 ];
 /* ============================== small components ============================== */
-function Pill({ tone = 'neutral', children }) {
-  return <span className={`pill pill-${tone}`}>{children}</span>;
+function Pill({ tone = 'neutral', children, title }) {
+  return <span className={`pill pill-${tone}`} title={title}>{children}</span>;
 }
 // Bold section separator used on Customer Stock to keep its three very different zones (needs your
 // input, nobody's claimed this at all, and the running per-customer ledgers) from blurring into one
@@ -3350,8 +3350,8 @@ function FIMSApp() {
                   const { unmatched: unmatchedForCount } = buildCustomerSheetPayload(customer);
                   const reviewForCustomer = reviewByCustomer[customer];
                   const reviewTabsForCount = (reviewForCustomer && reviewForCustomer.tabs) || [];
-                  const mismatchCountForCustomer = reviewTabsForCount.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + ((v.mismatches || []).length), 0), 0);
-                  const newRowsCountForCustomer = reviewTabsForCount.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + ((v.rows || []).length), 0), 0);
+                  const mismatchCountForCustomer = reviewTabsForCount.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'mismatch' || r.status === 'unverifiable').length, 0), 0);
+                  const newRowsCountForCustomer = reviewTabsForCount.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'new').length, 0), 0);
                   const needsAttention = unmatchedForCount.length > 0 || mismatchCountForCustomer > 0;
                   return (
                   <details className="panel customer-review-panel" key={`stock-review-${customer}`} open={needsAttention}>
@@ -3459,17 +3459,17 @@ function FIMSApp() {
                       const review = reviewByCustomer[customer];
                       if (!review) return null;
                       const reviewTabs = review.tabs || [];
-                      const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => v.rows.length > 0));
-                      const mismatchCount = reviewTabs.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + ((v.mismatches || []).length), 0), 0);
+                      const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => (v.rows || []).some(r => r.status === 'new')));
+                      const mismatchCount = reviewTabs.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'mismatch' || r.status === 'unverifiable').length, 0), 0);
                       return (
                         <div>
                           {review.loading && <div className="doc-hint"><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle', marginRight: 6 }} />checking against the real Sheet…</div>}
                           {review.error && <div className="error-box"><AlertCircle size={16} /><span>{review.error}</span></div>}
                           {!review.error && !hasAnyNewRows && !mismatchCount && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet.</div>}
                           {!review.error && !!mismatchCount && (
-                            <div className="error-box"><AlertCircle size={16} /><span>{mismatchCount} date{mismatchCount === 1 ? '' : 's'} already {mismatchCount === 1 ? 'has' : 'have'} a row in the real Sheet, but the numbers don't match what's on record here — nothing was pushed for {mismatchCount === 1 ? 'it' : 'them'}. Details below.</span></div>
+                            <div className="error-box"><AlertCircle size={16} /><span>{mismatchCount} row{mismatchCount === 1 ? '' : 's'} below {mismatchCount === 1 ? 'is' : 'are'} flagged — already dated in the real Sheet but with different numbers (or unreadable). Nothing flagged gets pushed; edit or delete the row if it needs fixing.</span></div>
                           )}
-                          {reviewTabs.map(tab => (tab.variants || []).filter(v => v.rows.length > 0 || (v.mismatches || []).length > 0).map(v => (
+                          {reviewTabs.map(tab => (tab.variants || []).filter(v => (v.rows || []).length > 0).map(v => (
                             <div key={`${tab.tabName}::${v.title}`} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
                               <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
                                 <strong>{v.title}</strong>
@@ -3496,39 +3496,24 @@ function FIMSApp() {
                                     <th style={{ padding: '2px 6px', fontWeight: 500 }}>Production</th>
                                     <th style={{ padding: '2px 6px', fontWeight: 500 }}>Dispatch</th>
                                     <th style={{ padding: '2px 6px', fontWeight: 500 }}>Closing</th>
+                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Status</th>
                                     <th style={{ padding: '2px 6px', fontWeight: 500 }}>Move to</th>
                                     <th style={{ padding: '2px 6px', fontWeight: 500 }} className="col-action"></th>
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  {v.lastExisting && (
-                                    <tr style={{ opacity: 0.55 }} title="Already in the real Sheet — shown for reference, never touched">
-                                      <td style={{ padding: '2px 6px' }}>{v.lastExisting.date}</td>
-                                      <td style={{ padding: '2px 6px' }} colSpan={3}>(already in the Sheet)</td>
-                                      <td style={{ padding: '2px 6px' }}>{v.lastExisting.closing}</td>
-                                      <td colSpan={2} />
-                                    </tr>
-                                  )}
-                                  {(v.mismatches || []).map((m, mi) => (
-                                    <tr key={`mismatch-${mi}`} style={{ background: 'var(--warn-soft)' }}>
-                                      <td style={{ padding: '2px 6px', whiteSpace: 'nowrap' }}>
-                                        <AlertCircle size={12} color="var(--ledger-red)" style={{ verticalAlign: 'middle', marginRight: 4 }} />{m.date}
-                                      </td>
-                                      <td style={{ padding: '2px 6px' }} colSpan={6}>
-                                        {m.reason === 'unverifiable'
-                                          ? `Already has a row for this date, but its Production/Dispatch columns couldn't be read to check — verify by hand. On record here: production ${m.expected.production}, dispatch ${m.expected.dispatch}.`
-                                          : `Already has a row for this date, but the numbers don't match. Sheet has: production ${m.existing.production}, dispatch ${m.existing.dispatch}. On record here: production ${m.expected.production}, dispatch ${m.expected.dispatch}.`}
-                                      </td>
-                                    </tr>
-                                  ))}
                                   {v.rows.map((r, i) => {
                                     const variantEdits = (reviewEdits[customer] && reviewEdits[customer][v.title]) || {};
                                     const edit = (variantEdits.rowEdits && variantEdits.rowEdits[i]) || {};
                                     const isDeleted = !!(variantEdits.deletedRows && variantEdits.deletedRows[i]);
                                     const moveKey = `${customer}::${v.title}::${i}`;
                                     const rowDateValue = edit.date ?? r.date;
+                                    const rowBg = isDeleted ? 'rgba(162,59,46,0.08)'
+                                      : r.status === 'mismatch' || r.status === 'unverifiable' ? 'var(--warn-soft)'
+                                      : r.status === 'duplicate' ? 'transparent'
+                                      : 'rgba(214,163,80,0.14)';
                                     return (
-                                      <tr key={i} style={{ background: isDeleted ? 'rgba(162,59,46,0.08)' : 'rgba(214,163,80,0.14)', opacity: isDeleted ? 0.55 : 1 }}>
+                                      <tr key={i} style={{ background: rowBg, opacity: isDeleted ? 0.55 : 1 }}>
                                         <td style={{ padding: '2px 6px' }}>
                                           <input className="cell-input" style={{ width: 100 }} value={rowDateValue} onChange={e => setRowEdit(customer, v.title, i, 'date', e.target.value)} disabled={isDeleted} />
                                         </td>
@@ -3540,6 +3525,12 @@ function FIMSApp() {
                                           <input className="cell-input" style={{ width: 80 }} type="number" value={edit.dispatch ?? r.dispatch} onChange={e => setRowEdit(customer, v.title, i, 'dispatch', e.target.value)} disabled={isDeleted} />
                                         </td>
                                         <td style={{ padding: '2px 6px' }}>{r.closing}</td>
+                                        <td style={{ padding: '2px 6px' }}>
+                                          {r.status === 'new' && <Pill tone="ok">New</Pill>}
+                                          {r.status === 'duplicate' && <Pill tone="neutral" title={`Already in the Sheet with the same numbers — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed again.`}>Duplicate</Pill>}
+                                          {r.status === 'mismatch' && <Pill tone="warn" title={`Sheet already has this date, but with different numbers — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed unless you fix it here.`}>Mismatch</Pill>}
+                                          {r.status === 'unverifiable' && <Pill tone="warn" title="Sheet already has this date, but its columns couldn't be read to check. Won't be pushed — verify by hand.">Can't verify</Pill>}
+                                        </td>
                                         <td style={{ padding: '2px 6px' }}>
                                           <div style={{ display: 'flex', gap: 4 }}>
                                             <input
@@ -3850,8 +3841,8 @@ function FIMSApp() {
                 const registryEntry = customerSheetIds.find(c => c.customer === customer);
                 const review = reviewByCustomer[customer];
                 const reviewTabs = (review && review.tabs) || [];
-                const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => v.rows.length > 0));
-                const mismatchCount = reviewTabs.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + ((v.mismatches || []).length), 0), 0);
+                const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => (v.rows || []).some(r => r.status === 'new')));
+                const mismatchCount = reviewTabs.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'mismatch' || r.status === 'unverifiable').length, 0), 0);
                 return (
                   <div className="panel" key={customer}>
                     <div className="panel-header">
@@ -3891,10 +3882,10 @@ function FIMSApp() {
                         {review.error && <div className="error-box"><AlertCircle size={16} /><span>{review.error}</span></div>}
                         {!review.error && !hasAnyNewRows && !mismatchCount && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet. Need to fix something first? See the Customer Stock tab.</div>}
                         {!review.error && !!mismatchCount && (
-                          <div className="error-box"><AlertCircle size={16} /><span>{mismatchCount} date{mismatchCount === 1 ? '' : 's'} already {mismatchCount === 1 ? 'has' : 'have'} a row in the real Sheet, but the numbers don't match what's on record here — nothing was pushed for {mismatchCount === 1 ? 'it' : 'them'}. Details below; fix on the Customer Stock tab.</span></div>
+                          <div className="error-box"><AlertCircle size={16} /><span>{mismatchCount} row{mismatchCount === 1 ? '' : 's'} below {mismatchCount === 1 ? 'is' : 'are'} flagged — already dated in the real Sheet but with different numbers (or unreadable). Nothing flagged gets pushed; fix on the Customer Stock tab.</span></div>
                         )}
                         {hasAnyNewRows && <p className="doc-hint" style={{ marginBottom: 8 }}>Read-only — to edit, delete, add, or move a row before pushing, use the Customer Stock tab.</p>}
-                        {reviewTabs.map(tab => (tab.variants || []).filter(v => v.rows.length > 0 || (v.mismatches || []).length > 0).map(v => (
+                        {reviewTabs.map(tab => (tab.variants || []).filter(v => (v.rows || []).length > 0).map(v => (
                           <div key={`${tab.tabName}::${v.title}`} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
                             <div style={{ marginBottom: 6 }}>
                               <strong>{v.title}</strong>{' '}
@@ -3911,40 +3902,31 @@ function FIMSApp() {
                                   <th style={{ padding: '2px 6px', fontWeight: 500 }}>Production</th>
                                   <th style={{ padding: '2px 6px', fontWeight: 500 }}>Dispatch</th>
                                   <th style={{ padding: '2px 6px', fontWeight: 500 }}>Closing</th>
+                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Status</th>
                                 </tr>
                               </thead>
                               <tbody>
-                                {v.lastExisting && (
-                                  <tr style={{ opacity: 0.55 }} title="Already in the real Sheet">
-                                    <td style={{ padding: '2px 6px' }}>{v.lastExisting.date}</td>
-                                    <td style={{ padding: '2px 6px' }} colSpan={3}>(already in the Sheet)</td>
-                                    <td style={{ padding: '2px 6px' }}>{v.lastExisting.closing}</td>
-                                  </tr>
-                                )}
-                                {(v.mismatches || []).map((m, mi) => (
-                                  <tr key={`mismatch-${mi}`} style={{ background: 'var(--warn-soft)' }}>
-                                    <td style={{ padding: '2px 6px', whiteSpace: 'nowrap' }}>
-                                      <AlertCircle size={12} color="var(--ledger-red)" style={{ verticalAlign: 'middle', marginRight: 4 }} />{m.date}
-                                    </td>
-                                    <td style={{ padding: '2px 6px' }} colSpan={4}>
-                                      {m.reason === 'unverifiable'
-                                        ? `Already has a row for this date, but its Production/Dispatch columns couldn't be read to check — verify by hand. On record here: production ${m.expected.production}, dispatch ${m.expected.dispatch}.`
-                                        : `Already has a row for this date, but the numbers don't match. Sheet has: production ${m.existing.production}, dispatch ${m.existing.dispatch}. On record here: production ${m.expected.production}, dispatch ${m.expected.dispatch}.`}
-                                    </td>
-                                  </tr>
-                                ))}
                                 {v.rows.map((r, i) => {
                                   const variantEdits = (reviewEdits[customer] && reviewEdits[customer][v.title]) || {};
                                   const edit = (variantEdits.rowEdits && variantEdits.rowEdits[i]) || {};
                                   const isDeleted = !!(variantEdits.deletedRows && variantEdits.deletedRows[i]);
                                   if (isDeleted) return null;
+                                  const rowBg = r.status === 'mismatch' || r.status === 'unverifiable' ? 'var(--warn-soft)'
+                                    : r.status === 'duplicate' ? 'transparent'
+                                    : 'rgba(214,163,80,0.14)';
                                   return (
-                                    <tr key={i} style={{ background: 'rgba(214,163,80,0.14)' }}>
+                                    <tr key={i} style={{ background: rowBg }}>
                                       <td style={{ padding: '2px 6px' }}>{edit.date ?? r.date}</td>
                                       <td style={{ padding: '2px 6px' }}>{r.opening}</td>
                                       <td style={{ padding: '2px 6px' }}>{edit.production ?? r.production}</td>
                                       <td style={{ padding: '2px 6px' }}>{edit.dispatch ?? r.dispatch}</td>
                                       <td style={{ padding: '2px 6px' }}>{r.closing}</td>
+                                      <td style={{ padding: '2px 6px' }}>
+                                        {r.status === 'new' && <Pill tone="ok">New</Pill>}
+                                        {r.status === 'duplicate' && <Pill tone="neutral" title={`Already in the Sheet with the same numbers — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}.`}>Duplicate</Pill>}
+                                        {r.status === 'mismatch' && <Pill tone="warn" title={`Sheet already has this date, but with different numbers — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}.`}>Mismatch</Pill>}
+                                        {r.status === 'unverifiable' && <Pill tone="warn" title="Sheet already has this date, but its columns couldn't be read to check.">Can't verify</Pill>}
+                                      </td>
                                     </tr>
                                   );
                                 })}

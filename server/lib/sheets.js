@@ -399,22 +399,22 @@ function parseExistingBlocks(grid) {
 // incoming rows are genuinely new, which are correctly already-there, and which are a MISMATCH — a
 // date that already has a row in the real sheet, but with different production/dispatch numbers than
 // what we're about to send. A mismatch is never pushed (existing rows are never touched) and never
-// silently treated as "already handled" either — it's reported back so a person can look at the real
-// sheet and decide, the same way an unmatched item gets flagged instead of guessed at.
+// silently treated as "already handled" either. Every single incoming row gets a status back — nothing
+// is ever dropped from the result — so the UI can show the real entry for every row, always, and just
+// flag the ones that need a second look instead of hiding them behind a summary.
 function classifyIncomingRows(match, incomingRows) {
-  const newRows = [];
-  const mismatches = [];
-  (Array.isArray(incomingRows) ? incomingRows : []).forEach(r => {
+  return (Array.isArray(incomingRows) ? incomingRows : []).map(r => {
     const row = r || [];
     const dateKey = canonicalDateKey(row[0]);
-    if (!match || !match.existingDates.has(dateKey)) { newRows.push(row); return; }
+    if (!match || !match.existingDates.has(dateKey)) return { row, status: 'new' };
     const expected = { production: Number(row[2]) || 0, dispatch: Number(row[3]) || 0 };
     const existingVals = match.existingValuesByDate.get(dateKey);
-    if (!existingVals) { mismatches.push({ date: row[0], reason: 'unverifiable', expected }); return; }
-    if (existingVals.production === expected.production && existingVals.dispatch === expected.dispatch) return;
-    mismatches.push({ date: row[0], reason: 'value_mismatch', existing: existingVals, expected });
+    if (!existingVals) return { row, status: 'unverifiable', expected };
+    if (existingVals.production === expected.production && existingVals.dispatch === expected.dispatch) {
+      return { row, status: 'duplicate', existing: existingVals };
+    }
+    return { row, status: 'mismatch', existing: existingVals, expected };
   });
-  return { newRows, mismatches };
 }
 
 // Grows an EXISTING tab's grid instead of replacing it — this is the "merge, never touch existing
@@ -496,7 +496,11 @@ function computeMergePatches(existingGrid, variants) {
     const incomingRows = Array.isArray(v.rows) ? v.rows : [];
 
     if (match) {
-      const { newRows, mismatches: variantMismatches } = classifyIncomingRows(match, incomingRows);
+      const classified = classifyIncomingRows(match, incomingRows);
+      const newRows = classified.filter(c => c.status === 'new').map(c => c.row);
+      const variantMismatches = classified
+        .filter(c => c.status === 'mismatch' || c.status === 'unverifiable')
+        .map(c => ({ date: c.row[0], reason: c.status === 'unverifiable' ? 'unverifiable' : 'value_mismatch', existing: c.existing, expected: c.expected }));
       if (variantMismatches.length) mismatches.push({ title: v.title, mismatches: variantMismatches });
       if (!newRows.length) return;
       const openingCol = colLetter(match.startCol + 1);
@@ -911,12 +915,14 @@ async function generateCustomerSheetStructureHandler(req, res) {
   }
 }
 
-// Dry-run counterpart to pushCustomerSheet — reads the SAME "before" state and identifies the SAME
-// new rows (reusing parseExistingBlocks so there's no risk of the preview ever disagreeing with what
-// an actual push would do), but never writes anything and returns plain numbers instead of formula
+// Dry-run counterpart to pushCustomerSheet — reads the SAME "before" state and classifies the SAME
+// rows (reusing parseExistingBlocks so there's no risk of the preview ever disagreeing with what an
+// actual push would do), but never writes anything and returns plain numbers instead of formula
 // strings, since a human reviewing a diff wants to see "what will this balance become," not raw
-// Sheets formula syntax. Used to populate the review-before-push screen: shows, per item, the last
-// row already in the sheet (for continuity/context) next to the new row(s) about to be appended.
+// Sheets formula syntax. EVERY row for the item is returned here — never just the new ones — each
+// tagged with its status ('new' / 'duplicate' / 'mismatch' / 'unverifiable'), so the review screen can
+// show the real entry for every single row and just flag the ones that need a look, instead of ever
+// summarizing a row away as plain text.
 function previewCustomerSheet(previousValuesByTab, tabPlans, missing) {
   return tabPlans.map(plan => {
     const previousGrid = previousValuesByTab[plan.tabName] || [];
@@ -925,38 +931,37 @@ function previewCustomerSheet(previousValuesByTab, tabPlans, missing) {
       const key = normalizeTabKey(v.title);
       const match = blocks.find(b => normalizeTabKey(b.title) === key);
       const incomingRows = Array.isArray(v.rows) ? v.rows : [];
-      const { newRows, mismatches } = classifyIncomingRows(match, incomingRows);
-      const lastExisting = (match && match.lastRowValues)
-        ? { date: match.lastRowValues[0], closing: Number(match.lastRowValues[match.width - 1]) || 0 }
-        : null;
-      let running = lastExisting ? lastExisting.closing : 0;
-      const rows = newRows.map(r => {
-        const row = r || [];
+      const classified = classifyIncomingRows(match, incomingRows);
+      // Running balance is OUR chain — computed from every row we know about, in order — continuing
+      // from the real sheet's last existing closing balance so it lines up visually with what's
+      // already there. A 'mismatch' row still carries what the sheet itself has for that date
+      // (existing), shown right alongside our own numbers, so nothing has to be taken on faith.
+      let running = (match && match.lastRowValues) ? (Number(match.lastRowValues[match.width - 1]) || 0) : 0;
+      const rows = classified.map(c => {
+        const row = c.row;
         const opening = running;
         const production = Number(row[2]) || 0;
         const dispatch = Number(row[3]) || 0;
         running = opening + production - dispatch;
-        return { date: row[0] || '', opening, production, dispatch, closing: running };
+        return { date: row[0] || '', opening, production, dispatch, closing: running, status: c.status, existing: c.existing || null };
       });
       // Same reasoning as computeMergePatches: if another variant in this same customer's payload
       // also resolves to this block, it needs to see these rows as already staged — both so its own
       // running balance continues from here instead of the real sheet's last row, and so it doesn't
       // re-offer the same dates as "new".
       if (match && rows.length) {
-        newRows.forEach(r => {
-          const k = canonicalDateKey((r || [])[0]);
+        classified.forEach(c => {
+          const k = canonicalDateKey(c.row[0]);
           match.existingDates.add(k);
-          match.existingValuesByDate.set(k, { production: Number((r || [])[2]) || 0, dispatch: Number((r || [])[3]) || 0 });
+          if (c.status === 'new') match.existingValuesByDate.set(k, { production: Number(c.row[2]) || 0, dispatch: Number(c.row[3]) || 0 });
         });
+        const last = rows[rows.length - 1];
         const synthesized = new Array(match.width).fill(null);
-        synthesized[0] = rows[rows.length - 1].date;
-        synthesized[match.width - 1] = rows[rows.length - 1].closing;
+        synthesized[0] = last.date;
+        synthesized[match.width - 1] = last.closing;
         match.lastRowValues = synthesized;
       }
-      // mismatches: dates already in the real sheet whose production/dispatch numbers don't match
-      // what we computed — surfaced right alongside the new rows so they're impossible to miss on the
-      // review screen, never silently treated as "already handled."
-      return { title: v.title, isNewBlock: !match, lastExisting, rows, mismatches };
+      return { title: v.title, isNewBlock: !match, rows };
     });
     return { tabName: plan.tabName, isNewTab: missing.includes(plan.tabName), variants };
   });
