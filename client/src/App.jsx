@@ -1866,7 +1866,17 @@ function FIMSApp() {
   };
   const customerStockGroups = (() => {
     const groups = {};
-    const addEntry = (row, pieces, dispatchQty, source) => {
+    // Merges by DATE within each customer+item group — a Production Register row and a Customer
+    // Dispatch Bill row landing on the same date are two separate approvals (confirmed independently,
+    // on their own timelines, in their own registers) but describe ONE real row in the real Sheet, so
+    // they combine into one ledger entry here rather than becoming two competing half-rows that each
+    // show 0 in the column the other one owns. Production Register rows can ALSO carry their own
+    // handwritten dispatch figure (noted on the same page) — that's a second, independent source of
+    // dispatch for the same date, summed in alongside any dispatch bill's quantity, not overwritten by
+    // it. `productionIds`/`dispatchIds` keep every contributing row's real id (there can be more than
+    // one dispatch bill for the same item on the same day), so a delete on the merged row can still
+    // reach back to the exact underlying register row(s) it came from.
+    const addEntry = (row, source) => {
       const customer = row.confirmedCustomer || matchCustomer(row);
       const variantKey = normalizeVariant(row.description);
       const key = `${customer}||${variantKey}`;
@@ -1874,17 +1884,25 @@ function FIMSApp() {
       // register wording happened to create this group first. Without this, the group's permanent
       // label (and the Sheet tab this pushes to) would be whatever pack count was on THAT entry,
       // e.g. "Kaju Bake 65g x60" forever, even on a day production ran a batch of 40 instead.
-      if (!groups[key]) groups[key] = { id: key, customer, description: stripPackCount(row.description) || row.description, entries: [] };
-      // `source` (which register the underlying row actually lives in) travels with each ledger entry
-      // so a "Delete" button on a Customer Stock ledger row knows whether to delete from Production
-      // Register or Customer Dispatch Bills — the ledger blends both into one table, but the real row
-      // only exists in one place.
-      groups[key].entries.push({ id: row.id, date: row.date, pieces, dispatch: dispatchQty, source });
+      if (!groups[key]) groups[key] = { id: key, customer, description: stripPackCount(row.description) || row.description, byDate: {} };
+      const dateKey = dateSortKey(row.date);
+      if (!groups[key].byDate[dateKey]) {
+        groups[key].byDate[dateKey] = { date: row.date, pieces: 0, dispatch: 0, productionIds: [], dispatchIds: [] };
+      }
+      const entry = groups[key].byDate[dateKey];
+      if (source === 'production') {
+        entry.pieces += num(row.pieces);
+        entry.dispatch += num(row.dispatch); // the Production Register's own handwritten dispatch column, if noted
+        entry.productionIds.push(row.id);
+      } else {
+        entry.dispatch += num(row.quantity);
+        entry.dispatchIds.push(row.id);
+      }
     };
-    confirmedProductionRows.forEach(row => addEntry(row, num(row.pieces), num(row.dispatch), 'production'));
-    confirmedDispatchRows.forEach(row => addEntry(row, 0, num(row.quantity), 'customerDispatch'));
+    confirmedProductionRows.forEach(row => addEntry(row, 'production'));
+    confirmedDispatchRows.forEach(row => addEntry(row, 'customerDispatch'));
     return Object.values(groups).map(g => {
-      const sorted = [...g.entries].sort((a, b) => dateSortKey(a.date).localeCompare(dateSortKey(b.date)));
+      const sorted = Object.values(g.byDate).sort((a, b) => dateSortKey(a.date).localeCompare(dateSortKey(b.date)));
       let running = 0;
       const ledger = sorted.map(e => {
         const opening = running;
@@ -1893,7 +1911,7 @@ function FIMSApp() {
       });
       const totalProduction = sorted.reduce((s, e) => s + num(e.pieces), 0);
       const totalDispatch = sorted.reduce((s, e) => s + num(e.dispatch), 0);
-      return { ...g, ledger, totalProduction, totalDispatch, closingBalance: running };
+      return { id: g.id, customer: g.customer, description: g.description, ledger, totalProduction, totalDispatch, closingBalance: running };
     });
   })();
   const customerNames = Array.from(new Set(customerStockGroups.map(g => g.customer))).sort((a, b) => (a === 'Unassigned') - (b === 'Unassigned') || a.localeCompare(b));
@@ -3253,7 +3271,14 @@ function FIMSApp() {
                                   <td style={{ padding: '6px 10px' }}>{e.dispatch || ''}</td>
                                   <td style={{ padding: '6px 10px' }}>{e.closing}</td>
                                   <td className="col-action">
-                                    <button className="icon-btn danger" title="Delete this row from the real register/log" onClick={() => deleteRow(e.source)(e.id)}><Trash2 size={14} /></button>
+                                    <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
+                                      {(e.productionIds || []).map(id => (
+                                        <button key={`p-${id}`} className="icon-btn danger" title="Delete this date's Production Register row" onClick={() => deleteRow('production')(id)}><Trash2 size={14} /></button>
+                                      ))}
+                                      {(e.dispatchIds || []).map(id => (
+                                        <button key={`d-${id}`} className="icon-btn danger" title="Delete this date's Customer Dispatch Bill row" onClick={() => deleteRow('customerDispatch')(id)}><Trash2 size={14} /></button>
+                                      ))}
+                                    </div>
                                   </td>
                                 </tr>
                               ))}
@@ -3442,7 +3467,14 @@ function FIMSApp() {
                                           <td style={{ padding: '2px 6px' }}>{e.dispatch || ''}</td>
                                           <td style={{ padding: '2px 6px' }}>{e.closing}</td>
                                           <td style={{ padding: '2px 6px' }}>
-                                            <button className="icon-btn danger" title="Delete this row from the real register/log" onClick={() => deleteRow(e.source)(e.id)}><Trash2 size={13} /></button>
+                                            <div style={{ display: 'flex', gap: 4 }}>
+                                              {(e.productionIds || []).map(id => (
+                                                <button key={`p-${id}`} className="icon-btn danger" title="Delete this date's Production Register row" onClick={() => deleteRow('production')(id)}><Trash2 size={13} /></button>
+                                              ))}
+                                              {(e.dispatchIds || []).map(id => (
+                                                <button key={`d-${id}`} className="icon-btn danger" title="Delete this date's Customer Dispatch Bill row" onClick={() => deleteRow('customerDispatch')(id)}><Trash2 size={13} /></button>
+                                              ))}
+                                            </div>
                                           </td>
                                         </tr>
                                       ))}
