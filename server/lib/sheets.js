@@ -402,6 +402,14 @@ function parseExistingBlocks(grid) {
 // silently treated as "already handled" either. Every single incoming row gets a status back — nothing
 // is ever dropped from the result — so the UI can show the real entry for every row, always, and just
 // flag the ones that need a second look instead of hiding them behind a summary.
+//
+// A column only counts as a real conflict when the sheet ALREADY has something recorded there
+// (non-zero) that disagrees with what we have. Dispatch in particular is routinely 0 in the sheet
+// until the truck actually leaves — often days after production gets logged — so a 0 there just means
+// "not filled in yet," not a disagreement. Flagging that as a mismatch would be crying wolf on the
+// completely normal case of dispatch catching up later. If nothing in the row is a real conflict, it's
+// treated as 'duplicate' (won't be pushed either way, since the date already has a row) rather than
+// flagged.
 function classifyIncomingRows(match, incomingRows) {
   return (Array.isArray(incomingRows) ? incomingRows : []).map(r => {
     const row = r || [];
@@ -410,10 +418,12 @@ function classifyIncomingRows(match, incomingRows) {
     const expected = { production: Number(row[2]) || 0, dispatch: Number(row[3]) || 0 };
     const existingVals = match.existingValuesByDate.get(dateKey);
     if (!existingVals) return { row, status: 'unverifiable', expected };
-    if (existingVals.production === expected.production && existingVals.dispatch === expected.dispatch) {
-      return { row, status: 'duplicate', existing: existingVals };
+    const productionConflict = existingVals.production !== 0 && existingVals.production !== expected.production;
+    const dispatchConflict = existingVals.dispatch !== 0 && existingVals.dispatch !== expected.dispatch;
+    if (productionConflict || dispatchConflict) {
+      return { row, status: 'mismatch', existing: existingVals, expected };
     }
-    return { row, status: 'mismatch', existing: existingVals, expected };
+    return { row, status: 'duplicate', existing: existingVals };
   });
 }
 

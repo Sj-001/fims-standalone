@@ -3506,29 +3506,35 @@ function FIMSApp() {
                                     const variantEdits = (reviewEdits[customer] && reviewEdits[customer][v.title]) || {};
                                     const edit = (variantEdits.rowEdits && variantEdits.rowEdits[i]) || {};
                                     const isDeleted = !!(variantEdits.deletedRows && variantEdits.deletedRows[i]);
+                                    const isDuplicate = r.status === 'duplicate';
+                                    // A duplicate is already in the Sheet with nothing worth changing — editing or
+                                    // deleting it here is a no-op either way (the push never touches an existing
+                                    // row), so the row is shown for visibility but its controls are disabled rather
+                                    // than left live and misleading.
+                                    const rowDisabled = isDeleted || isDuplicate;
                                     const moveKey = `${customer}::${v.title}::${i}`;
                                     const rowDateValue = edit.date ?? r.date;
                                     const rowBg = isDeleted ? 'rgba(162,59,46,0.08)'
                                       : r.status === 'mismatch' || r.status === 'unverifiable' ? 'var(--warn-soft)'
-                                      : r.status === 'duplicate' ? 'transparent'
+                                      : isDuplicate ? 'rgba(0,0,0,0.03)'
                                       : 'rgba(214,163,80,0.14)';
                                     return (
-                                      <tr key={i} style={{ background: rowBg, opacity: isDeleted ? 0.55 : 1 }}>
+                                      <tr key={i} style={{ background: rowBg, opacity: rowDisabled ? 0.55 : 1 }}>
                                         <td style={{ padding: '2px 6px' }}>
-                                          <input className="cell-input" style={{ width: 100 }} value={rowDateValue} onChange={e => setRowEdit(customer, v.title, i, 'date', e.target.value)} disabled={isDeleted} />
+                                          <input className="cell-input" style={{ width: 100 }} value={rowDateValue} onChange={e => setRowEdit(customer, v.title, i, 'date', e.target.value)} disabled={rowDisabled} />
                                         </td>
                                         <td style={{ padding: '2px 6px' }}>{r.opening}</td>
                                         <td style={{ padding: '2px 6px' }}>
-                                          <input className="cell-input" style={{ width: 80 }} type="number" value={edit.production ?? r.production} onChange={e => setRowEdit(customer, v.title, i, 'production', e.target.value)} disabled={isDeleted} />
+                                          <input className="cell-input" style={{ width: 80 }} type="number" value={edit.production ?? r.production} onChange={e => setRowEdit(customer, v.title, i, 'production', e.target.value)} disabled={rowDisabled} />
                                         </td>
                                         <td style={{ padding: '2px 6px' }}>
-                                          <input className="cell-input" style={{ width: 80 }} type="number" value={edit.dispatch ?? r.dispatch} onChange={e => setRowEdit(customer, v.title, i, 'dispatch', e.target.value)} disabled={isDeleted} />
+                                          <input className="cell-input" style={{ width: 80 }} type="number" value={edit.dispatch ?? r.dispatch} onChange={e => setRowEdit(customer, v.title, i, 'dispatch', e.target.value)} disabled={rowDisabled} />
                                         </td>
                                         <td style={{ padding: '2px 6px' }}>{r.closing}</td>
                                         <td style={{ padding: '2px 6px' }}>
                                           {r.status === 'new' && <Pill tone="ok">New</Pill>}
-                                          {r.status === 'duplicate' && <Pill tone="neutral" title={`Already in the Sheet with the same numbers — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed again.`}>Duplicate</Pill>}
-                                          {r.status === 'mismatch' && <Pill tone="warn" title={`Sheet already has this date, but with different numbers — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed unless you fix it here.`}>Mismatch</Pill>}
+                                          {isDuplicate && <Pill tone="neutral" title={`Already in the Sheet — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed again, so this row is disabled.`}>Duplicate</Pill>}
+                                          {r.status === 'mismatch' && <Pill tone="warn" title={`Sheet already has a recorded value here that disagrees — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed unless you fix it here.`}>Mismatch</Pill>}
                                           {r.status === 'unverifiable' && <Pill tone="warn" title="Sheet already has this date, but its columns couldn't be read to check. Won't be pushed — verify by hand.">Can't verify</Pill>}
                                         </td>
                                         <td style={{ padding: '2px 6px' }}>
@@ -3560,7 +3566,7 @@ function FIMSApp() {
                                           </div>
                                         </td>
                                         <td style={{ padding: '2px 6px' }} className="col-action">
-                                          <button className="icon-btn" title={isDeleted ? 'Undo delete' : 'Delete this row (only from this push — never touches the register)'} onClick={() => setRowDeleted(customer, v.title, i, !isDeleted)}>
+                                          <button className="icon-btn" title={isDuplicate ? "Nothing to delete — this row is a duplicate and won't be pushed" : isDeleted ? 'Undo delete' : 'Delete this row (only from this push — never touches the register)'} disabled={isDuplicate} onClick={() => setRowDeleted(customer, v.title, i, !isDeleted)}>
                                             {isDeleted ? <RefreshCw size={13} /> : <Trash2 size={13} />}
                                           </button>
                                         </td>
@@ -3911,11 +3917,12 @@ function FIMSApp() {
                                   const edit = (variantEdits.rowEdits && variantEdits.rowEdits[i]) || {};
                                   const isDeleted = !!(variantEdits.deletedRows && variantEdits.deletedRows[i]);
                                   if (isDeleted) return null;
+                                  const isDuplicate = r.status === 'duplicate';
                                   const rowBg = r.status === 'mismatch' || r.status === 'unverifiable' ? 'var(--warn-soft)'
-                                    : r.status === 'duplicate' ? 'transparent'
+                                    : isDuplicate ? 'rgba(0,0,0,0.03)'
                                     : 'rgba(214,163,80,0.14)';
                                   return (
-                                    <tr key={i} style={{ background: rowBg }}>
+                                    <tr key={i} style={{ background: rowBg, opacity: isDuplicate ? 0.55 : 1 }}>
                                       <td style={{ padding: '2px 6px' }}>{edit.date ?? r.date}</td>
                                       <td style={{ padding: '2px 6px' }}>{r.opening}</td>
                                       <td style={{ padding: '2px 6px' }}>{edit.production ?? r.production}</td>
@@ -3923,8 +3930,8 @@ function FIMSApp() {
                                       <td style={{ padding: '2px 6px' }}>{r.closing}</td>
                                       <td style={{ padding: '2px 6px' }}>
                                         {r.status === 'new' && <Pill tone="ok">New</Pill>}
-                                        {r.status === 'duplicate' && <Pill tone="neutral" title={`Already in the Sheet with the same numbers — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}.`}>Duplicate</Pill>}
-                                        {r.status === 'mismatch' && <Pill tone="warn" title={`Sheet already has this date, but with different numbers — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}.`}>Mismatch</Pill>}
+                                        {isDuplicate && <Pill tone="neutral" title={`Already in the Sheet — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed again.`}>Duplicate</Pill>}
+                                        {r.status === 'mismatch' && <Pill tone="warn" title={`Sheet already has a recorded value here that disagrees — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}.`}>Mismatch</Pill>}
                                         {r.status === 'unverifiable' && <Pill tone="warn" title="Sheet already has this date, but its columns couldn't be read to check.">Can't verify</Pill>}
                                       </td>
                                     </tr>
