@@ -841,12 +841,23 @@ function CustomerSuggestCell({ value, guess, isKnownGuess, knownCustomers, onCha
 function TabBlockPickerCells({ rowId, description, sheetGroupOptions, blockOptions, draft, onChange }) {
   const sheetGroup = (draft && draft.sheetGroup) || '';
   const block = (draft && draft.block) || '';
+  // Red-flagged (border + AlertCircle) until a Sheet tab is actually picked — same convention as
+  // Customer Stock's "not routed" section. Block staying blank is a legitimate choice (new block named
+  // after the item), so only the tab being unset counts as genuinely unresolved.
+  const unresolved = !sheetGroup.trim();
   return (
     <>
       <td>
-        <input className="cell-input" style={{ width: 110, fontSize: 12 }} list={`pending-sheetgroup-${rowId}`}
-          placeholder="Sheet tab" value={sheetGroup} onChange={e => onChange('sheetGroup', e.target.value)} />
-        <datalist id={`pending-sheetgroup-${rowId}`}>{sheetGroupOptions.map(s => <option key={s} value={s} />)}</datalist>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <input className="cell-input" style={{ width: 110, fontSize: 12, borderColor: unresolved ? 'var(--ledger-red)' : undefined }}
+            list={`pending-sheetgroup-${rowId}`}
+            placeholder="Sheet tab" value={sheetGroup} onChange={e => onChange('sheetGroup', e.target.value)} />
+          <datalist id={`pending-sheetgroup-${rowId}`}>{sheetGroupOptions.map(s => <option key={s} value={s} />)}</datalist>
+          {unresolved && (
+            <AlertCircle size={14} color="var(--ledger-red)" style={{ flexShrink: 0 }}
+              title="Not yet assigned to a Sheet tab — pick one, or type a new one. Leave Block blank to create a new block named after this item." />
+          )}
+        </div>
       </td>
       <td>
         <input className="cell-input" style={{ width: 140, fontSize: 12 }} list={`pending-block-${rowId}`}
@@ -2220,7 +2231,11 @@ function FIMSApp() {
     const knownTabNamesLower = new Set(itemGroups.map(g => (g.tabName || '').trim().toLowerCase()));
     const newProbeNames = probeTabNames.filter(t => !knownTabNamesLower.has(t.toLowerCase()));
     const itemGroupsForPreview = [...itemGroups, ...newProbeNames.map(t => ({ tabName: t, variants: [] }))];
-    if (!sheetId || !itemGroupsForPreview.length) { setReviewByCustomer(prev => ({ ...prev, [customer]: null })); return; }
+    // Still fire the preview call with an EMPTY itemGroups array when there's nothing routed/probed yet
+    // — the backend reads the real Sheet's tab list regardless of itemGroups content (see readPushState),
+    // so this is what makes existingTabNames available for the Sheet tab pickers even for a customer
+    // with zero confirmed items so far, instead of only ever showing catalog-guessed tab names.
+    if (!sheetId) { setReviewByCustomer(prev => ({ ...prev, [customer]: null })); return; }
     setReviewByCustomer(prev => ({ ...prev, [customer]: { ...(prev[customer] || {}), loading: true, error: '' } }));
     try {
       const res = await fetch('/api/customer-sheets/preview', {
@@ -2260,6 +2275,11 @@ function FIMSApp() {
     if (matchedTab && matchedTab.existingBlockTitles) return matchedTab.existingBlockTitles;
     return (rev.probedBlocksByTabName && rev.probedBlocksByTabName[sg]) || [];
   };
+  // Real Sheet tab names for a customer, straight from the customer's actual spreadsheet (see
+  // refreshReview, which now fires even with nothing routed/probed yet purely to populate this) — used
+  // ALONGSIDE whatever tab names the Product Catalog already knows, never instead of them, so a Sheet
+  // tab picker always offers the real tabs even for a customer with zero catalog entries so far.
+  const getRealTabNamesForCustomer = (customer) => (reviewByCustomer[customer] && reviewByCustomer[customer].existingTabNames) || [];
   const setRowEdit = (customer, variantTitle, rowIndex, field, value) => {
     setReviewEdits(prev => {
       const forCustomer = { ...(prev[customer] || {}) };
@@ -2969,6 +2989,11 @@ function FIMSApp() {
            a suggestion that didn't match anyone known). Disappears automatically the moment the row
            gets a real customer, so it's always safe to leave a row highlighted until you get to it. */
         .needs-customer-row { background: var(--accent-soft) !important; }
+        /* A row on Pending Production/Dispatch Review whose customer IS known but whose item isn't in
+           the Product Catalog yet — i.e. it needs a Sheet tab/Block picked by hand right here. Same
+           warning tone as .flagged-row (deliberately, since it's the same "needs your attention before
+           this counts" meaning) but its own class so it's never confused with extraction confidence. */
+        .needs-tabblock-row { background: var(--warn-soft) !important; }
         .info-box { display: flex; gap: 8px; align-items: flex-start; background: var(--accent-soft); border: 1px solid var(--rule); color: var(--ink); padding: 10px 12px; border-radius: 5px; font-size: 12.5px; margin: 10px 0; }
         .field-row { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
         .text-input { padding: 8px 10px; border-radius: 5px; border: 1px solid var(--rule); font: inherit; font-size: 13px; }
@@ -3357,8 +3382,9 @@ function FIMSApp() {
                           const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
                           const needsTabBlock = effectiveCustomer && !isItemKnownForCustomer(effectiveCustomer, row.description);
                           const draft = pendingTabBlockForms[row.id];
+                          const tabBlockUnresolved = needsTabBlock && !((draft && draft.sheetGroup) || '').trim();
                           return (
-                          <tr key={row.id}>
+                          <tr key={row.id} className={tabBlockUnresolved ? 'needs-tabblock-row' : ''}>
                             <td style={{ padding: '6px 10px' }}>{row.date}</td>
                             <td style={{ padding: '6px 10px' }}>{row.description}</td>
                             <td style={{ padding: '6px 10px' }}>{row.pieces || ''}</td>
@@ -3369,7 +3395,10 @@ function FIMSApp() {
                             </td>
                             {needsTabBlock ? (
                               <TabBlockPickerCells rowId={row.id} description={row.description}
-                                sheetGroupOptions={Array.from(new Set(productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup))).filter(Boolean)}
+                                sheetGroupOptions={Array.from(new Set([
+                                  ...productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup),
+                                  ...getRealTabNamesForCustomer(effectiveCustomer),
+                                ])).filter(Boolean)}
                                 blockOptions={getRealBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || '')}
                                 draft={draft} onChange={(field, value) => updatePendingTabBlockForm(row.id, field, value)} />
                             ) : (
@@ -3409,8 +3438,9 @@ function FIMSApp() {
                           const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
                           const needsTabBlock = effectiveCustomer && !isItemKnownForCustomer(effectiveCustomer, row.description);
                           const draft = pendingTabBlockForms[row.id];
+                          const tabBlockUnresolved = needsTabBlock && !((draft && draft.sheetGroup) || '').trim();
                           return (
-                          <tr key={row.id}>
+                          <tr key={row.id} className={tabBlockUnresolved ? 'needs-tabblock-row' : ''}>
                             <td style={{ padding: '6px 10px' }}>{row.date}</td>
                             <td style={{ padding: '6px 10px' }}>{row.invoice_no}</td>
                             <td style={{ padding: '6px 10px' }}>{row.description}</td>
@@ -3422,7 +3452,10 @@ function FIMSApp() {
                             </td>
                             {needsTabBlock ? (
                               <TabBlockPickerCells rowId={row.id} description={row.description}
-                                sheetGroupOptions={Array.from(new Set(productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup))).filter(Boolean)}
+                                sheetGroupOptions={Array.from(new Set([
+                                  ...productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup),
+                                  ...getRealTabNamesForCustomer(effectiveCustomer),
+                                ])).filter(Boolean)}
                                 blockOptions={getRealBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || '')}
                                 draft={draft} onChange={(field, value) => updatePendingTabBlockForm(row.id, field, value)} />
                             ) : (
@@ -3494,9 +3527,10 @@ function FIMSApp() {
                         {(() => {
                           const form = assignForms[g.id] || {};
                           const chosenCustomer = (form.customer || '').trim();
-                          const customerSheetGroups = Array.from(new Set(
-                            productCatalog.filter(c => c.customer.toLowerCase() === chosenCustomer.toLowerCase()).map(c => c.sheetGroup)
-                          )).filter(Boolean);
+                          const customerSheetGroups = Array.from(new Set([
+                            ...productCatalog.filter(c => c.customer.toLowerCase() === chosenCustomer.toLowerCase()).map(c => c.sheetGroup),
+                            ...getRealTabNamesForCustomer(chosenCustomer),
+                          ])).filter(Boolean);
                           const chosenSheetGroup = (form.sheetGroup || '').trim();
                           // Real block titles from the customer's actual Sheet tab, not the local
                           // Product Catalog — see the matching comment in the unmatched-items form above.
@@ -3628,9 +3662,10 @@ function FIMSApp() {
                           {unmatched.map(description => {
                             const key = `${customer}::${description}`;
                             const form = unmatchedAssignForms[key] || {};
-                            const customerSheetGroups = Array.from(new Set(
-                              productCatalog.filter(c => c.customer.toLowerCase() === customer.toLowerCase()).map(c => c.sheetGroup)
-                            )).filter(Boolean);
+                            const customerSheetGroups = Array.from(new Set([
+                              ...productCatalog.filter(c => c.customer.toLowerCase() === customer.toLowerCase()).map(c => c.sheetGroup),
+                              ...getRealTabNamesForCustomer(customer),
+                            ])).filter(Boolean);
                             const chosenSheetGroup = (form.sheetGroup || '').trim();
                             // Real block titles from the customer's actual Sheet tab (same source the
                             // review section below uses), not the local Product Catalog — the catalog
