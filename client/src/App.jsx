@@ -3339,11 +3339,11 @@ function FIMSApp() {
                             productCatalog.filter(c => c.customer.toLowerCase() === chosenCustomer.toLowerCase()).map(c => c.sheetGroup)
                           )).filter(Boolean);
                           const chosenSheetGroup = (form.sheetGroup || '').trim();
-                          const sheetGroupItems = Array.from(new Set(
-                            productCatalog
-                              .filter(c => c.customer.toLowerCase() === chosenCustomer.toLowerCase() && c.sheetGroup.toLowerCase() === chosenSheetGroup.toLowerCase())
-                              .map(c => c.item)
-                          )).filter(Boolean);
+                          // Real block titles from the customer's actual Sheet tab, not the local
+                          // Product Catalog — see the matching comment in the unmatched-items form above.
+                          const matchedReviewTab = chosenSheetGroup && (reviewByCustomer[chosenCustomer] && reviewByCustomer[chosenCustomer].tabs || [])
+                            .find(t => t.tabName.toLowerCase() === chosenSheetGroup.toLowerCase());
+                          const existingBlocks = (matchedReviewTab && matchedReviewTab.existingBlockTitles) || [];
                           const canAssign = chosenCustomer && chosenSheetGroup && (form.item || g.description || '').trim();
                           return (
                             <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
@@ -3369,13 +3369,14 @@ function FIMSApp() {
                               </datalist>
                               <input
                                 list={`assign-item-${g.id}`}
-                                placeholder="Block (item name)"
-                                value={form.item !== undefined ? form.item : g.description}
+                                placeholder="Block (blank = new block)"
+                                value={form.item || ''}
                                 onChange={e => updateAssignForm(g.id, 'item', e.target.value)}
                                 style={{ width: 180 }}
                               />
                               <datalist id={`assign-item-${g.id}`}>
-                                {sheetGroupItems.map(i => <option key={i} value={i} />)}
+                                {existingBlocks.map(i => <option key={i} value={i} />)}
+                                <option value={g.description}>{`+ New block: "${g.description}"`}</option>
                               </datalist>
                               <button className="btn btn-primary" disabled={!canAssign} onClick={() => assignUnassignedGroup(g.id, g.description)}>
                                 <Check size={15} /> Assign
@@ -3474,11 +3475,12 @@ function FIMSApp() {
                               productCatalog.filter(c => c.customer.toLowerCase() === customer.toLowerCase()).map(c => c.sheetGroup)
                             )).filter(Boolean);
                             const chosenSheetGroup = (form.sheetGroup || '').trim();
-                            const sheetGroupItems = Array.from(new Set(
-                              productCatalog
-                                .filter(c => c.customer.toLowerCase() === customer.toLowerCase() && c.sheetGroup.toLowerCase() === chosenSheetGroup.toLowerCase())
-                                .map(c => c.item)
-                            )).filter(Boolean);
+                            // Real block titles from the customer's actual Sheet tab (same source the
+                            // review section below uses), not the local Product Catalog — the catalog
+                            // can lag behind or omit blocks that already exist for real in the Sheet.
+                            const matchedReviewTab = chosenSheetGroup && (reviewByCustomer[customer] && reviewByCustomer[customer].tabs || [])
+                              .find(t => t.tabName.toLowerCase() === chosenSheetGroup.toLowerCase());
+                            const existingBlocks = (matchedReviewTab && matchedReviewTab.existingBlockTitles) || [];
                             const canAssign = chosenSheetGroup && (form.item || description || '').trim();
                             const group = groupsForCustomer.find(g => g.description === description);
                             return (
@@ -3489,8 +3491,11 @@ function FIMSApp() {
                                   <input className="cell-input" style={{ width: 150, fontSize: 12 }} list={`unmatched-sheetgroup-${key}`} placeholder="Sheet tab" value={form.sheetGroup || ''} onChange={e => updateUnmatchedAssignForm(key, 'sheetGroup', e.target.value)} />
                                   <datalist id={`unmatched-sheetgroup-${key}`}>{customerSheetGroups.map(s => <option key={s} value={s} />)}</datalist>
                                   <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>Block:</span>
-                                  <input className="cell-input" style={{ width: 180, fontSize: 12 }} list={`unmatched-item-${key}`} placeholder="Block (item name)" value={form.item !== undefined ? form.item : description} onChange={e => updateUnmatchedAssignForm(key, 'item', e.target.value)} />
-                                  <datalist id={`unmatched-item-${key}`}>{sheetGroupItems.map(i => <option key={i} value={i} />)}</datalist>
+                                  <input className="cell-input" style={{ width: 180, fontSize: 12 }} list={`unmatched-item-${key}`} placeholder="Block (blank = new block)" value={form.item || ''} onChange={e => updateUnmatchedAssignForm(key, 'item', e.target.value)} />
+                                  <datalist id={`unmatched-item-${key}`}>
+                                    {existingBlocks.map(i => <option key={i} value={i} />)}
+                                    <option value={description}>{`+ New block: "${description}"`}</option>
+                                  </datalist>
                                   <button className="btn btn-primary" style={{ marginLeft: 'auto' }} disabled={!canAssign} onClick={() => assignUnmatchedItem(customer, description)}><Check size={13} /> Assign</button>
                                 </div>
                                 {group && (
