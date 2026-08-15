@@ -836,36 +836,43 @@ function CustomerSuggestCell({ value, guess, isKnownGuess, knownCustomers, onCha
 // the case Customer Stock's "not routed to a Sheet tab yet" section exists to catch, just settled here
 // instead, in the same step as picking the customer. Confirming the row (see confirmStockRow) reads
 // this draft and registers it as a Product Catalog alias, so it's remembered for every future row with
-// this same wording — no second pass needed. Leaving Block blank falls back to a new block named after
-// the item, same convention as everywhere else this picker appears.
+// this same wording — no second pass needed. Both fields are flagged red until EXPLICITLY filled in —
+// leaving Block blank still functionally falls back to a new block named after the item on confirm, but
+// the row stays flagged until that choice is made on purpose (e.g. picking "+ New block" from its own
+// dropdown), not left blank by default.
 function TabBlockPickerCells({ rowId, description, sheetGroupOptions, blockOptions, draft, onChange }) {
   const sheetGroup = (draft && draft.sheetGroup) || '';
   const block = (draft && draft.block) || '';
-  // Red-flagged (border + AlertCircle) until a Sheet tab is actually picked — same convention as
-  // Customer Stock's "not routed" section. Block staying blank is a legitimate choice (new block named
-  // after the item), so only the tab being unset counts as genuinely unresolved.
-  const unresolved = !sheetGroup.trim();
+  const tabUnresolved = !sheetGroup.trim();
+  const blockUnresolved = !block.trim();
   return (
     <>
       <td>
         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          <input className="cell-input" style={{ width: 110, fontSize: 12, borderColor: unresolved ? 'var(--ledger-red)' : undefined }}
+          <input className="cell-input" style={{ width: 110, fontSize: 12, borderColor: tabUnresolved ? 'var(--ledger-red)' : undefined }}
             list={`pending-sheetgroup-${rowId}`}
             placeholder="Sheet tab" value={sheetGroup} onChange={e => onChange('sheetGroup', e.target.value)} />
           <datalist id={`pending-sheetgroup-${rowId}`}>{sheetGroupOptions.map(s => <option key={s} value={s} />)}</datalist>
-          {unresolved && (
+          {tabUnresolved && (
             <AlertCircle size={14} color="var(--ledger-red)" style={{ flexShrink: 0 }}
-              title="Not yet assigned to a Sheet tab — pick one, or type a new one. Leave Block blank to create a new block named after this item." />
+              title="Not yet assigned to a Sheet tab — pick one, or type a new one." />
           )}
         </div>
       </td>
       <td>
-        <input className="cell-input" style={{ width: 140, fontSize: 12 }} list={`pending-block-${rowId}`}
-          placeholder="Block (blank = new block)" value={block} onChange={e => onChange('block', e.target.value)} />
-        <datalist id={`pending-block-${rowId}`}>
-          {blockOptions.map(b => <option key={b} value={b} />)}
-          <option value={description}>{`+ New block: "${description}"`}</option>
-        </datalist>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <input className="cell-input" style={{ width: 140, fontSize: 12, borderColor: blockUnresolved ? 'var(--ledger-red)' : undefined }}
+            list={`pending-block-${rowId}`}
+            placeholder="Block (blank = new block)" value={block} onChange={e => onChange('block', e.target.value)} />
+          <datalist id={`pending-block-${rowId}`}>
+            {blockOptions.map(b => <option key={b} value={b} />)}
+            <option value={description}>{`+ New block: "${description}"`}</option>
+          </datalist>
+          {blockUnresolved && (
+            <AlertCircle size={14} color="var(--ledger-red)" style={{ flexShrink: 0 }}
+              title={`Not yet assigned to a block — pick an existing one, or "+ New block: \"${description}\"" to confirm this should be its own new block.`} />
+          )}
+        </div>
       </td>
     </>
   );
@@ -3403,7 +3410,7 @@ function FIMSApp() {
                           const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
                           const needsTabBlock = effectiveCustomer && !catalogEntry;
                           const draft = pendingTabBlockForms[row.id];
-                          const tabBlockUnresolved = needsTabBlock && !((draft && draft.sheetGroup) || '').trim();
+                          const tabBlockUnresolved = needsTabBlock && (!((draft && draft.sheetGroup) || '').trim() || !((draft && draft.block) || '').trim());
                           return (
                           <tr key={row.id} className={tabBlockUnresolved ? 'needs-tabblock-row' : ''}>
                             <td style={{ padding: '6px 10px' }}>{row.date}</td>
@@ -3463,7 +3470,7 @@ function FIMSApp() {
                           const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
                           const needsTabBlock = effectiveCustomer && !catalogEntry;
                           const draft = pendingTabBlockForms[row.id];
-                          const tabBlockUnresolved = needsTabBlock && !((draft && draft.sheetGroup) || '').trim();
+                          const tabBlockUnresolved = needsTabBlock && (!((draft && draft.sheetGroup) || '').trim() || !((draft && draft.block) || '').trim());
                           return (
                           <tr key={row.id} className={tabBlockUnresolved ? 'needs-tabblock-row' : ''}>
                             <td style={{ padding: '6px 10px' }}>{row.date}</td>
