@@ -2083,14 +2083,15 @@ function FIMSApp() {
     .replace(/(\d)\s*gm\b/g, '$1g')
     .replace(/\bcont\.?\b/g, 'container')
     .replace(/[^a-z0-9]/g, '');
-  // Whether a description already has a Product Catalog entry for this customer — i.e. whether it
-  // would land in a real Sheet tab on push without needing a Sheet tab/Block picked for it anywhere.
-  // Used to decide whether the Pending Review tables need to show the tab/block picker for a row at
-  // confirm time, before it's even reached Customer Stock's "not routed" fallback section.
-  const isItemKnownForCustomer = (customer, description) => {
-    if (!customer || customer === 'Unassigned') return true;
+  // The Product Catalog entry (if any) a description already resolves to for this customer — i.e.
+  // where it would land on push without needing a Sheet tab/Block picked for it anywhere. Used both to
+  // decide whether the Pending Review tables need to show the tab/block picker for a row at confirm
+  // time (before it's even reached Customer Stock's "not routed" fallback section), and, when it IS
+  // already known, to actually show what it's routed to instead of just a blank dash.
+  const getCatalogEntryForItem = (customer, description) => {
+    if (!customer || customer === 'Unassigned') return null;
     const key = normalizeForCatalogMatch(description || '');
-    return productCatalog.some(c => c.customer === customer && normalizeForCatalogMatch(c.item) === key);
+    return productCatalog.find(c => c.customer === customer && normalizeForCatalogMatch(c.item) === key) || null;
   };
   // Every real customer Sheet writes dates as dot-separated D.M.YY ("5.1.24", "26.1.24") — never with
   // Rows land in the ledger already dot-formatted now (normalizeDateToDots runs at extraction time,
@@ -2228,8 +2229,13 @@ function FIMSApp() {
         .map(f => (f.sheetGroup || '').trim()),
       ...pendingRowsForCustomer.map(row => ((pendingTabBlockForms[row.id] && pendingTabBlockForms[row.id].sheetGroup) || '').trim()),
     ].filter(Boolean)));
-    const knownTabNamesLower = new Set(itemGroups.map(g => (g.tabName || '').trim().toLowerCase()));
-    const newProbeNames = probeTabNames.filter(t => !knownTabNamesLower.has(t.toLowerCase()));
+    // Deliberately NOT excluding a probe name just because it looks like it already matches an
+    // itemGroups tab: real customer sheets routinely have trailing spaces / inconsistent casing in tab
+    // names (see normalizeTabKey's comments), so a plain client-side string comparison here could
+    // wrongly skip probing a tab whose REAL resolved name (only the backend actually knows it) differs
+    // by exactly that kind of formatting — leaving the Block picker with nothing and no fallback. A
+    // probe that turns out to duplicate an already-included tab just costs one harmless extra read.
+    const newProbeNames = probeTabNames;
     const itemGroupsForPreview = [...itemGroups, ...newProbeNames.map(t => ({ tabName: t, variants: [] }))];
     // Still fire the preview call with an EMPTY itemGroups array when there's nothing routed/probed yet
     // — the backend reads the real Sheet's tab list regardless of itemGroups content (see readPushState),
@@ -3380,7 +3386,8 @@ function FIMSApp() {
                       <tbody>
                         {pendingProductionRows.map(row => {
                           const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
-                          const needsTabBlock = effectiveCustomer && !isItemKnownForCustomer(effectiveCustomer, row.description);
+                          const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
+                          const needsTabBlock = effectiveCustomer && !catalogEntry;
                           const draft = pendingTabBlockForms[row.id];
                           const tabBlockUnresolved = needsTabBlock && !((draft && draft.sheetGroup) || '').trim();
                           return (
@@ -3403,8 +3410,8 @@ function FIMSApp() {
                                 draft={draft} onChange={(field, value) => updatePendingTabBlockForm(row.id, field, value)} />
                             ) : (
                               <>
-                                <td className="doc-hint">{effectiveCustomer ? '—' : ''}</td>
-                                <td className="doc-hint">{effectiveCustomer ? '—' : ''}</td>
+                                <td className="doc-hint">{catalogEntry ? (catalogEntry.sheetGroup || catalogEntry.item) : ''}</td>
+                                <td className="doc-hint">{catalogEntry ? (catalogEntry.block || catalogEntry.item) : ''}</td>
                               </>
                             )}
                             <td className="col-action">
@@ -3436,7 +3443,8 @@ function FIMSApp() {
                       <tbody>
                         {pendingDispatchRows.map(row => {
                           const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
-                          const needsTabBlock = effectiveCustomer && !isItemKnownForCustomer(effectiveCustomer, row.description);
+                          const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
+                          const needsTabBlock = effectiveCustomer && !catalogEntry;
                           const draft = pendingTabBlockForms[row.id];
                           const tabBlockUnresolved = needsTabBlock && !((draft && draft.sheetGroup) || '').trim();
                           return (
@@ -3460,8 +3468,8 @@ function FIMSApp() {
                                 draft={draft} onChange={(field, value) => updatePendingTabBlockForm(row.id, field, value)} />
                             ) : (
                               <>
-                                <td className="doc-hint">{effectiveCustomer ? '—' : ''}</td>
-                                <td className="doc-hint">{effectiveCustomer ? '—' : ''}</td>
+                                <td className="doc-hint">{catalogEntry ? (catalogEntry.sheetGroup || catalogEntry.item) : ''}</td>
+                                <td className="doc-hint">{catalogEntry ? (catalogEntry.block || catalogEntry.item) : ''}</td>
                               </>
                             )}
                             <td className="col-action">
