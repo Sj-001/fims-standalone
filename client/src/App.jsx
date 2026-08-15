@@ -1717,9 +1717,16 @@ function FIMSApp() {
   // different names (once per name) would each read the pre-first-call arrays from a stale closure,
   // and the second call would silently overwrite/drop the first's addition — a real bug, not just a
   // cosmetic staleness quirk, since these two setState calls target the exact same array.
-  const registerAliases = (customer, names, sheetGroup) => {
+  // `block` (optional): the REAL block title in the customer's actual Sheet this name should land
+  // under, when it differs from the name itself (e.g. alias "HANDLE LOCK" really means block "Tijori
+  // Handle") — stored on the entry only when it differs, same "blank = same as item name" convention
+  // the Sheet Tab column already uses. Read back at push time by buildCustomerSheetPayload, which
+  // applies it as an automatic blockTitleOverride — so once an alias's real block is known here, every
+  // future row with that same wording routes straight into the right block, no manual re-picking.
+  const registerAliases = (customer, names, sheetGroup, block) => {
     const c = (customer || '').trim();
     const sg = (sheetGroup || '').trim();
+    const blk = (block || '').trim();
     const list = Array.from(new Set((names || []).map(n => (n || '').trim()).filter(Boolean)));
     if (!c || !sg || !list.length) return;
     const existingItems = new Set(productCatalog.map(x => catalogDedupKey(x.customer, x.item)));
@@ -1729,7 +1736,7 @@ function FIMSApp() {
       const key = catalogDedupKey(c, name);
       if (existingItems.has(key) || seenCatalogKeys.has(key)) return;
       seenCatalogKeys.add(key);
-      newCatalogEntries.push({ id: genId(), customer: c, item: name, sheetGroup: sg });
+      newCatalogEntries.push({ id: genId(), customer: c, item: name, sheetGroup: sg, ...(blk && blk !== name ? { block: blk } : {}) });
     });
     if (newCatalogEntries.length) persistCatalog([...productCatalog, ...newCatalogEntries]);
     const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
@@ -2033,8 +2040,11 @@ function FIMSApp() {
   const buildCustomerSheetPayload = (customer) => {
     const groups = customerStockGroups.filter(g => g.customer === customer);
     const sheetGroupByItem = {};
+    const blockByItem = {};
     productCatalog.filter(c => c.customer === customer).forEach(c => {
-      sheetGroupByItem[normalizeForCatalogMatch(c.item)] = (c.sheetGroup || c.item || '').trim();
+      const key = normalizeForCatalogMatch(c.item);
+      sheetGroupByItem[key] = (c.sheetGroup || c.item || '').trim();
+      if (c.block && c.block.trim()) blockByItem[key] = c.block.trim();
     });
     const unmatched = [];
     const tabsMap = {};
@@ -2049,6 +2059,11 @@ function FIMSApp() {
       // Sheet uses for that variant's shared tab.
       if (!sheetGroup) { unmatched.push(g.description || '(blank description)'); return; }
       if (!tabsMap[sheetGroup]) tabsMap[sheetGroup] = [];
+      // blockTitleOverride from the catalog's stored alias->block mapping (see registerAliases) — set
+      // automatically here so a wording once routed by hand through the block picker never needs to be
+      // re-picked on a later push; an explicit reviewEdits override (picked fresh in the review UI)
+      // still wins over this, see applyReviewEdits.
+      const catalogBlock = blockByItem[key];
       tabsMap[sheetGroup].push({
         title: g.description || 'Item',
         header: ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
@@ -2063,6 +2078,7 @@ function FIMSApp() {
           e.hasDispatch ? (e.dispatch || 0) : null,
           e.closing,
         ]),
+        ...(catalogBlock ? { blockTitleOverride: catalogBlock } : {}),
       });
     });
     const itemGroups = Object.entries(tabsMap).map(([tabName, variants]) => ({ tabName, variants }));
@@ -2577,7 +2593,7 @@ function FIMSApp() {
     const rawAlias = (description || '').trim();
     const item = (form.item || rawAlias).trim();
     if (!customer || !sheetGroup || !item) return;
-    registerAliases(customer, [item, rawAlias], sheetGroup);
+    registerAliases(customer, [item, rawAlias], sheetGroup, item);
     reassignUnassignedRows();
     setAssignForms(prev => { const next = { ...prev }; delete next[groupId]; return next; });
   };
@@ -2595,17 +2611,17 @@ function FIMSApp() {
     const rawAlias = (description || '').trim();
     const item = (form.item || rawAlias).trim();
     if (!customer || !sheetGroup || !item) return;
-    registerAliases(customer, [item, rawAlias], sheetGroup);
+    registerAliases(customer, [item, rawAlias], sheetGroup, item);
     setUnmatchedAssignForms(prev => { const next = { ...prev }; delete next[key]; return next; });
   };
   // Add-new-alias form for the dedicated Aliases tab.
-  const [newAliasForm, setNewAliasForm] = useState({ customer: '', item: '', sheetGroup: '' });
+  const [newAliasForm, setNewAliasForm] = useState({ customer: '', item: '', sheetGroup: '', block: '' });
   const updateNewAliasForm = (field, value) => setNewAliasForm(prev => ({ ...prev, [field]: value }));
   const addAliasFromForm = () => {
-    const { customer, item, sheetGroup } = newAliasForm;
+    const { customer, item, sheetGroup, block } = newAliasForm;
     if (!customer.trim() || !item.trim() || !sheetGroup.trim()) return;
-    registerAliases(customer, [item], sheetGroup);
-    setNewAliasForm({ customer: '', item: '', sheetGroup: '' });
+    registerAliases(customer, [item], sheetGroup, block);
+    setNewAliasForm({ customer: '', item: '', sheetGroup: '', block: '' });
   };
   const pushCustomerSheetNow = async (customer) => {
     const sheetId = getCustomerSheetId(customer).trim();
@@ -3804,12 +3820,13 @@ function FIMSApp() {
                     <div className="section-label">{customer} ({productCatalog.filter(c => c.customer === customer).length} items)</div>
                     <div className="table-wrap">
                       <table>
-                        <thead><tr><th>Item name</th><th>Sheet Tab (item group)</th><th className="col-action"></th></tr></thead>
+                        <thead><tr><th>Item name</th><th>Sheet Tab (item group)</th><th>Block (blank = same as item name)</th><th className="col-action"></th></tr></thead>
                         <tbody>
                           {productCatalog.filter(c => c.customer === customer).map(c => (
                             <tr key={c.id}>
                               <td><input className="cell-input" value={c.item} onChange={e => updateCatalogItem(c.id, 'item', e.target.value)} /></td>
                               <td><input className="cell-input" value={c.sheetGroup || ''} placeholder={c.item} onChange={e => updateCatalogItem(c.id, 'sheetGroup', e.target.value)} /></td>
+                              <td><input className="cell-input" value={c.block || ''} placeholder={c.item} onChange={e => updateCatalogItem(c.id, 'block', e.target.value)} /></td>
                               <td className="col-action"><button className="icon-btn danger" onClick={() => deleteCatalogItem(c.id)}><Trash2 size={15} /></button></td>
                             </tr>
                           ))}
@@ -3867,6 +3884,17 @@ function FIMSApp() {
                   <datalist id={`alias-sheetgroups-${(newAliasForm.customer || '').trim().toLowerCase()}`}>
                     {Array.from(new Set(productCatalog.filter(c => c.customer.toLowerCase() === (newAliasForm.customer || '').trim().toLowerCase()).map(c => c.sheetGroup))).filter(Boolean).map(s => <option value={s} key={s} />)}
                   </datalist>
+                  <input
+                    className="text-input"
+                    list={`alias-blocks-${(newAliasForm.customer || '').trim().toLowerCase()}`}
+                    placeholder="Block it should land under (blank = same as item name)"
+                    style={{ width: 220 }}
+                    value={newAliasForm.block}
+                    onChange={e => updateNewAliasForm('block', e.target.value)}
+                  />
+                  <datalist id={`alias-blocks-${(newAliasForm.customer || '').trim().toLowerCase()}`}>
+                    {Array.from(new Set(productCatalog.filter(c => c.customer.toLowerCase() === (newAliasForm.customer || '').trim().toLowerCase()).map(c => c.block || c.item))).filter(Boolean).map(b => <option value={b} key={b} />)}
+                  </datalist>
                   <button className="btn btn-primary" disabled={!newAliasForm.customer.trim() || !newAliasForm.item.trim() || !newAliasForm.sheetGroup.trim()} onClick={addAliasFromForm}>
                     <Plus size={15} /> Add alias
                   </button>
@@ -3879,12 +3907,13 @@ function FIMSApp() {
                     <div className="section-label">{customer} ({productCatalog.filter(c => c.customer === customer).length})</div>
                     <div className="table-wrap">
                       <table>
-                        <thead><tr><th>Alias / item name</th><th>Sheet tab</th><th className="col-action"></th></tr></thead>
+                        <thead><tr><th>Alias / item name</th><th>Sheet tab</th><th>Block (blank = same as item name)</th><th className="col-action"></th></tr></thead>
                         <tbody>
                           {productCatalog.filter(c => c.customer === customer).map(c => (
                             <tr key={c.id}>
                               <td><input className="cell-input" value={c.item} onChange={e => updateCatalogItem(c.id, 'item', e.target.value)} /></td>
                               <td><input className="cell-input" value={c.sheetGroup || ''} placeholder={c.item} onChange={e => updateCatalogItem(c.id, 'sheetGroup', e.target.value)} /></td>
+                              <td><input className="cell-input" value={c.block || ''} placeholder={c.item} onChange={e => updateCatalogItem(c.id, 'block', e.target.value)} /></td>
                               <td className="col-action"><button className="icon-btn danger" onClick={() => deleteCatalogItem(c.id)}><Trash2 size={15} /></button></td>
                             </tr>
                           ))}
