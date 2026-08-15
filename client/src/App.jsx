@@ -3548,9 +3548,14 @@ function FIMSApp() {
                           {!review.error && !!mismatchCount && (
                             <div className="error-box"><AlertCircle size={16} /><span>{mismatchCount} row{mismatchCount === 1 ? '' : 's'} below {mismatchCount === 1 ? 'is' : 'are'} flagged — already dated in the real Sheet but with different numbers (or unreadable). Nothing flagged gets pushed; edit or delete the row if it needs fixing.</span></div>
                           )}
-                          {reviewTabs.map(tab => (tab.variants || []).filter(v => (v.rows || []).length > 0).map(v => (
-                            <div key={`${tab.tabName}::${v.title}`} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
-                              <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
+                          {reviewTabs.map(tab => (tab.variants || []).filter(v => (v.rows || []).length > 0).map(v => {
+                            const needsBlock = !tab.isNewTab && v.isNewBlock;
+                            const blockOverride = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].blockTitleOverride) || '';
+                            const unassigned = needsBlock && !blockOverride;
+                            const existingBlocks = tab.existingBlockTitles || [];
+                            return (
+                            <div key={`${tab.tabName}::${v.title}`} style={{ border: `1px solid ${unassigned ? 'var(--ledger-red)' : 'var(--border)'}`, borderRadius: 8, padding: 10, marginBottom: 8 }}>
+                              <div style={{ display: 'flex', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
                                 <strong>{v.title}</strong>
                                 <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>— Sheet tab:</span>
                                 <input
@@ -3564,18 +3569,13 @@ function FIMSApp() {
                                   {(review.existingTabNames || []).map(t => <option value={t} key={t} />)}
                                 </datalist>
                                 {tab.isNewTab && <span className="doc-hint">(new — this tab doesn't exist yet)</span>}
-                              </div>
-                              {!tab.isNewTab && v.isNewBlock && (() => {
-                                const blockOverride = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].blockTitleOverride) || '';
-                                const existingBlocks = tab.existingBlockTitles || [];
-                                return (
-                                  <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+                                {needsBlock && (
+                                  <>
                                     <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>— Block:</span>
                                     <input
                                       className="cell-input"
-                                      style={{ width: 220, fontSize: 12 }}
+                                      style={{ width: 200, fontSize: 12, borderColor: unassigned ? 'var(--ledger-red)' : undefined }}
                                       list={`review-blocks-${customer}-${tab.tabName}`}
-                                      placeholder="Pick the item's real block in this tab…"
                                       value={blockOverride}
                                       onChange={e => setBlockOverride(customer, v.title, e.target.value)}
                                     />
@@ -3583,14 +3583,17 @@ function FIMSApp() {
                                       {existingBlocks.map(t => <option value={t} key={t} />)}
                                       <option value={v.title}>{`+ New block: "${v.title}"`}</option>
                                     </datalist>
-                                    <span className="doc-hint">
-                                      {blockOverride
-                                        ? (existingBlocks.includes(blockOverride) ? '(matched to an existing block)' : '(will create this as a new block)')
-                                        : "(not yet assigned — pick the item's real block above, or it'll create a new one on push)"}
-                                    </span>
-                                  </div>
-                                );
-                              })()}
+                                    {unassigned && (
+                                      <AlertCircle
+                                        size={15}
+                                        color="var(--ledger-red)"
+                                        style={{ flexShrink: 0 }}
+                                        title="Not yet assigned to a block — pick one from the dropdown, or it'll create a new one named after the item on push."
+                                      />
+                                    )}
+                                  </>
+                                )}
+                              </div>
                               <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
                                 <thead>
                                   <tr style={{ textAlign: 'left', color: 'var(--muted)' }}>
@@ -3705,7 +3708,8 @@ function FIMSApp() {
                                 );
                               })()}
                             </div>
-                          )))}
+                            );
+                          }))}
                         </div>
                       );
                     })()}
@@ -3996,18 +4000,25 @@ function FIMSApp() {
                           <div className="error-box"><AlertCircle size={16} /><span>{mismatchCount} row{mismatchCount === 1 ? '' : 's'} below {mismatchCount === 1 ? 'is' : 'are'} flagged — already dated in the real Sheet but with different numbers (or unreadable). Nothing flagged gets pushed; fix on the Customer Stock tab.</span></div>
                         )}
                         {hasAnyNewRows && <p className="doc-hint" style={{ marginBottom: 8 }}>Read-only — to edit, delete, add, or move a row before pushing, use the Customer Stock tab.</p>}
-                        {reviewTabs.map(tab => (tab.variants || []).filter(v => (v.rows || []).length > 0).map(v => (
-                          <div key={`${tab.tabName}::${v.title}`} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
-                            <div style={{ marginBottom: 6 }}>
+                        {reviewTabs.map(tab => (tab.variants || []).filter(v => (v.rows || []).length > 0).map(v => {
+                          const needsBlock = !tab.isNewTab && v.isNewBlock;
+                          const blockOverride = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].blockTitleOverride) || '';
+                          const unassigned = needsBlock && !blockOverride;
+                          return (
+                          <div key={`${tab.tabName}::${v.title}`} style={{ border: `1px solid ${unassigned ? 'var(--ledger-red)' : 'var(--border)'}`, borderRadius: 8, padding: 10, marginBottom: 8 }}>
+                            <div style={{ marginBottom: 6, display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
                               <strong>{v.title}</strong>{' '}
                               <span className="doc-hint">— Sheet tab: {(reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) || tab.tabName}</span>
                               {tab.isNewTab && <span className="doc-hint"> (new — this tab doesn't exist yet)</span>}
-                              {!tab.isNewTab && v.isNewBlock && (() => {
-                                const blockOverride = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].blockTitleOverride) || '';
-                                return blockOverride
-                                  ? <span className="doc-hint"> — block: {blockOverride}</span>
-                                  : <span className="doc-hint"> (new block — not yet assigned; assign it on the Customer Stock tab)</span>;
-                              })()}
+                              {needsBlock && <span className="doc-hint"> — Block: {blockOverride || '—'}</span>}
+                              {unassigned && (
+                                <AlertCircle
+                                  size={15}
+                                  color="var(--ledger-red)"
+                                  style={{ flexShrink: 0 }}
+                                  title="Not yet assigned to a block — assign it on the Customer Stock tab, or it'll create a new one named after the item on push."
+                                />
+                              )}
                             </div>
                             <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
                               <thead>
@@ -4051,7 +4062,8 @@ function FIMSApp() {
                               </tbody>
                             </table>
                           </div>
-                        )))}
+                          );
+                        }))}
                       </div>
                     )}
                   </div>
