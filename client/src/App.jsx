@@ -1649,17 +1649,21 @@ function FIMSApp() {
   /* -------- customer name aliases (a dispatch bill's/register's raw "as written" customer text ->
      the one real known customer it means, e.g. "Bindal technopolymer pvt. ltd." -> "BINDAL STOCK
      1.08.26") -------- */
-  const persistCustomerNameAliases = (next) => {
-    setCustomerNameAliases(next);
-    scheduleSave('customerNameAliases', () => window.storage.set(CUSTOMER_NAME_ALIASES_KEY, JSON.stringify(next), false).catch(() => {}));
-  };
+  // Functional setState updater (never a plain `setCustomerNameAliases([...customerNameAliases, entry])`
+  // reading the outer closure) — required because confirmAllPendingProduction/confirmAllPendingDispatch
+  // call this once per row via confirmStockRow in a tight synchronous loop, and a closure-based read
+  // would have every call but the last one silently clobber the ones before it.
   const registerCustomerNameAlias = (alias, customer) => {
     const a = (alias || '').trim();
     const c = (customer || '').trim();
     if (!a || !c || a.toLowerCase() === c.toLowerCase()) return;
     const key = a.toLowerCase();
-    if (customerNameAliases.some(x => (x.alias || '').trim().toLowerCase() === key)) return;
-    persistCustomerNameAliases([...customerNameAliases, { id: genId(), alias: a, customer: c }]);
+    setCustomerNameAliases(prev => {
+      if (prev.some(x => (x.alias || '').trim().toLowerCase() === key)) return prev;
+      const next = [...prev, { id: genId(), alias: a, customer: c }];
+      scheduleSave('customerNameAliases', () => window.storage.set(CUSTOMER_NAME_ALIASES_KEY, JSON.stringify(next), false).catch(() => {}));
+      return next;
+    });
   };
   // Recovery tool for exactly the "phantom customer" situation the dropdown above now mostly prevents
   // going forward: an existing bucket of confirmed Production/Dispatch rows sitting under a name that
@@ -1758,11 +1762,14 @@ function FIMSApp() {
   };
   // Registers one or more alias/name spellings for a customer + sheet tab as a single batch — adds a
   // Product Catalog entry (routes to the right Sheet tab) and an exact-match Customer Mapping keyword
-  // rule (routes to the right customer) for whichever names aren't already known. Batched into one
-  // persistCatalog/persistCustomerMapping call each on purpose: calling this twice in a row for two
-  // different names (once per name) would each read the pre-first-call arrays from a stale closure,
-  // and the second call would silently overwrite/drop the first's addition — a real bug, not just a
-  // cosmetic staleness quirk, since these two setState calls target the exact same array.
+  // rule (routes to the right customer) for whichever names aren't already known.
+  // Uses FUNCTIONAL setState updaters (reading `prev`, never the outer `productCatalog`/`customerMapping`
+  // closure) — required because confirmAllPendingProduction/confirmAllPendingDispatch now call this once
+  // per row in a tight synchronous loop (via confirmStockRow) to register each row's picked block. With a
+  // plain `persistCatalog([...productCatalog, ...newEntries])` call, EVERY call in that loop would read
+  // the SAME pre-loop snapshot of productCatalog (React doesn't re-render between them), so each call's
+  // write would silently clobber the previous one's — only the LAST row's alias would ever actually
+  // persist. The functional form correctly threads the real, up-to-date array through every call.
   // `block` (optional): the REAL block title in the customer's actual Sheet this name should land
   // under, when it differs from the name itself (e.g. alias "HANDLE LOCK" really means block "Tijori
   // Handle") — stored on the entry only when it differs, same "blank = same as item name" convention
@@ -1775,26 +1782,36 @@ function FIMSApp() {
     const blk = (block || '').trim();
     const list = Array.from(new Set((names || []).map(n => (n || '').trim()).filter(Boolean)));
     if (!c || !sg || !list.length) return;
-    const existingItems = new Set(productCatalog.map(x => catalogDedupKey(x.customer, x.item)));
-    const seenCatalogKeys = new Set();
-    const newCatalogEntries = [];
-    list.forEach(name => {
-      const key = catalogDedupKey(c, name);
-      if (existingItems.has(key) || seenCatalogKeys.has(key)) return;
-      seenCatalogKeys.add(key);
-      newCatalogEntries.push({ id: genId(), customer: c, item: name, sheetGroup: sg, ...(blk && blk !== name ? { block: blk } : {}) });
+    setProductCatalog(prev => {
+      const existingItems = new Set(prev.map(x => catalogDedupKey(x.customer, x.item)));
+      const seenCatalogKeys = new Set();
+      const newCatalogEntries = [];
+      list.forEach(name => {
+        const key = catalogDedupKey(c, name);
+        if (existingItems.has(key) || seenCatalogKeys.has(key)) return;
+        seenCatalogKeys.add(key);
+        newCatalogEntries.push({ id: genId(), customer: c, item: name, sheetGroup: sg, ...(blk && blk !== name ? { block: blk } : {}) });
+      });
+      if (!newCatalogEntries.length) return prev;
+      const next = [...prev, ...newCatalogEntries];
+      scheduleSave('catalog', () => window.storage.set(CATALOG_KEY, JSON.stringify(next), false).catch(() => {}));
+      return next;
     });
-    if (newCatalogEntries.length) persistCatalog([...productCatalog, ...newCatalogEntries]);
-    const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
-    const seenKeywords = new Set();
-    const newMappingRules = [];
-    list.forEach(name => {
-      const exact = mappingDedupKey(name);
-      if (!exact || existingKeywords.has(exact) || seenKeywords.has(exact)) return;
-      seenKeywords.add(exact);
-      newMappingRules.push({ id: genId(), keyword: exact, customer: c });
+    setCustomerMapping(prev => {
+      const existingKeywords = new Set(prev.map(r => mappingDedupKey(r.keyword)));
+      const seenKeywords = new Set();
+      const newMappingRules = [];
+      list.forEach(name => {
+        const exact = mappingDedupKey(name);
+        if (!exact || existingKeywords.has(exact) || seenKeywords.has(exact)) return;
+        seenKeywords.add(exact);
+        newMappingRules.push({ id: genId(), keyword: exact, customer: c });
+      });
+      if (!newMappingRules.length) return prev;
+      const next = [...newMappingRules, ...prev];
+      scheduleSave('customerMapping', () => window.storage.set(CUSTOMER_MAPPING_KEY, JSON.stringify(next), false).catch(() => {}));
+      return next;
     });
-    if (newMappingRules.length) persistCustomerMapping([...newMappingRules, ...customerMapping]);
   };
   const matchCustomer = (row) => {
     const hint = (row.customerHint || '').trim();
