@@ -2286,6 +2286,20 @@ function FIMSApp() {
   // ALONGSIDE whatever tab names the Product Catalog already knows, never instead of them, so a Sheet
   // tab picker always offers the real tabs even for a customer with zero catalog entries so far.
   const getRealTabNamesForCustomer = (customer) => (reviewByCustomer[customer] && reviewByCustomer[customer].existingTabNames) || [];
+  // Block names already assigned to OTHER items under this same customer+Sheet tab in the Product
+  // Catalog — e.g. if "Jeera Dhamal 35gm" already routes to block "jeera 35gm x 144" under tab "jeera",
+  // that block should be offered as a pick for any OTHER item being routed to "jeera" too, even before
+  // it's ever actually been pushed to the real Sheet (getRealBlocksForTab alone only knows about blocks
+  // that already physically exist there, which a freshly-aliased-but-not-yet-pushed block never is).
+  const getCatalogBlocksForTab = (customer, sheetGroup) => {
+    const sg = (sheetGroup || '').trim().toLowerCase();
+    if (!customer || !sg) return [];
+    return Array.from(new Set(
+      productCatalog
+        .filter(c => c.customer === customer && (c.sheetGroup || c.item || '').trim().toLowerCase() === sg)
+        .map(c => (c.block || c.item || '').trim())
+    )).filter(Boolean);
+  };
   const setRowEdit = (customer, variantTitle, rowIndex, field, value) => {
     setReviewEdits(prev => {
       const forCustomer = { ...(prev[customer] || {}) };
@@ -3406,7 +3420,10 @@ function FIMSApp() {
                                   ...productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup),
                                   ...getRealTabNamesForCustomer(effectiveCustomer),
                                 ])).filter(Boolean)}
-                                blockOptions={getRealBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || '')}
+                                blockOptions={Array.from(new Set([
+                                  ...getRealBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || ''),
+                                  ...getCatalogBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || ''),
+                                ])).filter(Boolean)}
                                 draft={draft} onChange={(field, value) => updatePendingTabBlockForm(row.id, field, value)} />
                             ) : (
                               <>
@@ -3464,7 +3481,10 @@ function FIMSApp() {
                                   ...productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup),
                                   ...getRealTabNamesForCustomer(effectiveCustomer),
                                 ])).filter(Boolean)}
-                                blockOptions={getRealBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || '')}
+                                blockOptions={Array.from(new Set([
+                                  ...getRealBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || ''),
+                                  ...getCatalogBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || ''),
+                                ])).filter(Boolean)}
                                 draft={draft} onChange={(field, value) => updatePendingTabBlockForm(row.id, field, value)} />
                             ) : (
                               <>
@@ -3540,9 +3560,13 @@ function FIMSApp() {
                             ...getRealTabNamesForCustomer(chosenCustomer),
                           ])).filter(Boolean);
                           const chosenSheetGroup = (form.sheetGroup || '').trim();
-                          // Real block titles from the customer's actual Sheet tab, not the local
-                          // Product Catalog — see the matching comment in the unmatched-items form above.
-                          const existingBlocks = getRealBlocksForTab(chosenCustomer, chosenSheetGroup);
+                          // Both what physically already exists in the real Sheet tab, AND whatever
+                          // block name other Product Catalog entries under this same tab already use
+                          // (which may not be pushed to the real Sheet yet — see getCatalogBlocksForTab).
+                          const existingBlocks = Array.from(new Set([
+                            ...getRealBlocksForTab(chosenCustomer, chosenSheetGroup),
+                            ...getCatalogBlocksForTab(chosenCustomer, chosenSheetGroup),
+                          ])).filter(Boolean);
                           const canAssign = chosenCustomer && chosenSheetGroup && (form.item || g.description || '').trim();
                           return (
                             <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
@@ -3675,10 +3699,13 @@ function FIMSApp() {
                               ...getRealTabNamesForCustomer(customer),
                             ])).filter(Boolean);
                             const chosenSheetGroup = (form.sheetGroup || '').trim();
-                            // Real block titles from the customer's actual Sheet tab (same source the
-                            // review section below uses), not the local Product Catalog — the catalog
-                            // can lag behind or omit blocks that already exist for real in the Sheet.
-                            const existingBlocks = getRealBlocksForTab(customer, chosenSheetGroup);
+                            // Both what physically already exists in the real Sheet tab, AND whatever
+                            // block name other Product Catalog entries under this same tab already use
+                            // (which may not be pushed to the real Sheet yet — see getCatalogBlocksForTab).
+                            const existingBlocks = Array.from(new Set([
+                              ...getRealBlocksForTab(customer, chosenSheetGroup),
+                              ...getCatalogBlocksForTab(customer, chosenSheetGroup),
+                            ])).filter(Boolean);
                             const canAssign = chosenSheetGroup && (form.item || description || '').trim();
                             const group = groupsForCustomer.find(g => g.description === description);
                             return (
