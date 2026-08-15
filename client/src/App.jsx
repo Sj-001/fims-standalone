@@ -2115,6 +2115,12 @@ function FIMSApp() {
     const { itemGroups, unmatched } = buildCustomerSheetPayload(customer);
     return { itemGroups: applyReviewEdits(itemGroups, reviewEdits[customer]), unmatched };
   };
+  // Declared up here (rather than down by the rest of their assign-form logic, further below) because
+  // refreshReview/reviewRefreshKey read them and reviewRefreshKey's value is computed synchronously on
+  // every render, not deferred inside a callback — referencing a later `const [x] = useState()` from
+  // here would be a genuine temporal-dead-zone crash, not just a stale-closure issue.
+  const [assignForms, setAssignForms] = useState({});
+  const [unmatchedAssignForms, setUnmatchedAssignForms] = useState({}); // keyed by `${customer}::${description}`
   // Dry-runs the CURRENT (edited) payload against the customer's real Sheet so the review area always
   // shows an accurate diff — old row (from the real Sheet, read fresh every time) next to the new
   // row(s) about to be appended — rather than a locally-guessed one. Called automatically whenever the
@@ -2546,8 +2552,8 @@ function FIMSApp() {
   // Manual assign form for the Unassigned section (Customer Stock tab) — lets a person route a
   // stuck item straight to a customer + sheet tab + item block by hand instead of only being able
   // to fix it indirectly via a Customer Mapping keyword rule. One form per unassigned group, keyed
-  // by group id, so several can be filled in without clobbering each other.
-  const [assignForms, setAssignForms] = useState({});
+  // by group id, so several can be filled in without clobbering each other. (State declared earlier,
+  // above refreshReview — see the comment there.)
   const updateAssignForm = (groupId, field, value) => setAssignForms(prev => ({ ...prev, [groupId]: { ...prev[groupId], [field]: value } }));
   // Same two-step fix an unassigned row already gets from a Customer Mapping rule: (1) make sure a
   // Product Catalog entry exists mapping this item to the chosen customer + sheet tab, so it lands
@@ -2579,8 +2585,8 @@ function FIMSApp() {
   // matched a Customer Mapping rule), but its exact wording doesn't match any Product Catalog item,
   // so buildCustomerSheetPayload has nowhere to route it and silently excludes it from what gets
   // pushed. Same underlying fix as the Unassigned assign form (register the wording as an alias), just
-  // with the customer field already fixed instead of picked — there's nothing to guess there.
-  const [unmatchedAssignForms, setUnmatchedAssignForms] = useState({}); // keyed by `${customer}::${description}`
+  // with the customer field already fixed instead of picked — there's nothing to guess there. (State
+  // declared earlier, above refreshReview — see the comment there.)
   const updateUnmatchedAssignForm = (key, field, value) => setUnmatchedAssignForms(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
   const assignUnmatchedItem = (customer, description) => {
     const key = `${customer}::${description}`;
