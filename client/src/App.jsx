@@ -2102,7 +2102,12 @@ function FIMSApp() {
         })
         .filter(Boolean);
       if (!regrouped[finalTab]) regrouped[finalTab] = [];
-      regrouped[finalTab].push({ ...v, rows });
+      // blockTitleOverride: which of the tab's REAL existing blocks this item was explicitly assigned
+      // to via the block picker (or the "+ New block" choice) — v.title itself (the item's real name)
+      // is never rewritten, so it keeps working as the stable key reviewEdits/moveReviewRow/etc. are
+      // all keyed by. Only sent when actually set, so an untouched item's behavior is unchanged.
+      const blockTitleOverride = (e && e.blockTitleOverride && e.blockTitleOverride.trim()) ? e.blockTitleOverride.trim() : undefined;
+      regrouped[finalTab].push(blockTitleOverride ? { ...v, rows, blockTitleOverride } : { ...v, rows });
     }));
     return Object.entries(regrouped).map(([tabName, variants]) => ({ tabName, variants }));
   };
@@ -2151,6 +2156,16 @@ function FIMSApp() {
     setReviewEdits(prev => {
       const forCustomer = { ...(prev[customer] || {}) };
       forCustomer[variantTitle] = { ...(forCustomer[variantTitle] || {}), tabNameOverride: tabName };
+      return { ...prev, [customer]: forCustomer };
+    });
+  };
+  // Assigns which of the tab's REAL existing blocks a not-yet-matched item should be pushed into
+  // (picked from the block-picker dropdown), or an explicit "+ New block" choice — see the block
+  // picker UI below. Mirrors setTabOverride exactly.
+  const setBlockOverride = (customer, variantTitle, blockTitle) => {
+    setReviewEdits(prev => {
+      const forCustomer = { ...(prev[customer] || {}) };
+      forCustomer[variantTitle] = { ...(forCustomer[variantTitle] || {}), blockTitleOverride: blockTitle };
       return { ...prev, [customer]: forCustomer };
     });
   };
@@ -3548,10 +3563,34 @@ function FIMSApp() {
                                 <datalist id={`review-tabs-${customer}`}>
                                   {(review.existingTabNames || []).map(t => <option value={t} key={t} />)}
                                 </datalist>
-                                {tab.isNewTab
-                                  ? <span className="doc-hint">(new — this tab doesn't exist yet)</span>
-                                  : v.isNewBlock && <span className="doc-hint">(new — this block doesn't exist yet)</span>}
+                                {tab.isNewTab && <span className="doc-hint">(new — this tab doesn't exist yet)</span>}
                               </div>
+                              {!tab.isNewTab && v.isNewBlock && (() => {
+                                const blockOverride = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].blockTitleOverride) || '';
+                                const existingBlocks = tab.existingBlockTitles || [];
+                                return (
+                                  <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, marginBottom: 6 }}>
+                                    <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>— Block:</span>
+                                    <input
+                                      className="cell-input"
+                                      style={{ width: 220, fontSize: 12 }}
+                                      list={`review-blocks-${customer}-${tab.tabName}`}
+                                      placeholder="Pick the item's real block in this tab…"
+                                      value={blockOverride}
+                                      onChange={e => setBlockOverride(customer, v.title, e.target.value)}
+                                    />
+                                    <datalist id={`review-blocks-${customer}-${tab.tabName}`}>
+                                      {existingBlocks.map(t => <option value={t} key={t} />)}
+                                      <option value={v.title}>{`+ New block: "${v.title}"`}</option>
+                                    </datalist>
+                                    <span className="doc-hint">
+                                      {blockOverride
+                                        ? (existingBlocks.includes(blockOverride) ? '(matched to an existing block)' : '(will create this as a new block)')
+                                        : "(not yet assigned — pick the item's real block above, or it'll create a new one on push)"}
+                                    </span>
+                                  </div>
+                                );
+                              })()}
                               <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
                                 <thead>
                                   <tr style={{ textAlign: 'left', color: 'var(--muted)' }}>
@@ -3962,9 +4001,13 @@ function FIMSApp() {
                             <div style={{ marginBottom: 6 }}>
                               <strong>{v.title}</strong>{' '}
                               <span className="doc-hint">— Sheet tab: {(reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) || tab.tabName}</span>
-                              {tab.isNewTab
-                                ? <span className="doc-hint"> (new — this tab doesn't exist yet)</span>
-                                : v.isNewBlock && <span className="doc-hint"> (new — this block doesn't exist yet)</span>}
+                              {tab.isNewTab && <span className="doc-hint"> (new — this tab doesn't exist yet)</span>}
+                              {!tab.isNewTab && v.isNewBlock && (() => {
+                                const blockOverride = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].blockTitleOverride) || '';
+                                return blockOverride
+                                  ? <span className="doc-hint"> — block: {blockOverride}</span>
+                                  : <span className="doc-hint"> (new block — not yet assigned; assign it on the Customer Stock tab)</span>;
+                              })()}
                             </div>
                             <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
                               <thead>

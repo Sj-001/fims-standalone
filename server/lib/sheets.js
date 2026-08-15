@@ -706,7 +706,11 @@ function computeMergePatches(existingGrid, variants) {
   const existingGroups = new Map(); // match -> [{ v, incomingRows }]
   const rest = [];
   (Array.isArray(variants) ? variants : []).forEach(v => {
-    const key = normalizeTabKey(v.title);
+    // blockTitleOverride: set when the person explicitly picked which real block a not-yet-matched
+    // item belongs to (see the block-picker in the review UI) — takes priority over the item's own
+    // title for matching purposes ONLY; v.title itself (the item's real name) is left untouched so it
+    // keeps working as the stable key the client's review edits are stored under.
+    const key = normalizeTabKey(v.blockTitleOverride || v.title);
     const match = blocks.find(b => normalizeTabKey(b.title) === key);
     const incomingRows = Array.isArray(v.rows) ? v.rows : [];
     if (match) {
@@ -719,7 +723,11 @@ function computeMergePatches(existingGrid, variants) {
   existingGroups.forEach((entries, match) => processBlockGroup(match, entries));
 
   rest.forEach(({ v, incomingRows }) => {
-    const key = normalizeTabKey(v.title);
+    // Same override-aware key as above — and the actual new block's title text, if one truly gets
+    // created below, also has to honor it: if the person explicitly typed a name via "+ New block",
+    // that's the name that should land in the Sheet, not silently the item's own title.
+    const blockTitle = v.blockTitleOverride || v.title;
+    const key = normalizeTabKey(blockTitle);
     const header = (v.header && v.header.length) ? v.header : ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'];
     // A PRECEDING variant with no pre-existing block, but the SAME title, may have already created
     // this exact block earlier in this same loop (matching the original append-only behavior) — route
@@ -734,7 +742,7 @@ function computeMergePatches(existingGrid, variants) {
       const dispCol = colLetter(startCol + 3);
       const closingCol = colLetter(startCol + width - 1);
       const dataStartRow0 = usedHeaderRowIdx + 1;
-      patches.push({ startRow0: usedHeaderRowIdx - 1, startCol0: startCol, values: [[v.title || '']] });
+      patches.push({ startRow0: usedHeaderRowIdx - 1, startCol0: startCol, values: [[blockTitle || '']] });
       patches.push({ startRow0: usedHeaderRowIdx, startCol0: startCol, values: [header] });
       let prevRow1 = null;
       const values = incomingRows.map((r, i) => {
@@ -757,7 +765,7 @@ function computeMergePatches(existingGrid, variants) {
       const newExistingRows = incomingRows.map((r, i) => ({ rowIdx: dataStartRow0 + i, dateKey: canonicalDateKey((r || [])[0]) }));
       const newExistingValues = new Map(incomingRows.map((r, i) => [canonicalDateKey((r || [])[0]), { production: Number((r || [])[2]) || 0, dispatch: Number((r || [])[3]) || 0, rowIdx: dataStartRow0 + i }]));
       blocks.push({
-        title: v.title, startCol, width, nextRowIdx: dataStartRow0 + values.length,
+        title: blockTitle, startCol, width, nextRowIdx: dataStartRow0 + values.length,
         existingDates: new Set(newExistingRows.map(er => er.dateKey)), existingValuesByDate: newExistingValues,
         existingRowsOrdered: newExistingRows, lastRowValues: null,
       });
@@ -865,6 +873,16 @@ const normalizeTabKey = (name) => {
   s = s.replace(/\d+\s*(pkt|pkts|ppkt|ppkts|pcs|nos|ctn|ctns|box|boxes|bag|bags|unit|units)\.?\s*$/i, '').trim();
   // Unit spelling: "65GM" and "65g" mean the same thing.
   s = s.replace(/(\d)\s*gm\b/gi, '$1g');
+  // Blanket "pkt"/"pkts" strip, wherever it appears — not just trailing-with-a-digit-prefix like the
+  // two rules above require. Real block titles have shown up with the word landing mid-string or
+  // followed by more text (e.g. a trailing "(BOWL)" after the count), which the anchored `$` rules
+  // above never reach. Deliberately NO word-boundary requirement before it, same reasoning as the
+  // client's normalizeForCatalogMatch: it's routinely glued straight onto a digit with no space
+  // ("70pkt", "40pkt"), and a digit/letter join isn't a regex word boundary anyway. "pkt"/"pkts" (and
+  // the "ppkt" typo seen in real sheets) is never part of a real item's identity, so it's always safe
+  // to drop outright. Confirmed per explicit customer instruction: "always ignore the pkt/pkts string
+  // whenever matching."
+  s = s.replace(/p+kts?\.?/gi, '');
   // Collapse all remaining whitespace so "64 g" and "64g" compare equal.
   s = s.replace(/\s+/g, '');
   return s;
@@ -1199,7 +1217,8 @@ function previewCustomerSheet(previousValuesByTab, tabPlans, missing) {
     const existingGroups = new Map(); // match -> [v, ...]
     const restVariants = [];
     (plan.variants || []).forEach(v => {
-      const key = normalizeTabKey(v.title);
+      // Same blockTitleOverride priority as the real push (computeMergePatches) — see its comment.
+      const key = normalizeTabKey(v.blockTitleOverride || v.title);
       const match = blocks.find(b => normalizeTabKey(b.title) === key);
       if (match) {
         if (!existingGroups.has(match)) existingGroups.set(match, []);
@@ -1233,18 +1252,21 @@ function previewCustomerSheet(previousValuesByTab, tabPlans, missing) {
     };
     existingGroups.forEach((vs, match) => processGroup(match, vs));
     restVariants.forEach(v => {
-      const key = normalizeTabKey(v.title);
+      const key = normalizeTabKey(v.blockTitleOverride || v.title);
       const rematch = blocks.find(b => normalizeTabKey(b.title) === key);
       if (rematch) { processGroup(rematch, [v]); return; }
       const incomingRows = Array.isArray(v.rows) ? v.rows : [];
       resultByVariant.set(v, buildDisplayRows(null, classifyIncomingRows(null, incomingRows)));
     });
     const variants = (plan.variants || []).map(v => {
-      const key = normalizeTabKey(v.title);
+      const key = normalizeTabKey(v.blockTitleOverride || v.title);
       const match = blocks.find(b => normalizeTabKey(b.title) === key);
       return { title: v.title, isNewBlock: !match, rows: resultByVariant.get(v) || [] };
     });
-    return { tabName: plan.tabName, isNewTab: missing.includes(plan.tabName), variants };
+    // Real, pre-existing block titles in this tab ONLY — `blocks` here is never mutated with a
+    // fabricated "new block" entry during preview (unlike the real push), so this is exactly the list
+    // the client's block-picker dropdown needs to offer for a not-yet-matched item, nothing invented.
+    return { tabName: plan.tabName, isNewTab: missing.includes(plan.tabName), existingBlockTitles: blocks.map(b => b.title), variants };
   });
 }
 
