@@ -2123,17 +2123,41 @@ function FIMSApp() {
   const refreshReview = async (customer) => {
     const sheetId = getCustomerSheetId(customer).trim();
     const { itemGroups } = getEditedPayload(customer);
-    if (!sheetId || !itemGroups.length) { setReviewByCustomer(prev => ({ ...prev, [customer]: null })); return; }
+    // Bare tab-name probes: whatever's currently typed into this customer's "Sheet tab" field on the
+    // unassigned / not-yet-routed assign forms, even before anything is confirmed to land there. Sent
+    // as tabName-only groups (no variants) so readPushState/previewCustomerSheet still read that tab's
+    // REAL current blocks — otherwise a tab with zero currently-routed items never gets read at all,
+    // and the Block picker for a customer whose items are ALL still unmatched would always show empty.
+    const probeTabNames = Array.from(new Set([
+      ...Object.entries(unmatchedAssignForms)
+        .filter(([key]) => key.startsWith(`${customer}::`))
+        .map(([, f]) => (f.sheetGroup || '').trim()),
+      ...Object.values(assignForms)
+        .filter(f => (f.customer || '').trim().toLowerCase() === customer.toLowerCase())
+        .map(f => (f.sheetGroup || '').trim()),
+    ].filter(Boolean)));
+    const knownTabNamesLower = new Set(itemGroups.map(g => (g.tabName || '').trim().toLowerCase()));
+    const newProbeNames = probeTabNames.filter(t => !knownTabNamesLower.has(t.toLowerCase()));
+    const itemGroupsForPreview = [...itemGroups, ...newProbeNames.map(t => ({ tabName: t, variants: [] }))];
+    if (!sheetId || !itemGroupsForPreview.length) { setReviewByCustomer(prev => ({ ...prev, [customer]: null })); return; }
     setReviewByCustomer(prev => ({ ...prev, [customer]: { ...(prev[customer] || {}), loading: true, error: '' } }));
     try {
       const res = await fetch('/api/customer-sheets/preview', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
-        body: JSON.stringify({ spreadsheetId: sheetId, itemGroups }),
+        body: JSON.stringify({ spreadsheetId: sheetId, itemGroups: itemGroupsForPreview }),
       });
       if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return; }
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.ok) {
-        setReviewByCustomer(prev => ({ ...prev, [customer]: { loading: false, error: '', tabs: data.tabs, existingTabNames: data.existingTabNames || [] } }));
+        // Probe-only entries come back at the same positions they were appended at, in order — pull
+        // their real block titles into a name -> titles map so the picker can look a typed Sheet tab
+        // name up directly (exact string, same as what was sent), no tab-name re-normalization needed.
+        const probedBlocksByTabName = {};
+        newProbeNames.forEach((name, i) => {
+          const t = (data.tabs || [])[itemGroups.length + i];
+          probedBlocksByTabName[name] = (t && t.existingBlockTitles) || [];
+        });
+        setReviewByCustomer(prev => ({ ...prev, [customer]: { loading: false, error: '', tabs: data.tabs, existingTabNames: data.existingTabNames || [], probedBlocksByTabName } }));
       } else {
         setReviewByCustomer(prev => ({ ...prev, [customer]: { loading: false, error: data.error || `Preview failed (HTTP ${res.status}).`, tabs: [] } }));
       }
@@ -2251,6 +2275,12 @@ function FIMSApp() {
   const reviewRefreshKey = JSON.stringify({
     groups: customerStockGroups.map(g => ({ c: g.customer, d: g.description, ledger: g.ledger })),
     catalog: productCatalog, sheetIds: customerSheetIds, edits: reviewEdits,
+    // Sheet tab names typed into the not-yet-routed assign forms — included so pausing on a newly
+    // typed tab name re-probes the real Sheet for that tab's blocks (see refreshReview).
+    pendingTabs: [
+      ...Object.entries(unmatchedAssignForms).map(([k, f]) => [k, f.sheetGroup || '']),
+      ...Object.entries(assignForms).map(([k, f]) => [k, f.customer || '', f.sheetGroup || '']),
+    ],
   });
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -3341,9 +3371,14 @@ function FIMSApp() {
                           const chosenSheetGroup = (form.sheetGroup || '').trim();
                           // Real block titles from the customer's actual Sheet tab, not the local
                           // Product Catalog — see the matching comment in the unmatched-items form above.
-                          const matchedReviewTab = chosenSheetGroup && (reviewByCustomer[chosenCustomer] && reviewByCustomer[chosenCustomer].tabs || [])
+                          // Tabs with already-routed items are matched by name out of `tabs`; a tab with
+                          // nothing routed there yet only gets read via the probe map (see refreshReview).
+                          const chosenCustomerReview = reviewByCustomer[chosenCustomer];
+                          const matchedReviewTab = chosenSheetGroup && chosenCustomerReview && (chosenCustomerReview.tabs || [])
                             .find(t => t.tabName.toLowerCase() === chosenSheetGroup.toLowerCase());
-                          const existingBlocks = (matchedReviewTab && matchedReviewTab.existingBlockTitles) || [];
+                          const existingBlocks = (matchedReviewTab && matchedReviewTab.existingBlockTitles)
+                            || (chosenCustomerReview && chosenCustomerReview.probedBlocksByTabName && chosenCustomerReview.probedBlocksByTabName[chosenSheetGroup])
+                            || [];
                           const canAssign = chosenCustomer && chosenSheetGroup && (form.item || g.description || '').trim();
                           return (
                             <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
@@ -3478,9 +3513,15 @@ function FIMSApp() {
                             // Real block titles from the customer's actual Sheet tab (same source the
                             // review section below uses), not the local Product Catalog — the catalog
                             // can lag behind or omit blocks that already exist for real in the Sheet.
-                            const matchedReviewTab = chosenSheetGroup && (reviewByCustomer[customer] && reviewByCustomer[customer].tabs || [])
+                            // Tabs with already-routed items are matched by name out of `tabs`; a tab
+                            // with nothing routed there yet only gets read via the probe map below (see
+                            // refreshReview) — this customer's items being ALL unmatched is exactly that case.
+                            const customerReview = reviewByCustomer[customer];
+                            const matchedReviewTab = chosenSheetGroup && customerReview && (customerReview.tabs || [])
                               .find(t => t.tabName.toLowerCase() === chosenSheetGroup.toLowerCase());
-                            const existingBlocks = (matchedReviewTab && matchedReviewTab.existingBlockTitles) || [];
+                            const existingBlocks = (matchedReviewTab && matchedReviewTab.existingBlockTitles)
+                              || (customerReview && customerReview.probedBlocksByTabName && customerReview.probedBlocksByTabName[chosenSheetGroup])
+                              || [];
                             const canAssign = chosenSheetGroup && (form.item || description || '').trim();
                             const group = groupsForCustomer.find(g => g.description === description);
                             return (
