@@ -775,11 +775,14 @@ function computeMergePatches(existingGrid, variants) {
 }
 
 // Highlight color for the "what's new since last push" formatting below — a warm tint matching this
-// app's own accent color, applied ONLY to the exact cells a patch just wrote. There's no more "reset
-// everything to white first" step: since a push never touches a pre-existing cell anymore, there's
-// nothing to fade — a cell keeps its highlight from whichever push actually last wrote it, and a
-// person can always clear formatting by hand for a cell they've since confirmed/reviewed.
+// app's own accent color, applied to the exact cells a patch just wrote — and ONLY those, so the
+// highlight always means "new since the last push," never "new at some unknown point in the past."
+// Every push first clears any leftover highlight from an EARLIER push (see readHighlightedCellsByTab
+// and buildUnhighlightRequests below) before applying this push's own, so highlighting never just
+// keeps accumulating forever.
 const HIGHLIGHT_COLOR = { red: 0.941, green: 0.886, blue: 0.769 };
+const NO_HIGHLIGHT_COLOR = { red: 1, green: 1, blue: 1 };
+const HIGHLIGHT_COLOR_TOLERANCE = 0.01;
 
 // Turns the same patches that were just written into the matching repeatCell highlight requests —
 // built from the identical structured data (startRow0/startCol0/values), so the highlighted range can
@@ -801,6 +804,77 @@ function buildHighlightRequestsForPatches(sheetId, patches) {
       },
     };
   });
+}
+const colorsClose = (a, b) => Math.abs((a.red || 0) - b.red) < HIGHLIGHT_COLOR_TOLERANCE
+  && Math.abs((a.green || 0) - b.green) < HIGHLIGHT_COLOR_TOLERANCE
+  && Math.abs((a.blue || 0) - b.blue) < HIGHLIGHT_COLOR_TOLERANCE;
+// Reads which cells in the given (already-existing) tabs currently carry THIS app's highlight color —
+// never any other formatting a customer's own sheet template might have — so a fresh push can clear
+// exactly last push's highlight and nothing else. One read call for every tab about to be written to.
+async function readHighlightedCellsByTab(sheets, spreadsheetId, tabNames, existingMeta) {
+  const realTabs = (tabNames || []).filter(t => existingMeta[t]);
+  if (!realTabs.length) return {};
+  const resp = await sheets.spreadsheets.get({
+    spreadsheetId,
+    ranges: realTabs.map(t => wholeSheetRangeA1(t, existingMeta[t])),
+    fields: 'sheets(properties(title),data(startRow,startColumn,rowData(values(userEnteredFormat(backgroundColor)))))',
+  });
+  const result = {};
+  (resp.data.sheets || []).forEach(s => {
+    const title = s.properties.title;
+    const cells = [];
+    (s.data || []).forEach(d => {
+      const rowOffset = d.startRow || 0;
+      const colOffset = d.startColumn || 0;
+      (d.rowData || []).forEach((rd, ri) => {
+        (rd.values || []).forEach((cell, ci) => {
+          const bg = cell.userEnteredFormat && cell.userEnteredFormat.backgroundColor;
+          if (bg && colorsClose(bg, HIGHLIGHT_COLOR)) cells.push({ row: rowOffset + ri, col: colOffset + ci });
+        });
+      });
+    });
+    result[title] = cells;
+  });
+  return result;
+}
+// Merges a row's highlighted column indices into contiguous [start, end] spans, so an appended
+// ledger row (columns highlighted wall-to-wall) costs one repeatCell request, not one per cell.
+function runLengthEncodeColumns(cols) {
+  const sorted = Array.from(cols).sort((a, b) => a - b);
+  const spans = [];
+  let start = null, prev = null;
+  sorted.forEach(c => {
+    if (start === null) { start = c; prev = c; return; }
+    if (c === prev + 1) { prev = c; return; }
+    spans.push([start, prev]);
+    start = c; prev = c;
+  });
+  if (start !== null) spans.push([start, prev]);
+  return spans;
+}
+// Resets exactly the cells readHighlightedCellsByTab found still carrying an earlier push's highlight
+// back to no fill — never a blanket whole-tab reset, so any OTHER formatting the customer's own sheet
+// template has (header shading, borders, whatever) is never touched.
+function buildUnhighlightRequests(sheetId, highlightedCells) {
+  if (sheetId === undefined || sheetId === null || !highlightedCells || !highlightedCells.length) return [];
+  const colsByRow = new Map();
+  highlightedCells.forEach(({ row, col }) => {
+    if (!colsByRow.has(row)) colsByRow.set(row, new Set());
+    colsByRow.get(row).add(col);
+  });
+  const requests = [];
+  colsByRow.forEach((cols, row) => {
+    runLengthEncodeColumns(cols).forEach(([c0, c1]) => {
+      requests.push({
+        repeatCell: {
+          range: { sheetId, startRowIndex: row, endRowIndex: row + 1, startColumnIndex: c0, endColumnIndex: c1 + 1 },
+          cell: { userEnteredFormat: { backgroundColor: NO_HIGHLIGHT_COLOR } },
+          fields: 'userEnteredFormat.backgroundColor',
+        },
+      });
+    });
+  });
+  return requests;
 }
 
 // Real customer spreadsheets routinely have tab names with trailing spaces or inconsistent casing
@@ -991,8 +1065,20 @@ async function pushCustomerSheet(spreadsheetId, itemGroups) {
       return tabPlans.map(plan => ({ tab: plan.tabName, ok: false, error: msg }));
     }
   }
+  // Clear whatever's left highlighted from an EARLIER push before applying this one's — otherwise
+  // highlighting only ever accumulates and stops meaning "new since last push." Only tabs that already
+  // existed before this push can have a leftover highlight to clear; a tab just created above is empty.
+  // Best-effort: a failure here shouldn't block this push's own (successful) highlight from applying.
+  let highlightedCellsByTab = {};
+  try {
+    const preExistingTabNames = tabPlans.map(p => p.tabName).filter(t => !missing.includes(t));
+    highlightedCellsByTab = await readHighlightedCellsByTab(sheets, spreadsheetId, preExistingTabNames, existingMeta);
+  } catch (e) {
+    console.error('Customer sheet pre-push highlight read failed — skipping un-highlight this push:', e);
+  }
   tabPlans.forEach(plan => {
     const sheetId = existingMeta[plan.tabName] && existingMeta[plan.tabName].sheetId;
+    formatRequests.push(...buildUnhighlightRequests(sheetId, highlightedCellsByTab[plan.tabName]));
     formatRequests.push(...buildHighlightRequestsForPatches(sheetId, patchesByTab[plan.tabName]));
   });
   if (formatRequests.length) {

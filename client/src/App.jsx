@@ -831,6 +831,34 @@ function CustomerSuggestCell({ value, guess, isKnownGuess, knownCustomers, onCha
     </select>
   );
 }
+// "Sheet tab" / "Block" cells on a Pending Production/Dispatch Review row, shown only once a real
+// customer is picked/confirmed AND the Product Catalog doesn't already know this item — i.e. exactly
+// the case Customer Stock's "not routed to a Sheet tab yet" section exists to catch, just settled here
+// instead, in the same step as picking the customer. Confirming the row (see confirmStockRow) reads
+// this draft and registers it as a Product Catalog alias, so it's remembered for every future row with
+// this same wording — no second pass needed. Leaving Block blank falls back to a new block named after
+// the item, same convention as everywhere else this picker appears.
+function TabBlockPickerCells({ rowId, description, sheetGroupOptions, blockOptions, draft, onChange }) {
+  const sheetGroup = (draft && draft.sheetGroup) || '';
+  const block = (draft && draft.block) || '';
+  return (
+    <>
+      <td>
+        <input className="cell-input" style={{ width: 110, fontSize: 12 }} list={`pending-sheetgroup-${rowId}`}
+          placeholder="Sheet tab" value={sheetGroup} onChange={e => onChange('sheetGroup', e.target.value)} />
+        <datalist id={`pending-sheetgroup-${rowId}`}>{sheetGroupOptions.map(s => <option key={s} value={s} />)}</datalist>
+      </td>
+      <td>
+        <input className="cell-input" style={{ width: 140, fontSize: 12 }} list={`pending-block-${rowId}`}
+          placeholder="Block (blank = new block)" value={block} onChange={e => onChange('block', e.target.value)} />
+        <datalist id={`pending-block-${rowId}`}>
+          {blockOptions.map(b => <option key={b} value={b} />)}
+          <option value={description}>{`+ New block: "${description}"`}</option>
+        </datalist>
+      </td>
+    </>
+  );
+}
 // One dropdown per real-world invoice/party, above the itemized Pending Review table, so picking a
 // customer for a multi-line bill doesn't mean repeating the same pick on every one of its rows.
 // Applying it sets every row in the group at once; "Confirm all N" then confirms just this group
@@ -1829,11 +1857,22 @@ function FIMSApp() {
     // automatically when the hint already IS the customer name, or when there's nothing to learn.
     const rawHint = (row.customerHint || '').trim();
     if (rawHint && customer !== 'Unassigned') registerCustomerNameAlias(rawHint, customer);
+    // If a Sheet tab (and optionally a block) was picked right here on the Pending Review row for an
+    // item the Product Catalog didn't already know, register it now — same alias mechanism as Customer
+    // Stock's "not routed" flow, just settled in this same confirm step instead of a second pass later.
+    const tabBlockDraft = pendingTabBlockForms[row.id];
+    const draftSheetGroup = (tabBlockDraft && tabBlockDraft.sheetGroup || '').trim();
+    if (customer !== 'Unassigned' && draftSheetGroup) {
+      const description = (row.description || '').trim();
+      const block = (tabBlockDraft.block || description).trim();
+      registerAliases(customer, [description], draftSheetGroup, block);
+    }
     registerSetters[registerKey](prev => {
       const next = prev.map(r => r.id === row.id ? { ...r, confirmedCustomer: customer, stockConfirmed: true } : r);
       persist(registerKey, next);
       return next;
     });
+    if (tabBlockDraft) setPendingTabBlockForms(prev => { const next = { ...prev }; delete next[row.id]; return next; });
   };
   // "Confirm all suggested" must never silently confirm a row onto a fabricated new-customer guess —
   // only rows that are either already explicitly picked (row.confirmedCustomer set via the dropdown)
@@ -2033,6 +2072,15 @@ function FIMSApp() {
     .replace(/(\d)\s*gm\b/g, '$1g')
     .replace(/\bcont\.?\b/g, 'container')
     .replace(/[^a-z0-9]/g, '');
+  // Whether a description already has a Product Catalog entry for this customer — i.e. whether it
+  // would land in a real Sheet tab on push without needing a Sheet tab/Block picked for it anywhere.
+  // Used to decide whether the Pending Review tables need to show the tab/block picker for a row at
+  // confirm time, before it's even reached Customer Stock's "not routed" fallback section.
+  const isItemKnownForCustomer = (customer, description) => {
+    if (!customer || customer === 'Unassigned') return true;
+    const key = normalizeForCatalogMatch(description || '');
+    return productCatalog.some(c => c.customer === customer && normalizeForCatalogMatch(c.item) === key);
+  };
   // Every real customer Sheet writes dates as dot-separated D.M.YY ("5.1.24", "26.1.24") — never with
   // Rows land in the ledger already dot-formatted now (normalizeDateToDots runs at extraction time,
   // see DOCUMENT_TYPES above) — this second call right before push is a safety net for anything that
@@ -2137,6 +2185,12 @@ function FIMSApp() {
   // here would be a genuine temporal-dead-zone crash, not just a stale-closure issue.
   const [assignForms, setAssignForms] = useState({});
   const [unmatchedAssignForms, setUnmatchedAssignForms] = useState({}); // keyed by `${customer}::${description}`
+  // Sheet tab / Block picked directly on a Pending Production/Dispatch Review row, for an item that
+  // isn't in the Product Catalog yet — keyed by the register row's own id. Applied at confirm time (see
+  // confirmStockRow) so an unknown item's routing is settled in the SAME step as picking its customer,
+  // instead of needing a second pass through Customer Stock's "not routed" section afterward.
+  const [pendingTabBlockForms, setPendingTabBlockForms] = useState({});
+  const updatePendingTabBlockForm = (id, field, value) => setPendingTabBlockForms(prev => ({ ...prev, [id]: { ...prev[id], [field]: value } }));
   // Dry-runs the CURRENT (edited) payload against the customer's real Sheet so the review area always
   // shows an accurate diff — old row (from the real Sheet, read fresh every time) next to the new
   // row(s) about to be appended — rather than a locally-guessed one. Called automatically whenever the
@@ -2150,6 +2204,10 @@ function FIMSApp() {
     // as tabName-only groups (no variants) so readPushState/previewCustomerSheet still read that tab's
     // REAL current blocks — otherwise a tab with zero currently-routed items never gets read at all,
     // and the Block picker for a customer whose items are ALL still unmatched would always show empty.
+    const pendingRowsForCustomer = [...pendingProductionRows, ...pendingDispatchRows].filter(row => {
+      const guess = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
+      return (guess || '').trim().toLowerCase() === customer.toLowerCase();
+    });
     const probeTabNames = Array.from(new Set([
       ...Object.entries(unmatchedAssignForms)
         .filter(([key]) => key.startsWith(`${customer}::`))
@@ -2157,6 +2215,7 @@ function FIMSApp() {
       ...Object.values(assignForms)
         .filter(f => (f.customer || '').trim().toLowerCase() === customer.toLowerCase())
         .map(f => (f.sheetGroup || '').trim()),
+      ...pendingRowsForCustomer.map(row => ((pendingTabBlockForms[row.id] && pendingTabBlockForms[row.id].sheetGroup) || '').trim()),
     ].filter(Boolean)));
     const knownTabNamesLower = new Set(itemGroups.map(g => (g.tabName || '').trim().toLowerCase()));
     const newProbeNames = probeTabNames.filter(t => !knownTabNamesLower.has(t.toLowerCase()));
@@ -2186,6 +2245,20 @@ function FIMSApp() {
     } catch (e) {
       setReviewByCustomer(prev => ({ ...prev, [customer]: { loading: false, error: e.message || 'Network error — could not reach the server.', tabs: [] } }));
     }
+  };
+  // Real block titles for a customer's Sheet tab, sourced from whatever refreshReview last fetched —
+  // checks an already-routed tab (`tabs`, matched by name) first, then a bare probe-only tab
+  // (`probedBlocksByTabName`, keyed by the exact string sent). Shared by every Block picker in this app
+  // (Customer Stock's unassigned/not-routed forms, Pending Review) so a typed Sheet tab name resolves to
+  // the same real blocks no matter which form it's typed into.
+  const getRealBlocksForTab = (customer, sheetGroup) => {
+    const sg = (sheetGroup || '').trim();
+    if (!sg) return [];
+    const rev = reviewByCustomer[customer];
+    if (!rev) return [];
+    const matchedTab = (rev.tabs || []).find(t => t.tabName.toLowerCase() === sg.toLowerCase());
+    if (matchedTab && matchedTab.existingBlockTitles) return matchedTab.existingBlockTitles;
+    return (rev.probedBlocksByTabName && rev.probedBlocksByTabName[sg]) || [];
   };
   const setRowEdit = (customer, variantTitle, rowIndex, field, value) => {
     setReviewEdits(prev => {
@@ -2302,6 +2375,8 @@ function FIMSApp() {
     pendingTabs: [
       ...Object.entries(unmatchedAssignForms).map(([k, f]) => [k, f.sheetGroup || '']),
       ...Object.entries(assignForms).map(([k, f]) => [k, f.customer || '', f.sheetGroup || '']),
+      ...Object.entries(pendingTabBlockForms).map(([k, f]) => [k, f.sheetGroup || '', f.block || '']),
+      ...[...pendingProductionRows, ...pendingDispatchRows].map(r => [r.id, r.confirmedCustomer || '']),
     ],
   });
   useEffect(() => {
@@ -3276,9 +3351,13 @@ function FIMSApp() {
                   ))}
                   <div className="table-wrap">
                     <table>
-                      <thead><tr><th>Date</th><th>Description</th><th>Pieces</th><th>Suggested Customer</th><th className="col-action"></th></tr></thead>
+                      <thead><tr><th>Date</th><th>Description</th><th>Pieces</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
                       <tbody>
-                        {pendingProductionRows.map(row => (
+                        {pendingProductionRows.map(row => {
+                          const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
+                          const needsTabBlock = effectiveCustomer && !isItemKnownForCustomer(effectiveCustomer, row.description);
+                          const draft = pendingTabBlockForms[row.id];
+                          return (
                           <tr key={row.id}>
                             <td style={{ padding: '6px 10px' }}>{row.date}</td>
                             <td style={{ padding: '6px 10px' }}>{row.description}</td>
@@ -3288,11 +3367,23 @@ function FIMSApp() {
                                 isKnownGuess={isKnownCustomerGuess(row)} knownCustomers={allCustomerTabNames}
                                 onChange={v => updatePendingCustomer('production')(row.id, v)} />
                             </td>
+                            {needsTabBlock ? (
+                              <TabBlockPickerCells rowId={row.id} description={row.description}
+                                sheetGroupOptions={Array.from(new Set(productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup))).filter(Boolean)}
+                                blockOptions={getRealBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || '')}
+                                draft={draft} onChange={(field, value) => updatePendingTabBlockForm(row.id, field, value)} />
+                            ) : (
+                              <>
+                                <td className="doc-hint">{effectiveCustomer ? '—' : ''}</td>
+                                <td className="doc-hint">{effectiveCustomer ? '—' : ''}</td>
+                              </>
+                            )}
                             <td className="col-action">
                               <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm this row" onClick={() => confirmStockRow('production', row)}><CheckCircle2 size={16} /></button>
                             </td>
                           </tr>
-                        ))}
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -3312,9 +3403,13 @@ function FIMSApp() {
                   ))}
                   <div className="table-wrap">
                     <table>
-                      <thead><tr><th>Date</th><th>Invoice No</th><th>Description</th><th>Quantity</th><th>Suggested Customer</th><th className="col-action"></th></tr></thead>
+                      <thead><tr><th>Date</th><th>Invoice No</th><th>Description</th><th>Quantity</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
                       <tbody>
-                        {pendingDispatchRows.map(row => (
+                        {pendingDispatchRows.map(row => {
+                          const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
+                          const needsTabBlock = effectiveCustomer && !isItemKnownForCustomer(effectiveCustomer, row.description);
+                          const draft = pendingTabBlockForms[row.id];
+                          return (
                           <tr key={row.id}>
                             <td style={{ padding: '6px 10px' }}>{row.date}</td>
                             <td style={{ padding: '6px 10px' }}>{row.invoice_no}</td>
@@ -3325,11 +3420,23 @@ function FIMSApp() {
                                 isKnownGuess={isKnownCustomerGuess(row)} knownCustomers={allCustomerTabNames}
                                 onChange={v => updatePendingCustomer('customerDispatch')(row.id, v)} />
                             </td>
+                            {needsTabBlock ? (
+                              <TabBlockPickerCells rowId={row.id} description={row.description}
+                                sheetGroupOptions={Array.from(new Set(productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup))).filter(Boolean)}
+                                blockOptions={getRealBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || '')}
+                                draft={draft} onChange={(field, value) => updatePendingTabBlockForm(row.id, field, value)} />
+                            ) : (
+                              <>
+                                <td className="doc-hint">{effectiveCustomer ? '—' : ''}</td>
+                                <td className="doc-hint">{effectiveCustomer ? '—' : ''}</td>
+                              </>
+                            )}
                             <td className="col-action">
                               <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm this row" onClick={() => confirmStockRow('customerDispatch', row)}><CheckCircle2 size={16} /></button>
                             </td>
                           </tr>
-                        ))}
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -3393,14 +3500,7 @@ function FIMSApp() {
                           const chosenSheetGroup = (form.sheetGroup || '').trim();
                           // Real block titles from the customer's actual Sheet tab, not the local
                           // Product Catalog — see the matching comment in the unmatched-items form above.
-                          // Tabs with already-routed items are matched by name out of `tabs`; a tab with
-                          // nothing routed there yet only gets read via the probe map (see refreshReview).
-                          const chosenCustomerReview = reviewByCustomer[chosenCustomer];
-                          const matchedReviewTab = chosenSheetGroup && chosenCustomerReview && (chosenCustomerReview.tabs || [])
-                            .find(t => t.tabName.toLowerCase() === chosenSheetGroup.toLowerCase());
-                          const existingBlocks = (matchedReviewTab && matchedReviewTab.existingBlockTitles)
-                            || (chosenCustomerReview && chosenCustomerReview.probedBlocksByTabName && chosenCustomerReview.probedBlocksByTabName[chosenSheetGroup])
-                            || [];
+                          const existingBlocks = getRealBlocksForTab(chosenCustomer, chosenSheetGroup);
                           const canAssign = chosenCustomer && chosenSheetGroup && (form.item || g.description || '').trim();
                           return (
                             <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
@@ -3535,15 +3635,7 @@ function FIMSApp() {
                             // Real block titles from the customer's actual Sheet tab (same source the
                             // review section below uses), not the local Product Catalog — the catalog
                             // can lag behind or omit blocks that already exist for real in the Sheet.
-                            // Tabs with already-routed items are matched by name out of `tabs`; a tab
-                            // with nothing routed there yet only gets read via the probe map below (see
-                            // refreshReview) — this customer's items being ALL unmatched is exactly that case.
-                            const customerReview = reviewByCustomer[customer];
-                            const matchedReviewTab = chosenSheetGroup && customerReview && (customerReview.tabs || [])
-                              .find(t => t.tabName.toLowerCase() === chosenSheetGroup.toLowerCase());
-                            const existingBlocks = (matchedReviewTab && matchedReviewTab.existingBlockTitles)
-                              || (customerReview && customerReview.probedBlocksByTabName && customerReview.probedBlocksByTabName[chosenSheetGroup])
-                              || [];
+                            const existingBlocks = getRealBlocksForTab(customer, chosenSheetGroup);
                             const canAssign = chosenSheetGroup && (form.item || description || '').trim();
                             const group = groupsForCustomer.find(g => g.description === description);
                             return (
