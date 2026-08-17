@@ -679,6 +679,28 @@ function computeMergePatches(existingGrid, variants) {
     // trailing range.
     values.forEach(({ row0, out }) => patches.push({ startRow0: row0, startCol0: match.startCol, values: [out] }));
 
+    // Whenever a group of new rows lands directly ABOVE a pre-existing row (beforeRowIdx !== null),
+    // that pre-existing row's own Opening cell still references whatever USED to be its predecessor —
+    // Google Sheets only auto-adjusts a formula's cell reference when the cell it points AT physically
+    // moves; it has no way to know a newly-inserted row should now become the logical predecessor, since
+    // neither the existing row's old predecessor nor its own formula content changed. Left alone, that
+    // one stale link corrupts every row's balance below it, permanently, even though the rest of the
+    // chain (including the just-written new rows above it) is internally consistent — confirmed against
+    // a real customer sheet where exactly this left a pre-existing row's Opening pointing two rows too
+    // far back after new rows were correctly inserted above it. Rewritten here as a fresh live formula
+    // (never a flattened static number, same self-referencing convention as every row this app writes)
+    // chaining from the new group's real last row, so the sheet keeps behaving like a person edited an
+    // old row and everything below it recalculated. Closing is rewritten too, in case that existing
+    // row's Closing was never a formula to begin with — otherwise fixing Opening alone wouldn't help.
+    groups.forEach(g => {
+      if (g.beforeRowIdx === null) return;
+      const existingRow0 = adjustExistingRowIdx(g.beforeRowIdx);
+      const existingRow1 = existingRow0 + 1;
+      const lastNewRow1 = g.finalStartRow + g.rows.length;
+      patches.push({ startRow0: existingRow0, startCol0: match.startCol + 1, values: [[`=${closingCol}${lastNewRow1}`]] });
+      patches.push({ startRow0: existingRow0, startCol0: match.startCol + match.width - 1, values: [[`=${openingCol}${existingRow1}+${prodCol}${existingRow1}-${dispCol}${existingRow1}`]] });
+    });
+
     perEntry.forEach(({ v }, vi) => {
       const lastRow0 = lastRow0ByEntry[vi] !== undefined ? lastRow0ByEntry[vi] : match.nextRowIdx - 1;
       placements.push({ title: v.title, startCol0: match.startCol, width: match.width, lastWrittenRow1: lastRow0 + 1 });
