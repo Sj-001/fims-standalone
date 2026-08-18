@@ -269,6 +269,11 @@ const STORAGE_KEYS = {
   daburSpecs: 'fims_dabur_specs',
   daburPO: 'fims_dabur_po',
   daburDispatch: 'fims_dabur_dispatch',
+  // A local mirror of every customer's real Sheet content (every ledger row across every block/tab),
+  // refreshed whenever a Sheet ID is imported or pushed to — see confirmSheetImport/pushCustomerSheetNow.
+  // Stored as just another flat register (same generic tab-bridge everything else here uses), so global
+  // search can look through every customer's real Sheet data locally, without a live API call per search.
+  customerSheetsMirror: 'fims_customer_sheets_mirror',
 };
 const CATALOG_KEY = 'fims_product_catalog';
 // Exact item names, one per customer — used to correct handwriting misreads during extraction (e.g.
@@ -1053,6 +1058,7 @@ function FIMSApp() {
   const [daburSpecs, setDaburSpecs] = useState([]);
   const [daburPO, setDaburPO] = useState([]);
   const [daburDispatch, setDaburDispatch] = useState([]);
+  const [customerSheetsMirror, setCustomerSheetsMirror] = useState([]); // [{id, customer, sheetTab, block, date, opening, production, dispatch, closing}]
   const [trainingExamples, setTrainingExamples] = useState({});
   const [customerMapping, setCustomerMapping] = useState(DEFAULT_CUSTOMER_MAPPING);
   const [productCatalog, setProductCatalog] = useState(DEFAULT_PRODUCT_CATALOG);
@@ -1077,7 +1083,7 @@ function FIMSApp() {
   // Per-row "move to a different customer" selection, keyed by `${customer}::${variantTitle}::${rowIndex}`.
   const [moveTargets, setMoveTargets] = useState({});
   const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
-  const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch };
+  const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch, customerSheetsMirror: setCustomerSheetsMirror };
   useEffect(() => {
     (async () => {
       const entries = await Promise.all(Object.entries(STORAGE_KEYS).map(async ([k, storageKey]) => [k, await loadRegister(storageKey)]));
@@ -1154,6 +1160,20 @@ function FIMSApp() {
   const persist = useCallback((registerKey, rows) => {
     scheduleSave(`register:${registerKey}`, () => saveRegister(STORAGE_KEYS[registerKey], rows));
   }, [scheduleSave]);
+  // Full-resync semantics for ONE customer's slice of the Customer Sheets Mirror: replaces every row
+  // this customer already had with the fresh set just read from their real Sheet (at import or push
+  // time — see confirmSheetImport/pushCustomerSheetNow), so a block/row renamed or removed for real
+  // never lingers as a stale, unfindable-in-real-life search result. A functional update — not a plain
+  // `setCustomerSheetsMirror([...customerSheetsMirror.filter(...), ...fresh])` reading the outer
+  // closure — for the exact same reason registerAliases needs one: guards against two customers'
+  // imports/pushes landing in the same render tick and silently clobbering each other.
+  const replaceCustomerMirrorRows = (customer, freshRowsForCustomer) => {
+    setCustomerSheetsMirror(prev => {
+      const next = [...prev.filter(r => r.customer !== customer), ...(freshRowsForCustomer || []).map(r => ({ id: genId(), customer, ...r }))];
+      persist('customerSheetsMirror', next);
+      return next;
+    });
+  };
   /* -------- Settings: Clear App Data — a UI version of the direct-API wipe used earlier this
      session, so this doesn't need a one-off script every time a clean retest is wanted. Writes go
      out immediately (not through the debounced `persist`/scheduleSave path) since a clear should be
@@ -2020,7 +2040,12 @@ function FIMSApp() {
   // an invoice number, a PO number, anything, in whichever register it actually lives in. The Customer
   // Stock match is kept separate from the register matches (not just another "register") since it's the
   // one search result showing the produced/dispatched/balance-so-far numbers the old dedicated check
-  // used to show, matched against the customer name and item description together.
+  // used to show, matched against the customer name and item description together. The Customer Sheets
+  // Mirror match is ALSO kept separate — it's read-only (reflects each customer's real, external Sheet;
+  // editing a search result row there would silently diverge from the real Sheet instead of fixing
+  // anything), and can genuinely be large across many customers/blocks/dates, so it's capped rather than
+  // ever rendering an unbounded table.
+  const MIRROR_SEARCH_RESULT_CAP = 300;
   const globalSearchResults = (() => {
     const q = globalQuery.trim().toLowerCase();
     if (!q) return null;
@@ -2028,7 +2053,12 @@ function FIMSApp() {
       .map(reg => ({ ...reg, rows: reg.rows.filter(row => reg.columns.some(c => String(row[c.key] ?? '').toLowerCase().includes(q))) }))
       .filter(reg => reg.rows.length > 0);
     const stockMatches = customerStockGroups.filter(g => g.customer.toLowerCase().includes(q) || g.description.toLowerCase().includes(q));
-    return { registerMatches, stockMatches };
+    const allMirrorMatches = customerSheetsMirror.filter(r =>
+      r.customer.toLowerCase().includes(q) || r.sheetTab.toLowerCase().includes(q) || r.block.toLowerCase().includes(q) || String(r.date || '').toLowerCase().includes(q)
+    );
+    const mirrorMatches = allMirrorMatches.slice(0, MIRROR_SEARCH_RESULT_CAP);
+    const mirrorMatchesTruncated = allMirrorMatches.length > MIRROR_SEARCH_RESULT_CAP;
+    return { registerMatches, stockMatches, mirrorMatches, mirrorMatchesTotal: allMirrorMatches.length, mirrorMatchesTruncated };
   })();
   /* -------- Customer Sheets: push a customer's stock ledger out to THEIR OWN separate Google
      Sheet (not a tab on this app's main sheet) — matching the real BINDAL STOCK.xlsx / DIAMOND.xlsx /
@@ -2551,7 +2581,10 @@ function FIMSApp() {
       // anything stale (a block that got renamed or removed in the Sheet) drops out too, instead of
       // piling up forever. isNew is kept per item just so the review can show what's actually changed.
       const skippedExisting = mode === 'resync' ? items.filter(it => !it.isNew).length : 0;
-      setSheetReview({ spreadsheetId: id, spreadsheetTitle: data.spreadsheetTitle || '', customerName, mode, resyncCustomer, items, skippedExisting });
+      // Carried through to confirmSheetImport, which is where the customer name is actually finalized
+      // (still editable right up to confirm) — the Customer Sheets Mirror gets tagged with whatever
+      // name the person confirms, not this suggested one.
+      setSheetReview({ spreadsheetId: id, spreadsheetTitle: data.spreadsheetTitle || '', customerName, mode, resyncCustomer, items, skippedExisting, mirrorRows: data.mirrorRows || [] });
     } catch (e) {
       setSheetImportError(e.message || 'Network error — could not reach the server.');
     } finally {
@@ -2634,6 +2667,9 @@ function FIMSApp() {
       lastImportedAt: new Date().toISOString(),
       itemCount: nextCatalog.filter(c => c.customer === customer).length,
     });
+    // Seeds/refreshes this customer's slice of the Customer Sheets Mirror with every real ledger row
+    // read at import time, so global search can find it immediately — no separate sync step needed.
+    replaceCustomerMirrorRows(customer, sheetReview.mirrorRows);
     const reassignedCount = reassignUnassignedRows();
     const verb = isFullResync ? 'Re-synced' : sheetReview.mode === 'generate' ? 'Generated' : 'Imported';
     setImportResultMessage(
@@ -2684,7 +2720,7 @@ function FIMSApp() {
         return;
       }
       const items = (data.items || []).map(it => ({ id: genId(), item: it.item, sheetGroup: it.sheetGroup || it.item, include: true, isNew: true }));
-      setSheetReview({ spreadsheetId: sheetId, spreadsheetTitle: customer, customerName: customer, mode: 'generate', resyncCustomer: '', items, skippedExisting: 0 });
+      setSheetReview({ spreadsheetId: sheetId, spreadsheetTitle: customer, customerName: customer, mode: 'generate', resyncCustomer: '', items, skippedExisting: 0, mirrorRows: [] });
       setGenCustomerName(''); setGenSheetId(''); setGenCategories([{ id: genId(), name: '', itemsText: '' }]);
     } catch (e) {
       setGenError(e.message || 'Network error — could not reach the server.');
@@ -2809,6 +2845,10 @@ function FIMSApp() {
         const mismatchNote = mismatchCount ? ` ${mismatchCount} date${mismatchCount === 1 ? '' : 's'} already had a row with different numbers and ${mismatchCount === 1 ? "wasn't" : "weren't"} touched — see the Preview below for details.` : '';
         setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Pushed ${itemGroups.length} item tab${itemGroups.length === 1 ? '' : 's'} just now.${mismatchNote}`, unmatched } }));
         patchCustomerSheetEntry(customer, { sheetId, lastPushedAt: new Date().toISOString() });
+        // Refreshes this customer's slice of the Customer Sheets Mirror with what's really in the Sheet
+        // post-push (the server re-reads it fresh — see pushCustomerSheetHandler) so search reflects the
+        // just-written rows immediately, not just whatever the mirror last had at import time.
+        replaceCustomerMirrorRows(customer, data.mirrorRows || []);
         // The staged edits were for THIS specific diff — once it's actually written, their values are
         // now baked into the real rows the app just appended, so clear them and pull a fresh diff.
         setReviewEdits(prev => { const next = { ...prev }; delete next[customer]; return next; });
@@ -3351,10 +3391,10 @@ function FIMSApp() {
             <div>
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Search Results</h2>
-                <p className="subtitle" style={{ marginBottom: !globalSearchResults || (globalSearchResults.stockMatches.length === 0 && globalSearchResults.registerMatches.length === 0) ? 0 : 16 }}>
-                  Matches for “{globalQuery}” across every register and Customer Stock — plain substring match, case-insensitive. Every row here is the real row — fix or delete it right here, same as on its own tab.
+                <p className="subtitle" style={{ marginBottom: !globalSearchResults || (globalSearchResults.stockMatches.length === 0 && globalSearchResults.registerMatches.length === 0 && globalSearchResults.mirrorMatches.length === 0) ? 0 : 16 }}>
+                  Matches for “{globalQuery}” across every register, Customer Stock, and every customer's real Google Sheet — plain substring match, case-insensitive. Register rows are the real row — fix or delete right here, same as on their own tab; Customer Sheet rows are read-only (they reflect the real Sheet — fix them there, on the Customer Sheets tab).
                 </p>
-                {(!globalSearchResults || (globalSearchResults.stockMatches.length === 0 && globalSearchResults.registerMatches.length === 0)) && (
+                {(!globalSearchResults || (globalSearchResults.stockMatches.length === 0 && globalSearchResults.registerMatches.length === 0 && globalSearchResults.mirrorMatches.length === 0)) && (
                   <p className="subtitle">No matches found.</p>
                 )}
               </div>
@@ -3370,6 +3410,27 @@ function FIMSApp() {
                             <td>{g.customer}</td><td>{g.description}</td>
                             <td>{g.totalProduction}</td><td>{g.totalDispatch}</td>
                             <td style={{ color: g.closingBalance > 0 ? 'var(--ok)' : 'var(--ledger-red)' }}>{g.closingBalance}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+              {globalSearchResults && globalSearchResults.mirrorMatches.length > 0 && (
+                <div className="panel">
+                  <div className="section-label">Customer Sheets — real data ({globalSearchResults.mirrorMatchesTotal})</div>
+                  {globalSearchResults.mirrorMatchesTruncated && (
+                    <p className="doc-hint" style={{ marginBottom: 8 }}>Showing the first {MIRROR_SEARCH_RESULT_CAP} of {globalSearchResults.mirrorMatchesTotal} matches — narrow your search to see the rest.</p>
+                  )}
+                  <div className="table-wrap">
+                    <table>
+                      <thead><tr><th>Customer</th><th>Sheet Tab</th><th>Block</th><th>Date</th><th>Opening</th><th>Production</th><th>Dispatch</th><th>Closing</th></tr></thead>
+                      <tbody>
+                        {globalSearchResults.mirrorMatches.map(r => (
+                          <tr key={r.id}>
+                            <td>{r.customer}</td><td>{r.sheetTab}</td><td>{r.block}</td><td>{r.date}</td>
+                            <td>{r.opening}</td><td>{r.production}</td><td>{r.dispatch}</td><td>{r.closing}</td>
                           </tr>
                         ))}
                       </tbody>

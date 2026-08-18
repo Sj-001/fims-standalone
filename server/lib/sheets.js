@@ -1442,9 +1442,34 @@ function extractItemsFromTabGrid(tabName, grid) {
   return items;
 }
 
-// Reads every non-"summary" tab of the given spreadsheet and returns the full item list, plus the
-// spreadsheet's own title (used as a suggested customer name — editable by the person importing it,
-// same as the existing file-upload import flow already lets them edit the suggested name).
+// Flattens a tab's every real block/date into one array of {sheetTab, block, date, opening,
+// production, dispatch, closing} — the shape the client's "Customer Sheets Mirror" register stores
+// (one row per real ledger line, across every block in the tab), so the global search box can find
+// anything in a customer's real Sheet without a live API call per search. Reuses parseExistingBlocks
+// (already correctly finds every block/date in a tab) rather than re-deriving block/row detection —
+// same reasoning as computeMergePatches above, kept as one shared implementation.
+function extractMirrorRowsFromGrid(tabName, grid) {
+  const { blocks } = parseExistingBlocks(grid);
+  const rows = [];
+  blocks.forEach(b => {
+    if (b.width < 4) return; // narrower than Date/Opening/Production/Dispatch/Closing — nothing to mirror
+    b.existingRowsOrdered.forEach(er => {
+      const vals = b.existingValuesByDate.get(er.dateKey);
+      if (!vals) return;
+      const rawDate = normalizeDateCell((grid[er.rowIdx] || [])[b.startCol]);
+      rows.push({ sheetTab: tabName, block: b.title, date: rawDate, opening: vals.opening, production: vals.production, dispatch: vals.dispatch, closing: vals.closing });
+    });
+  });
+  return rows;
+}
+
+// Reads every non-"summary" tab of the given spreadsheet and returns the full item list (for the
+// Product Catalog) AND every real ledger row flattened for the Customer Sheets Mirror (for global
+// search) — both derived from the SAME single read, so seeding/refreshing the mirror never costs an
+// extra API call beyond what importing already does. spreadsheetTitle is used as a suggested customer
+// name — editable by the person importing it, same as the existing file-upload import flow already
+// lets them edit the suggested name. valueRenderOption UNFORMATTED_VALUE matters here specifically for
+// the mirror's numbers (a formatted "1,220" would not parse back to 1220 as a plain Number).
 async function importCustomerSheet(spreadsheetId) {
   const sheets = getSheetsClient();
   const meta = await sheets.spreadsheets.get({
@@ -1457,21 +1482,24 @@ async function importCustomerSheet(spreadsheetId) {
   (meta.data.sheets || []).forEach(s => { gridPropsByTitle[s.properties.title] = s.properties.gridProperties || {}; });
   const dataTabTitles = allTabTitles.filter(t => !/summary/i.test(t));
   if (!dataTabTitles.length) {
-    return { spreadsheetTitle, tabCount: allTabTitles.length, items: [] };
+    return { spreadsheetTitle, tabCount: allTabTitles.length, items: [], mirrorRows: [] };
   }
   // See wholeSheetRangeA1 above: a bare tab name is ambiguous with a cell reference (e.g. "N200",
   // "E900") and the Sheets API will silently read the wrong thing. Always quote + range every tab.
   const resp = await sheets.spreadsheets.values.batchGet({
     spreadsheetId,
     ranges: dataTabTitles.map(t => wholeSheetRangeA1(t, gridPropsByTitle[t])),
+    valueRenderOption: 'UNFORMATTED_VALUE',
   });
   const items = [];
+  const mirrorRows = [];
   (resp.data.valueRanges || []).forEach((vr, idx) => {
     const tabName = dataTabTitles[idx];
     const grid = vr.values || [];
     extractItemsFromTabGrid(tabName, grid).forEach(it => items.push(it));
+    extractMirrorRowsFromGrid(tabName, grid).forEach(r => mirrorRows.push(r));
   });
-  return { spreadsheetTitle, tabCount: allTabTitles.length, items };
+  return { spreadsheetTitle, tabCount: allTabTitles.length, items, mirrorRows };
 }
 
 // --- HTTP handlers ---
@@ -1504,7 +1532,19 @@ async function pushCustomerSheetHandler(req, res) {
     }
     const results = await pushCustomerSheet(String(spreadsheetId).trim(), itemGroups);
     const failed = results.filter(r => !r.ok);
-    res.status(failed.length ? 502 : 200).json({ ok: failed.length === 0, results });
+    // Refresh the Customer Sheets Mirror with what's REALLY in the sheet now, post-write — a fresh
+    // read (via the same importCustomerSheet used at import time) rather than reconstructing values
+    // from the push's own patches, since those carry live formula strings (e.g. "=E5") for
+    // Opening/Closing, not the evaluated numbers Google Sheets has now actually computed. Best-effort:
+    // a refresh failure here must never mask the push's own (already-succeeded) results.
+    let mirrorRows = [];
+    try {
+      const fresh = await importCustomerSheet(String(spreadsheetId).trim());
+      mirrorRows = fresh.mirrorRows;
+    } catch (e) {
+      console.error('Post-push Customer Sheets Mirror refresh failed (push itself still succeeded):', e);
+    }
+    res.status(failed.length ? 502 : 200).json({ ok: failed.length === 0, results, mirrorRows });
   } catch (e) {
     console.error('Customer sheet push error:', e);
     res.status(502).json({ error: friendlyGoogleError(e) });
