@@ -528,18 +528,19 @@ IMPORTANT — column format varies between mills, read carefully:
     hint: 'The handwritten daily sheet workers use to record raw material consumed — columns are usually Shade, GSM, Size, Weight, and Balance Left.',
     register: 'consumption',
     systemPrompt: `You read a handwritten daily raw-material consumption report from a corrugated box factory. The sheet has Hindi column headers. Most rows share one date written once at the top. Return ONLY one JSON object:
-{"date":"as written at the top, DD/MM/YYYY","items":[{"shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number","balance_left":"the टुकड़ा / Tukda column value (this is the running balance left, NOT a piece count) as a number, or empty string if that row has none","date_override":"only include this if a specific row has a different date than the header, else omit","flag":"only if you couldn't reliably read this row's weight/balance — e.g. a column looks cut off/missing, or there's a crossed-out number and you're unsure which replacement is correct — a short reason why, else omit"}]}
+{"date":"as written at the top, DD/MM/YYYY","items":[{"sl_no":"this row's own SL.NO./serial number exactly as printed in that column, as a string — see rules below","shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number","balance_left":"the टुकड़ा / Tukda column value (this is the running balance left, NOT a piece count) as a number, or empty string if that row has none","date_override":"only include this if a specific row has a different date than the header, else omit","flag":"only if you couldn't reliably read this row's weight/balance — e.g. a column looks cut off/missing, or there's a crossed-out number and you're unsure which replacement is correct — a short reason why, else omit"}]}
 IMPORTANT:
+- SL.NO IS YOUR ROW-ALIGNMENT ANCHOR. This sheet's rows are frequently laid out as narrow vertical strips (SL.NO increasing left-to-right or in whatever direction the page actually runs) with every strip looking nearly identical (same date, same shade, similar GSM) — the kind of layout where it's extremely easy for a value to silently slide into the wrong row. To prevent that: for EACH row, first locate its SL.NO in the image, then read every other field (shade, GSM, size, weight, balance) from that exact same physical strip/line — never from a neighboring one — before moving to the next SL.NO. After you've extracted every row, check your own output: the sl_no values you produced should appear once each, in the same order they run on the page, with no duplicates and no unexplained gaps. If you notice a duplicate or out-of-sequence SL.NO in what you were about to return, that is a sign a value drifted between rows — go back and re-read those specific rows from the image before finalizing, rather than submitting a duplicated or skipped row.
 - The column that looks like it's labeled "S/K" is actually the SHADE column, not a party name or code. Decode its handwritten values: "S.K" or "SK" means shade NS (Sada Kraft / natural shade). "G.Y" or "GY" means shade GY (Golden Yellow). If you see a different value you don't recognize, copy it as written rather than forcing it into NS or GY.
 - There is no BF field on this document — do not invent one. What might look like a stray extra column is the Size column.
 - Do not skip the last column (टुकड़ा / Tukda) — it is the balance left, and must be captured for every row that has a value in it.
 - CROSSED-OUT / CORRECTED VALUES: this is a real working register — a number is sometimes struck through with the corrected number written right next to it in that same row. Use only the number that is NOT crossed out; ignore the struck-through one entirely. This stays within one row — never borrow a number from the row above or below because a cell looks messy.
 - MISSING/CUT-OFF COLUMNS: if a column genuinely isn't visible for a row (cropped off the scan, torn page, etc.), do not invent a value by reading unrelated nearby text. Leave that field empty/0 and set "flag" to a short reason instead.
-- Interpret unclear handwriting as best you can; if a value is genuinely illegible leave it as an empty string rather than guessing wildly.`,
+- Interpret unclear handwriting as best you can; if a value is genuinely illegible leave it as an empty string rather than guessing wildly. If the SL.NO itself is illegible, still extract the row's other fields as best you can and set "flag" to say the serial number wasn't legible — do not drop the row.`,
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
       const rows = raw.items.map(it => ({
-        id: genId(), date: normalizeDateToDots(it.date_override || raw.date || ''), shade: it.shade || '', size: it.size || '', gsm: it.gsm || '',
+        id: genId(), sl_no: it.sl_no != null ? String(it.sl_no) : '', date: normalizeDateToDots(it.date_override || raw.date || ''), shade: it.shade || '', size: it.size || '', gsm: it.gsm || '',
         weight_consumed: num(it.weight_consumed), balance_left: it.balance_left === '' || it.balance_left == null ? '' : num(it.balance_left),
         flagged: !!(it.flag && String(it.flag).trim()), flagReason: (it.flag || '').trim(),
       }));
@@ -583,7 +584,7 @@ Return ONLY one JSON object: {"date":"shared header date if Style A, DD/MM/YYYY,
   {
     key: 'dispatch_bill',
     label: 'Dispatch Bill / Tax Invoice',
-    hint: 'A printed tax invoice / dispatch bill sent to any customer (Bindal, Diamond, Anmol, or otherwise) — lands in its own Customer Dispatch Bills tab, separate from the Production Register, and reduces that customer’s stock balance on the Customer Stock tab and feeds the Order Availability Check.',
+    hint: 'A printed tax invoice / dispatch bill sent to any customer (Bindal, Diamond, Anmol, or otherwise) — lands in its own Customer Dispatch Bills tab, separate from the Production Register, and reduces that customer’s stock balance on the Customer Stock tab.',
     register: 'customerDispatch',
     systemPrompt: `You read a printed GST tax invoice / dispatch bill for corrugated boxes sent to a customer.
 CRITICAL — you are shown ONE PAGE at a time, in isolation. You have no memory of any other page in this document, so you must decide what to do based only on what's printed on THIS page. Every dispatch bill is printed as a set of near-identical copies, each one labeled directly beside or below the words "Tax Invoice" at the very top: "(ORIGINAL FOR RECIPIENT)", "(DUPLICATE FOR TRANSPORTER)", "(TRIPLICATE FOR SUPPLIER)", "(EXTRA COPY)" — plus separate e-Way Bill pages mixed in between them. These copies are NOT separate invoices and NOT separate deliveries — they are the identical invoice printed several times.
@@ -660,6 +661,7 @@ const COLUMNS = {
     { key: 'weight_kg', label: 'Weight (kg)', type: 'number' },
   ],
   consumption: [
+    { key: 'sl_no', label: 'SL. No.' },
     { key: 'date', label: 'Date' }, { key: 'shade', label: 'Shade' }, { key: 'size', label: 'Size' }, { key: 'gsm', label: 'GSM' },
     { key: 'weight_consumed', label: 'Weight Consumed', type: 'number' }, { key: 'balance_left', label: 'Balance Left (Tukda)', type: 'number' },
   ],
@@ -694,7 +696,6 @@ const NAV = [
   { key: 'rawMaterialIn', label: 'Raw Material Register', icon: Archive },
   { key: 'production', label: 'Production Register', icon: ClipboardList },
   { key: 'customerDispatch', label: 'Customer Dispatch Bills', icon: Package },
-  { key: 'orderCheck', label: 'Order Availability Check', icon: Search },
   { key: 'daburSpecs', label: 'Dabur — Spec Master', icon: FileText },
   { key: 'daburPO', label: 'Dabur — Pending PO', icon: ListChecks },
   { key: 'daburDispatch', label: 'Dabur — Dispatch Log', icon: Truck },
@@ -727,7 +728,7 @@ const GUIDE_STEPS = [
     title: 'Production Register handles two different page styles',
     tab: 'production',
     what: 'Some of your handwritten pages track shade/size/GSM (box blanks); others list a product description and quantity (finished goods, e.g. "Butter Bake 65g x60"). Both land in this one table — the system figures out which style a page is automatically.',
-    how: 'Upload as usual. If a page has a customer name written on it (as a page header, not a bracket next to one item), it’s worth double-checking the Party column got filled in — that field is what the Order Availability Check searches by.',
+    how: 'Upload as usual. If a page has a customer name written on it (as a page header, not a bracket next to one item), it’s worth double-checking the Party column got filled in — that field is searchable from the search bar at the top of the app.',
   },
   {
     title: 'New finished-goods rows wait in Customer Stock for your OK',
@@ -742,15 +743,9 @@ const GUIDE_STEPS = [
     how: 'Paste a customer’s Google Sheet ID/link on the Customer Sheets tab (new or already-added) to add its products automatically. You can also add, edit, or delete individual rules by hand at any time — rules are checked top to bottom, first match wins.',
   },
   {
-    title: 'Check what’s available before promising a customer an order',
-    tab: 'orderCheck',
-    what: 'Type a party name (and optionally a size/GSM keyword) to see pieces produced vs. pieces dispatched, and what’s left. It shows you the exact matching rows too, not just a number, so you can double-check it.',
-    how: 'This searches the Production Register’s Party field, so it only works well once party names are actually filled in on those rows.',
-  },
-  {
     title: 'Dispatch bills record what actually went out',
     tab: 'upload',
-    what: 'Upload dispatch bills / tax invoices from the same dropdown as everything else — they land in their own Customer Dispatch Bills tab (kept separate from the Production Register) and, once confirmed, reduce that customer’s balance on both the Order Availability Check and Customer Stock.',
+    what: 'Upload dispatch bills / tax invoices from the same dropdown as everything else — they land in their own Customer Dispatch Bills tab (kept separate from the Production Register) and, once confirmed, reduce that customer’s balance on Customer Stock.',
     how: 'Same upload-extract-review-confirm pattern as everywhere else. These invoices are usually printed with several duplicate copies (Original/Duplicate/Triplicate/Extra Copy) plus an e-Way Bill page — the extraction already knows to count the transaction once, not once per copy.',
   },
   {
@@ -1240,6 +1235,11 @@ function FIMSApp() {
   useEffect(() => {
     try { localStorage.setItem('fims_sidebar_collapsed', sidebarCollapsed ? '1' : '0'); } catch (e) { /* noop */ }
   }, [sidebarCollapsed]);
+  // Topbar search — replaced the old dedicated "Order Availability Check" tab. Instead of a single
+  // party/keyword form scoped to just Production + Dispatch, this is a plain substring search across
+  // every flat register PLUS Customer Stock (produced/dispatched/balance by customer+item), so the same
+  // box that finds "was this order dispatched" also finds a mill slip, a Dabur PO, anything else.
+  const [globalQuery, setGlobalQuery] = useState('');
   /* -------- upload & extract state -------- */
   const [docType, setDocType] = useState(DOCUMENT_TYPES[0].key);
   const [preview, setPreview] = useState(null);
@@ -1604,22 +1604,6 @@ function FIMSApp() {
     });
     return Object.values(map).map(v => ({ ...v, balance: v.weight_in - v.weight_consumed }));
   })();
-  /* -------- order availability check -------- */
-  const [checkParty, setCheckParty] = useState('');
-  const [checkKeyword, setCheckKeyword] = useState('');
-  const [checkResult, setCheckResult] = useState(null);
-  const runCheck = () => {
-    const p = checkParty.trim().toLowerCase();
-    const k = checkKeyword.trim().toLowerCase();
-    if (!p) { setCheckResult(null); return; }
-    const partyMatch = r => (r.party || '').toLowerCase().includes(p) || (r.confirmedCustomer || '').toLowerCase().includes(p) || (r.customerHint || '').toLowerCase().includes(p);
-    const keywordMatch = r => !k || (r.size || '').toLowerCase().includes(k) || (r.gsm || '').toLowerCase().includes(k) || (r.description || '').toLowerCase().includes(k);
-    const matchProd = production.filter(r => partyMatch(r) && keywordMatch(r) && num(r.pieces) > 0);
-    const matchDisp = customerDispatch.filter(r => partyMatch(r) && keywordMatch(r) && num(r.quantity) > 0);
-    const produced = matchProd.reduce((s, r) => s + num(r.pieces), 0);
-    const dispatched = matchDisp.reduce((s, r) => s + num(r.quantity), 0);
-    setCheckResult({ produced, dispatched, available: produced - dispatched, matchProd, matchDisp });
-  };
   /* -------- dabur PO pending calc -------- */
   const PO_TOLERANCE = 0.10; // ±10% — a PO counts as fulfilled once dispatched qty reaches 90% of ordered qty
   const daburPOWithPending = daburPO.map(po => {
@@ -2018,6 +2002,34 @@ function FIMSApp() {
     });
   })();
   const customerNames = Array.from(new Set(customerStockGroups.map(g => g.customer))).sort((a, b) => (a === 'Unassigned') - (b === 'Unassigned') || a.localeCompare(b));
+  // Every flat register the topbar search box can look through — one entry per register, carrying its
+  // own rows/columns so the results panel can render each with the exact same EditableTable used on
+  // that register's own tab (fix a row right from the search results, no need to go find it by hand).
+  const SEARCHABLE_REGISTERS = [
+    { key: 'rawMaterialIn', label: 'Raw Material Register', rows: rawMaterialIn, columns: COLUMNS.rawMaterialIn },
+    { key: 'consumption', label: 'Consumption', rows: consumption, columns: COLUMNS.consumption },
+    { key: 'production', label: 'Production Register', rows: production, columns: COLUMNS.production },
+    { key: 'customerDispatch', label: 'Customer Dispatch Bills', rows: customerDispatch, columns: COLUMNS.customerDispatch },
+    { key: 'daburSpecs', label: 'Dabur — Spec Master', rows: daburSpecs, columns: COLUMNS.daburSpecs },
+    { key: 'daburPO', label: 'Dabur — Pending PO', rows: daburPO, columns: COLUMNS.daburPO },
+    { key: 'daburDispatch', label: 'Dabur — Dispatch Log', rows: daburDispatch, columns: COLUMNS.daburDispatch },
+  ];
+  // Plain case-insensitive substring match against every column's own displayed value — deliberately
+  // simple (no fuzzy matching, no per-register special-casing) so the same box that used to only search
+  // Production's Party field for Order Availability Check now finds a party name, an item description,
+  // an invoice number, a PO number, anything, in whichever register it actually lives in. The Customer
+  // Stock match is kept separate from the register matches (not just another "register") since it's the
+  // one search result showing the produced/dispatched/balance-so-far numbers the old dedicated check
+  // used to show, matched against the customer name and item description together.
+  const globalSearchResults = (() => {
+    const q = globalQuery.trim().toLowerCase();
+    if (!q) return null;
+    const registerMatches = SEARCHABLE_REGISTERS
+      .map(reg => ({ ...reg, rows: reg.rows.filter(row => reg.columns.some(c => String(row[c.key] ?? '').toLowerCase().includes(q))) }))
+      .filter(reg => reg.rows.length > 0);
+    const stockMatches = customerStockGroups.filter(g => g.customer.toLowerCase().includes(q) || g.description.toLowerCase().includes(q));
+    return { registerMatches, stockMatches };
+  })();
   /* -------- Customer Sheets: push a customer's stock ledger out to THEIR OWN separate Google
      Sheet (not a tab on this app's main sheet) — matching the real BINDAL STOCK.xlsx / DIAMOND.xlsx /
      anmol stock dec 22.xlsx layout exactly: one tab per base item ("IT 500", "Digestive", "CREAM"),
@@ -3041,11 +3053,6 @@ function FIMSApp() {
         .info-box { display: flex; gap: 8px; align-items: flex-start; background: var(--accent-soft); border: 1px solid var(--rule); color: var(--ink); padding: 10px 12px; border-radius: 5px; font-size: 12.5px; margin: 10px 0; }
         .field-row { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
         .text-input { padding: 8px 10px; border-radius: 5px; border: 1px solid var(--rule); font: inherit; font-size: 13px; }
-        .check-result { margin-top: 16px; }
-        .check-stats { display: flex; gap: 14px; margin-bottom: 14px; flex-wrap: wrap; }
-        .stat-box { background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; padding: 12px 18px; min-width: 130px; }
-        .stat-box .val { font-family: 'Fraunces', serif; font-size: 24px; }
-        .stat-box .lbl { font-size: 11px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.04em; }
         .review-box { border: 1px solid var(--accent); border-radius: 6px; padding: 16px; background: #fff; margin-top: 18px; }
         .review-actions { display: flex; gap: 10px; margin-top: 14px; }
         .section-label { font-size: 13px; font-weight: 700; margin: 18px 0 8px 0; color: var(--ink); }
@@ -3094,8 +3101,19 @@ function FIMSApp() {
       </aside>
       <div className="main">
         <div className="topbar">
-          <h2>{NAV.find(n => n.key === activeTab)?.label}</h2>
-          <button className="btn btn-primary" onClick={exportAll}><FileSpreadsheet size={15} /> Export all to Excel</button>
+          <h2>{activeTab === 'search' ? `Search: "${globalQuery}"` : NAV.find(n => n.key === activeTab)?.label}</h2>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <input
+              className="text-input"
+              placeholder="Search every register — party, item, invoice, PO no…"
+              value={globalQuery}
+              onChange={e => setGlobalQuery(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && globalQuery.trim()) setActiveTab('search'); }}
+              style={{ width: 280 }}
+            />
+            <button className="btn" onClick={() => { if (globalQuery.trim()) setActiveTab('search'); }} title="Search across every register"><Search size={15} /></button>
+            <button className="btn btn-primary" onClick={exportAll}><FileSpreadsheet size={15} /> Export all to Excel</button>
+          </div>
         </div>
         <div className="content">
           {!loaded && <div className="empty-state">Loading your registers…</div>}
@@ -3117,7 +3135,7 @@ function FIMSApp() {
               </div>
               <p className="subtitle" style={{ marginBottom: 18 }}>Everything below is stored on this device for your account and stays put between visits. Click any card to jump to that register.</p>
               <div className="dash-grid">
-                {NAV.filter(n => n.key !== 'dashboard' && n.key !== 'upload' && n.key !== 'orderCheck' && n.key !== 'customerStock' && n.key !== 'customerMapping' && n.key !== 'aliases' && n.key !== 'settings').map(n => (
+                {NAV.filter(n => n.key !== 'dashboard' && n.key !== 'upload' && n.key !== 'customerStock' && n.key !== 'customerMapping' && n.key !== 'aliases' && n.key !== 'settings').map(n => (
                   <div className="dash-card" key={n.key} onClick={() => setActiveTab(n.key)}>
                     <div className="num">{counts[n.key]}</div>
                     <div className="lbl">{n.label}</div>
@@ -3326,35 +3344,45 @@ function FIMSApp() {
               onUpdate={updateRow('production')} onDelete={deleteRow('production')} onExport={() => exportSheet('Production_Register', production, COLUMNS.production)} suppressFlags highlightRow={needsCustomerHighlight} />
           )}
           {loaded && activeTab === 'customerDispatch' && (
-            <RegisterPanel title="Customer Dispatch Bills" subtitle="From dispatch bills / tax invoices sent to customers (Bindal, Diamond, Anmol, or otherwise) — kept separate from the Production Register. Once confirmed on the Customer Stock tab, these reduce that customer's balance there and in the Order Availability Check." columns={COLUMNS.customerDispatch} rows={customerDispatch}
+            <RegisterPanel title="Customer Dispatch Bills" subtitle="From dispatch bills / tax invoices sent to customers (Bindal, Diamond, Anmol, or otherwise) — kept separate from the Production Register. Once confirmed on the Customer Stock tab, these reduce that customer's balance there." columns={COLUMNS.customerDispatch} rows={customerDispatch}
               onUpdate={updateRow('customerDispatch')} onDelete={deleteRow('customerDispatch')} onExport={() => exportSheet('Customer_Dispatch_Bills', customerDispatch, COLUMNS.customerDispatch)} highlightRow={needsCustomerHighlight} />
           )}
-          {loaded && activeTab === 'orderCheck' && (
-            <div className="panel">
-              <h2 style={{ marginBottom: 6 }}>Order Availability Check</h2>
-              <p className="subtitle" style={{ marginBottom: 16 }}>Enter a party name (and optionally a size/GSM keyword) to see pieces produced (from the Production Register) vs. dispatched (from confirmed Customer Dispatch Bills), and what's still available. Note: the handwritten Production Register usually doesn't name a customer on the sheet itself — if "Party" is blank on those rows, click into the cell on the Production Register tab and fill it in manually so this check can find it.</p>
-              <div className="field-row">
-                <input className="text-input" placeholder="Party name (e.g. Anmol, Dabur, Ashoka)" value={checkParty} onChange={e => setCheckParty(e.target.value)} />
-                <input className="text-input" placeholder="Size / GSM keyword (optional)" value={checkKeyword} onChange={e => setCheckKeyword(e.target.value)} />
-                <button className="btn btn-primary" onClick={runCheck}><Search size={15} /> Check availability</button>
+          {loaded && activeTab === 'search' && (
+            <div>
+              <div className="panel">
+                <h2 style={{ marginBottom: 6 }}>Search Results</h2>
+                <p className="subtitle" style={{ marginBottom: !globalSearchResults || (globalSearchResults.stockMatches.length === 0 && globalSearchResults.registerMatches.length === 0) ? 0 : 16 }}>
+                  Matches for “{globalQuery}” across every register and Customer Stock — plain substring match, case-insensitive. Every row here is the real row — fix or delete it right here, same as on its own tab.
+                </p>
+                {(!globalSearchResults || (globalSearchResults.stockMatches.length === 0 && globalSearchResults.registerMatches.length === 0)) && (
+                  <p className="subtitle">No matches found.</p>
+                )}
               </div>
-              {checkResult && (
-                <div className="check-result">
-                  <div className="check-stats">
-                    <div className="stat-box"><div className="val">{checkResult.produced}</div><div className="lbl">Produced (pcs)</div></div>
-                    <div className="stat-box"><div className="val">{checkResult.dispatched}</div><div className="lbl">Dispatched (pcs)</div></div>
-                    <div className="stat-box" style={{ borderColor: checkResult.available > 0 ? 'var(--ok)' : 'var(--ledger-red)' }}>
-                      <div className="val" style={{ color: checkResult.available > 0 ? 'var(--ok)' : 'var(--ledger-red)' }}>{checkResult.available}</div>
-                      <div className="lbl">Available (pcs)</div>
-                    </div>
+              {globalSearchResults && globalSearchResults.stockMatches.length > 0 && (
+                <div className="panel">
+                  <div className="section-label">Customer Stock ({globalSearchResults.stockMatches.length})</div>
+                  <div className="table-wrap">
+                    <table>
+                      <thead><tr><th>Customer</th><th>Item</th><th>Total Produced</th><th>Total Dispatched</th><th>Balance</th></tr></thead>
+                      <tbody>
+                        {globalSearchResults.stockMatches.map(g => (
+                          <tr key={g.id}>
+                            <td>{g.customer}</td><td>{g.description}</td>
+                            <td>{g.totalProduction}</td><td>{g.totalDispatch}</td>
+                            <td style={{ color: g.closingBalance > 0 ? 'var(--ok)' : 'var(--ledger-red)' }}>{g.closingBalance}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
-                  <div className="section-label">Matched production rows ({checkResult.matchProd.length})</div>
-                  <EditableTable columns={COLUMNS.production} rows={checkResult.matchProd} onUpdate={updateRow('production')} onDelete={deleteRow('production')} emptyLabel="No matching production rows." />
-                  <div className="section-label">Matched dispatch bill rows ({checkResult.matchDisp.length})</div>
-                  <EditableTable columns={COLUMNS.customerDispatch} rows={checkResult.matchDisp} onUpdate={updateRow('customerDispatch')} onDelete={deleteRow('customerDispatch')} emptyLabel="No matching dispatch bill rows." />
                 </div>
               )}
-              {!checkResult && <p className="subtitle">No search run yet — results aren't guessed, only shown once you check.</p>}
+              {globalSearchResults && globalSearchResults.registerMatches.map(reg => (
+                <div className="panel" key={reg.key}>
+                  <div className="section-label">{reg.label} ({reg.rows.length})</div>
+                  <EditableTable columns={reg.columns} rows={reg.rows} onUpdate={updateRow(reg.key)} onDelete={deleteRow(reg.key)} emptyLabel="No matches." />
+                </div>
+              ))}
             </div>
           )}
           {loaded && activeTab === 'daburSpecs' && (
