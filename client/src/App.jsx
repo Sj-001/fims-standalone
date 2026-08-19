@@ -2612,27 +2612,25 @@ function FIMSApp() {
       // Destructive — the Sheet becomes the source of truth for this customer's catalog from here on,
       // so anything currently there that isn't in `included` is about to be dropped. Confirm first,
       // same as every other real write in this app (Push to Sheet, Discard changes, Clear Data).
-      if (!window.confirm(`Re-sync ${customer}: replace all ${oldCustomerItems.length} existing catalog item${oldCustomerItems.length === 1 ? '' : 's'} for this customer with the ${included.length} item${included.length === 1 ? '' : 's'} currently in their Sheet${staleRemovedCount ? ` (${staleRemovedCount} no longer there will be removed)` : ''}? A manually-added alias whose exact wording isn't a block title in the Sheet will be removed too unless it's also written there.`)) return;
+      if (!window.confirm(`Re-sync ${customer}: replace all ${oldCustomerItems.length} existing catalog item${oldCustomerItems.length === 1 ? '' : 's'} for this customer with the ${included.length} item${included.length === 1 ? '' : 's'} currently in their Sheet${staleRemovedCount ? ` (${staleRemovedCount} no longer there will be removed)` : ''}? Customer Mapping keyword rules (and Aliases) are never removed by this — only added to — even for an item that drops out of the catalog here.`)) return;
     }
     let nextCatalog;
     let nextMapping;
     let addedCount;
     if (isFullResync) {
-      // Only auto-generated keyword rules (exact item name + the digit-stripped fallback) tied to the
-      // OLD item list get dropped — a keyword rule typed by hand for some other reason is left alone,
-      // since a full re-sync has no way to tell that one was deliberate.
-      const oldGeneratedKeywords = new Set();
-      oldCustomerItems.forEach(c => {
-        const exact = mappingDedupKey(c.item);
-        if (exact) oldGeneratedKeywords.add(exact);
-        const fallback = exact.replace(/[\d].*$/, '').trim();
-        if (fallback && fallback.length > 2) oldGeneratedKeywords.add(fallback);
-      });
+      // The CATALOG is genuinely replaced (the Sheet is the source of truth for "what items this
+      // customer has"), but Customer Mapping keyword rules are NEVER removed here, even for an item
+      // that just dropped out of the catalog — confirmed directly: clearing a customer's real Sheet
+      // (e.g. to undo a bad push) and re-syncing used to also silently delete the keyword rules
+      // matchCustomer relies on to guess that customer from an item's description alone (the ONLY
+      // signal available for a handwritten Production Register page with no party/hint written on it),
+      // so every past row for that item would show up as Unassigned on the next upload — a genuine data
+      // loss, not the intended "sync the catalog to the Sheet" behavior. Purely additive now, same as
+      // the non-resync branch below: existing rules (auto-generated or hand-typed) always survive.
       const freshEntries = included.map(it => ({ id: genId(), customer, item: it.item.trim(), sheetGroup: (it.sheetGroup || it.item).trim() }));
       addedCount = freshEntries.length;
       nextCatalog = [...productCatalog.filter(c => c.customer !== customer), ...freshEntries];
-      const survivingMapping = customerMapping.filter(r => !(r.customer === customer && oldGeneratedKeywords.has(mappingDedupKey(r.keyword))));
-      const existingKeywords = new Set(survivingMapping.map(r => mappingDedupKey(r.keyword)));
+      const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
       const exactRules = [];
       const fallbackRules = [];
       included.forEach(it => {
@@ -2641,7 +2639,7 @@ function FIMSApp() {
         const fallback = exact.replace(/[\d].*$/, '').trim();
         if (fallback && fallback.length > 2 && !existingKeywords.has(fallback)) { fallbackRules.push({ id: genId(), keyword: fallback, customer }); existingKeywords.add(fallback); }
       });
-      nextMapping = [...exactRules, ...survivingMapping, ...fallbackRules];
+      nextMapping = [...exactRules, ...customerMapping, ...fallbackRules];
     } else {
       const existingItems = new Set(productCatalog.map(c => catalogDedupKey(c.customer, c.item)));
       const newCatalogEntries = included
