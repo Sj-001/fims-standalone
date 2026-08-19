@@ -2065,8 +2065,9 @@ function FIMSApp() {
      anmol stock dec 22.xlsx layout exactly: one tab per base item ("IT 500", "Digestive", "CREAM"),
      with every variant of that item as its own side-by-side table within that tab. This is a
      write-only computed mirror (the Production Register and Customer Dispatch Bills stay the real
-     source of truth) and is pushed ONLY when you click "Push to Sheet" for that customer below —
-     never automatically. The item/variant tabs are MERGED, never overwritten: the backend reads what's
+     source of truth) and is pushed ONLY when you click "Push to Sheet" on the Customer Stock tab,
+     right under that customer's own preview — never automatically. The item/variant tabs are MERGED,
+     never overwritten: the backend reads what's
      already in each tab first and only appends rows for dates it doesn't already have there, using
      the SAME formula convention already used throughout the real file (Opening references the
      previous row's Closing cell, Closing = Opening+Production-Dispatch) — anything already in the
@@ -3488,7 +3489,7 @@ function FIMSApp() {
             <div>
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Customer Stock</h2>
-                <p className="subtitle">Review new Production Register and Customer Dispatch Bill entries here and confirm which customer they belong to — that's the only thing that still lives on this tab. Once confirmed, matching is done by the Customer Mapping tab, plus anything literally bracketed next to the item name. The actual per-customer ledger, the diff against each customer's real Sheet, and pushing now all live in the Customer Sheets tab.</p>
+                <p className="subtitle">Review new Production Register and Customer Dispatch Bill entries here and confirm which customer they belong to. Matching is done by the Customer Mapping tab, plus anything literally bracketed next to the item name. The per-customer ledger, the diff against each customer's real Sheet, and pushing to that Sheet all live here too, below — the Customer Sheets tab is just for adding/syncing a Sheet ID.</p>
               </div>
               {(pendingProductionRows.length > 0 || pendingDispatchRows.length > 0) && (
                 <SectionDivider icon={ListChecks} label="Needs your input" hint="New entries whose customer isn't confirmed yet — nothing here counts toward any balance until you confirm it." />
@@ -3775,7 +3776,7 @@ function FIMSApp() {
                       </div>
                     </summary>
                     <div className="panel-header" style={{ marginTop: 12 }}>
-                      <p className="subtitle">Per-item ledger and what's about to go to their Sheet — fix anything here, then push from the Customer Sheets tab.</p>
+                      <p className="subtitle">Per-item ledger and what's about to go to their Sheet — fix anything here, then push right below. The Customer Sheets tab is just for adding/syncing a Sheet ID now.</p>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                         <select
                           className="cell-input"
@@ -4054,6 +4055,29 @@ function FIMSApp() {
                         </div>
                       );
                     })()}
+                    {(() => {
+                      // Push lives right here now, directly under the preview tables it pushes exactly
+                      // what's shown above — the Customer Sheets tab is just for adding/syncing a Sheet
+                      // ID, no separate read-only copy of this same review to keep in sync with edits
+                      // made here.
+                      const sheetIdForPush = getCustomerSheetId(customer).trim();
+                      const pushStatusForCustomer = pushStatus[customer] || {};
+                      return (
+                        <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                          <button
+                            className="btn btn-primary"
+                            onClick={() => pushCustomerSheetNow(customer)}
+                            disabled={pushStatusForCustomer.state === 'pushing' || !sheetIdForPush || !newRowsCountForCustomer}
+                            title={!sheetIdForPush ? 'Add a Sheet ID for this customer on the Customer Sheets tab first' : !newRowsCountForCustomer ? 'Nothing new to push right now' : ''}
+                          >
+                            {pushStatusForCustomer.state === 'pushing' ? <Loader2 size={15} className="spin" /> : <FileSpreadsheet size={15} />} Push to Sheet
+                          </button>
+                          {!sheetIdForPush && <span className="doc-hint">No Sheet ID set for {customer} yet — add one on the Customer Sheets tab.</span>}
+                          {pushStatusForCustomer.state === 'done' && <span className="doc-hint" style={{ color: 'var(--ok)' }}>✓ {pushStatusForCustomer.message}</span>}
+                          {pushStatusForCustomer.state === 'error' && <span style={{ color: 'var(--ledger-red)', fontSize: 12.5 }}>{pushStatusForCustomer.message}</span>}
+                        </div>
+                      );
+                    })()}
                   </details>
                   );
                 })}
@@ -4202,8 +4226,8 @@ function FIMSApp() {
             <div>
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Customer Sheets</h2>
-                <p className="subtitle" style={{ marginBottom: 4 }}>Push a customer's stock ledger out to THEIR OWN separate Google Sheet — not a tab on this app's main sheet — laid out the same way as your original BINDAL STOCK.xlsx / DIAMOND.xlsx / anmol stock files: one tab per base item, every variant of that item as its own side-by-side table within that tab.</p>
-                <p className="subtitle" style={{ marginBottom: 4 }}>Pushing only happens when you click "Push to Sheet" below — nothing is pushed automatically. Pushing only appends: it never touches or duplicates a row that's already in the sheet, whether it got there from a previous push or someone typed it in by hand, and new rows use the same Opening/Closing formula convention already in your sheet instead of dumping in flat numbers. The "summary" tab is never touched at all — its existing formulas already point at each item's latest row, so they keep calculating themselves.</p>
+                <p className="subtitle" style={{ marginBottom: 4 }}>Add and sync a customer's Sheet ID here — their own separate Google Sheet, not a tab on this app's main sheet — laid out the same way as your original BINDAL STOCK.xlsx / DIAMOND.xlsx / anmol stock files: one tab per base item, every variant of that item as its own side-by-side table within that tab.</p>
+                <p className="subtitle" style={{ marginBottom: 4 }}>Reviewing and pushing a customer's ledger out to their Sheet now happens on the Customer Stock tab, right under their per-item preview — nothing pushes from here. Pushing only ever appends: it never touches or duplicates a row that's already in the sheet, whether it got there from a previous push or someone typed it in by hand, and new rows use the same Opening/Closing formula convention already in your sheet instead of dumping in flat numbers. The "summary" tab is never touched at all — its existing formulas already point at each item's latest row, so they keep calculating themselves.</p>
                 <p className="subtitle">Setup per customer, once: create or open their Google Sheet, share it with the service account email below as an Editor, then paste that sheet's link below — you can paste the whole browser address bar URL, no need to dig out just the ID. Skipping the share step is the #1 cause of "the caller does not have permission" errors.</p>
                 <div className="field-row" style={{ marginTop: 10 }}>
                   <span style={{ fontSize: 13, fontWeight: 600 }}>Share every customer Sheet with:</span>
@@ -4303,33 +4327,23 @@ function FIMSApp() {
               })()}
               {allCustomerTabNames.length === 0 && <div className="panel"><div className="empty-state">No customers yet — add one above.</div></div>}
               {allCustomerTabNames.map(customer => {
-                const status = pushStatus[customer] || {};
                 const { itemGroups } = buildCustomerSheetPayload(customer);
                 const variantCount = itemGroups.reduce((s, g) => s + (g.variants || []).length, 0);
                 const sheetId = getCustomerSheetId(customer);
                 const registryEntry = customerSheetIds.find(c => c.customer === customer);
-                const review = reviewByCustomer[customer];
-                const reviewTabs = (review && review.tabs) || [];
-                const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => (v.rows || []).some(r => r.status === 'new' || r.status === 'fillable')));
-                const mismatchCount = reviewTabs.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'mismatch' || r.status === 'unverifiable').length, 0), 0);
                 return (
                   <div className="panel" key={customer}>
                     <div className="panel-header">
                       <div>
                         <h2>{customer}</h2>
-                        <p className="subtitle">{itemGroups.length} item tab{itemGroups.length === 1 ? '' : 's'} · {variantCount} variant{variantCount === 1 ? '' : 's'} ready to push
+                        <p className="subtitle">{itemGroups.length} item tab{itemGroups.length === 1 ? '' : 's'} · {variantCount} variant{variantCount === 1 ? '' : 's'} in the catalog
                           {registryEntry?.lastImportedAt && <> · last imported {new Date(registryEntry.lastImportedAt).toLocaleString()}</>}
                           {registryEntry?.lastPushedAt && <> · last pushed {new Date(registryEntry.lastPushedAt).toLocaleString()}</>}
                         </p>
                       </div>
-                      <div style={{ display: 'flex', gap: 8 }}>
-                        <button className="btn btn-ghost" onClick={() => importSheetById(sheetId, { mode: 'resync', resyncCustomer: customer })} disabled={sheetImportBusy || !sheetId.trim()} title="Re-read this customer's Sheet fresh and replace their catalog with exactly what's in it now (removes anything renamed or deleted there) — you'll see a review + confirm before anything changes">
-                          <RefreshCw size={15} /> Re-sync
-                        </button>
-                        <button className="btn btn-primary" onClick={() => pushCustomerSheetNow(customer)} disabled={status.state === 'pushing' || !sheetId.trim() || !hasAnyNewRows} title={!hasAnyNewRows ? 'Nothing new to push right now' : ''}>
-                          {status.state === 'pushing' ? <Loader2 size={15} className="spin" /> : <FileSpreadsheet size={15} />} Push to Sheet
-                        </button>
-                      </div>
+                      <button className="btn btn-ghost" onClick={() => importSheetById(sheetId, { mode: 'resync', resyncCustomer: customer })} disabled={sheetImportBusy || !sheetId.trim()} title="Re-read this customer's Sheet fresh and replace their catalog with exactly what's in it now (removes anything renamed or deleted there) — you'll see a review + confirm before anything changes">
+                        <RefreshCw size={15} /> Re-sync
+                      </button>
                     </div>
                     <div className="field-row">
                       <input className="text-input" style={{ minWidth: 340, flex: 1 }} placeholder="Paste this customer's Google Sheet link or ID" value={sheetId} onChange={e => updateCustomerSheetId(customer, e.target.value)} autoComplete="off" spellCheck={false} />
@@ -4339,87 +4353,7 @@ function FIMSApp() {
                         </button>
                       )}
                     </div>
-                    {status.state === 'done' && <div className="doc-hint" style={{ color: 'var(--ok)', marginTop: 10 }}>✓ {status.message}</div>}
-                    {status.state === 'error' && <div className="error-box" style={{ marginTop: 10 }}><AlertCircle size={16} /><span>{status.message}</span></div>}
-                    {!sheetId.trim() && <div className="doc-hint" style={{ marginTop: 10 }}>Add a Sheet ID above to enable pushing or re-syncing.</div>}
-                    {sheetId.trim() && review && (
-                      <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
-                        <h3 style={{ margin: '0 0 8px 0', fontSize: 14 }}>
-                          Preview
-                          {review.loading && <span className="doc-hint" style={{ marginLeft: 8, fontWeight: 400 }}><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle' }} /> checking against the real Sheet…</span>}
-                        </h3>
-                        {review.error && <div className="error-box"><AlertCircle size={16} /><span>{review.error}</span></div>}
-                        {!review.error && !hasAnyNewRows && !mismatchCount && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet. Need to fix something first? See the Customer Stock tab.</div>}
-                        {!review.error && !!mismatchCount && (
-                          <div className="error-box"><AlertCircle size={16} /><span>{mismatchCount} row{mismatchCount === 1 ? '' : 's'} below {mismatchCount === 1 ? 'is' : 'are'} flagged — already dated in the real Sheet but with different numbers (or unreadable). Nothing flagged gets pushed; fix on the Customer Stock tab.</span></div>
-                        )}
-                        {hasAnyNewRows && <p className="doc-hint" style={{ marginBottom: 8 }}>Read-only — to edit, delete, add, or move a row before pushing, use the Customer Stock tab.</p>}
-                        {reviewTabs.map(tab => (tab.variants || []).filter(v => (v.rows || []).length > 0).map(v => {
-                          const needsBlock = !tab.isNewTab && v.isNewBlock;
-                          const blockOverride = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].blockTitleOverride) || '';
-                          const unassigned = needsBlock && !blockOverride;
-                          return (
-                          <div key={`${tab.tabName}::${v.title}`} style={{ border: `1px solid ${unassigned ? 'var(--ledger-red)' : 'var(--border)'}`, borderRadius: 8, padding: 10, marginBottom: 8 }}>
-                            <div style={{ marginBottom: 6, display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
-                              <strong>{v.title}</strong>{' '}
-                              <span className="doc-hint">— Sheet tab: {(reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) || tab.tabName}</span>
-                              {tab.isNewTab && <span className="doc-hint"> (new — this tab doesn't exist yet)</span>}
-                              {needsBlock && <span className="doc-hint"> — Block: {blockOverride || '—'}</span>}
-                              {unassigned && (
-                                <AlertCircle
-                                  size={15}
-                                  color="var(--ledger-red)"
-                                  style={{ flexShrink: 0 }}
-                                  title="Not yet assigned to a block — assign it on the Customer Stock tab, or it'll create a new one named after the item on push."
-                                />
-                              )}
-                            </div>
-                            <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
-                              <thead>
-                                <tr style={{ textAlign: 'left', color: 'var(--muted)' }}>
-                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Date</th>
-                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Opening</th>
-                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Production</th>
-                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Dispatch</th>
-                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Closing</th>
-                                  <th style={{ padding: '2px 6px', fontWeight: 500 }}>Status</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {v.rows.map((r, i) => {
-                                  const variantEdits = (reviewEdits[customer] && reviewEdits[customer][v.title]) || {};
-                                  const edit = (variantEdits.rowEdits && variantEdits.rowEdits[i]) || {};
-                                  const isDeleted = !!(variantEdits.deletedRows && variantEdits.deletedRows[i]);
-                                  if (isDeleted) return null;
-                                  const isDuplicate = r.status === 'duplicate';
-                                  const rowBg = r.status === 'mismatch' || r.status === 'unverifiable' ? 'var(--warn-soft)'
-                                    : isDuplicate ? 'rgba(0,0,0,0.03)'
-                                    : r.status === 'fillable' ? 'var(--ok-soft)'
-                                    : 'rgba(214,163,80,0.14)';
-                                  return (
-                                    <tr key={i} style={{ background: rowBg, opacity: isDuplicate ? 0.55 : 1 }}>
-                                      <td style={{ padding: '2px 6px' }}>{edit.date ?? r.date}</td>
-                                      <td style={{ padding: '2px 6px' }}>{r.opening}</td>
-                                      <td style={{ padding: '2px 6px' }}>{edit.production ?? r.production}</td>
-                                      <td style={{ padding: '2px 6px' }}>{edit.dispatch ?? r.dispatch}</td>
-                                      <td style={{ padding: '2px 6px' }}>{r.closing}</td>
-                                      <td style={{ padding: '2px 6px' }}>
-                                        {r.status === 'new' && <Pill tone="ok">New</Pill>}
-                                        {r.status === 'fillable' && <Pill tone="ok" title={fillableTitle(r)}>{fillableLabel(r)}</Pill>}
-                                        {isDuplicate && <Pill tone="neutral" title={`Already in the Sheet — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed again.`}>Duplicate</Pill>}
-                                        {r.status === 'mismatch' && <Pill tone="warn" title={`Sheet already has a recorded value here that disagrees — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}.`}>Mismatch</Pill>}
-                                        {r.status === 'unverifiable' && <Pill tone="warn" title="Sheet already has this date, but its columns couldn't be read to check.">Can't verify</Pill>}
-                                      </td>
-                                    </tr>
-                                  );
-                                })}
-                              </tbody>
-                            </table>
-                          </div>
-                          );
-                        }))}
-                      </div>
-                    )}
+                    {!sheetId.trim() && <div className="doc-hint" style={{ marginTop: 10 }}>Add a Sheet ID above to enable syncing and pushing (pushing itself now happens on the Customer Stock tab).</div>}
                   </div>
                 );
               })}
