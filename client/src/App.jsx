@@ -493,6 +493,20 @@ function dateSortKey(raw) {
   return `${year}-${month}-${day}`;
 }
 const REAL_DATE_RE = /^\d{1,2}\.\d{1,2}\.\d{2,4}$/;
+// Rows genuinely representing the SAME real-world line, extracted twice (the same page uploaded twice,
+// or included in two overlapping photos), should never both land in a register — see addRows, which
+// uses this to skip a newly-extracted row that already exactly matches one already there. Matched by
+// every real data field EXCEPT id/confirmation-state (id, stockConfirmed, confirmedCustomer, flagged,
+// flagReason — which legitimately differ for what's otherwise the same entry). Deliberately EXACT, not
+// fuzzy: a looser match (say, just date+description) risks silently dropping a genuinely different row
+// that happens to share those two fields, which is a far worse failure than occasionally missing a
+// duplicate whose OCR reading varied slightly between two extractions of the same page.
+const DEDUP_EXCLUDE_FIELDS = new Set(['id', 'stockConfirmed', 'confirmedCustomer', 'flagged', 'flagReason']);
+function rowDedupKey(row) {
+  return Object.keys(row).filter(k => !DEDUP_EXCLUDE_FIELDS.has(k)).sort()
+    .map(k => `${k}=${typeof row[k] === 'number' ? row[k] : String(row[k] ?? '').trim().toLowerCase()}`)
+    .join('|');
+}
 // Safety net for ditto marks (a tick, quote mark, "11", "//", "do", a dash, etc. — handwritten
 // shorthand for "same date as the row above"). The extraction prompt already asks Claude to resolve
 // these itself, but that's a probabilistic instruction — this is a deterministic backstop that runs
@@ -897,8 +911,20 @@ function PendingGroupBar({ group, guess, isKnownGuess, knownCustomers, onBulkCha
     </div>
   );
 }
-function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow }) {
+// Every register table with a "date" column renders in real chronological order (dateSortKey — see
+// its own comment — handles D.M.YY correctly, unlike a plain string sort). Rows get appended to a
+// register in whatever order they're extracted/confirmed, which is routinely NOT chronological order
+// (a page dated last week uploaded today lands after today's already-confirmed rows) — sorting here,
+// once, covers every register/search-result table that has a date column, rather than needing every
+// call site to remember to sort its own rows before passing them in. A stable sort (guaranteed by the
+// spec), so rows sharing the same date keep their existing relative order. sortByDate={false} opts a
+// caller out — used only by the pre-confirm extraction review table, which must stay in the exact
+// order the model returned it (matching the physical page top-to-bottom) so a row can be cross-checked
+// against the original photo by position; sorting THAT one by date would scramble the correspondence.
+function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow, sortByDate = true }) {
   if (!rows.length) return <div className="empty-state">{emptyLabel}</div>;
+  const hasDateColumn = sortByDate && columns.some(c => c.key === 'date');
+  const sortedRows = hasDateColumn ? [...rows].sort((a, b) => dateSortKey(a.date).localeCompare(dateSortKey(b.date))) : rows;
   return (
     <div className="table-wrap">
       <table>
@@ -906,7 +932,7 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
           <tr>{columns.map(c => <th key={c.key}>{c.label}</th>)}<th className="col-action"></th></tr>
         </thead>
         <tbody>
-          {rows.map(row => (
+          {sortedRows.map(row => (
             <tr key={row.id} className={[
               (!suppressFlags && row.flagged) ? 'flagged-row' : '',
               (highlightRow && highlightRow(row)) ? 'needs-customer-row' : '',
@@ -1077,6 +1103,11 @@ function FIMSApp() {
   // (with a plain confirm dialog, same as every other real write in this app).
   const [reviewByCustomer, setReviewByCustomer] = useState({}); // { [customer]: { loading, error, tabs, existingTabNames } }
   const [reviewEdits, setReviewEdits] = useState({}); // { [customer]: { [variantTitle]: { tabNameOverride, rowEdits: { [rowIndex]: {date,production,dispatch} }, deletedRows: { [rowIndex]: true } } } }
+  // A customer's review panel dismissed (via the "Discard" button) while it had nothing new to push —
+  // pure local/in-memory UI state, never persisted: hides that customer from the Customer Ledgers list
+  // ONLY while it's still true that there's nothing to do for them, and self-heals the moment that
+  // changes (a new confirmed row, a new mismatch) without needing to explicitly un-dismiss anything.
+  const [dismissedReviews, setDismissedReviews] = useState(new Set());
   // Inline "+ Add row" form state for the review screen, keyed by `${customer}::${variantTitle}`.
   const [newRowForms, setNewRowForms] = useState({});
   const updateNewRowForm = (key, field, value) => setNewRowForms(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
@@ -1238,12 +1269,36 @@ function FIMSApp() {
       return next;
     });
   };
+  // Only Production and Customer Dispatch Bills get de-duplicated on add — the two registers a person
+  // is most likely to accidentally re-upload (a page re-photographed, two overlapping scans of the same
+  // invoice). Checked against the CURRENT register via registerState (read from the outer render
+  // closure, not a functional-updater `prev` — safe here specifically because addRows is only ever
+  // called once per user action, never in a loop the way some other multi-row confirms elsewhere in
+  // this app are, so there's no risk of the staleness that pattern would otherwise need guarding
+  // against) plus within the new batch itself, so two copies of the same page queued together in one
+  // "Confirm all" don't both land either. Returns how many were skipped so the caller can tell the user.
+  const DEDUP_REGISTERS = new Set(['production', 'customerDispatch']);
   const addRows = (registerKey, rows) => {
-    registerSetters[registerKey](prev => {
-      const next = [...prev, ...rows];
-      persist(registerKey, next);
-      return next;
-    });
+    let toAdd = rows;
+    let skipped = 0;
+    if (DEDUP_REGISTERS.has(registerKey)) {
+      const existingKeys = new Set((registerState[registerKey] || []).map(rowDedupKey));
+      const seenInBatch = new Set();
+      toAdd = rows.filter(r => {
+        const key = rowDedupKey(r);
+        if (existingKeys.has(key) || seenInBatch.has(key)) { skipped++; return false; }
+        seenInBatch.add(key);
+        return true;
+      });
+    }
+    if (toAdd.length) {
+      registerSetters[registerKey](prev => {
+        const next = [...prev, ...toAdd];
+        persist(registerKey, next);
+        return next;
+      });
+    }
+    return skipped;
   };
   // Collapsible sidebar — mainly so the upload preview (and the review table next to it) has more
   // room to breathe on a laptop-width screen. A pure UI preference, not app data, so it's kept in
@@ -1587,16 +1642,18 @@ function FIMSApp() {
     const page = fileResults[idx];
     if (!page || !page.rows.length) return;
     recordCorrections(page.originalRows, page.rows);
-    addRows(activeConfig.register, page.rows);
+    const skipped = addRows(activeConfig.register, page.rows);
     setFileResults(prev => prev.filter((_, i) => i !== idx));
     setActiveResultIndex(prev => Math.max(0, Math.min(prev, fileResults.length - 2)));
+    if (skipped) window.alert(`${skipped} row${skipped === 1 ? '' : 's'} exactly matched one already in the register and ${skipped === 1 ? "wasn't" : "weren't"} added again — looks like this page (or part of it) was uploaded before.`);
   };
   const confirmAllPages = () => {
     const donePages = fileResults.filter(r => r.status === 'done' && r.rows.length);
     donePages.forEach(page => recordCorrections(page.originalRows, page.rows));
     const allRows = donePages.flatMap(p => p.rows);
-    if (allRows.length) addRows(activeConfig.register, allRows);
+    const skipped = allRows.length ? addRows(activeConfig.register, allRows) : 0;
     setFileResults([]); setActiveResultIndex(0); setPreview(null); setBase64Img(null); setQueuedPages([]);
+    if (skipped) window.alert(`${skipped} row${skipped === 1 ? '' : 's'} exactly matched one already in the register and ${skipped === 1 ? "wasn't" : "weren't"} added again — looks like a page (or part of it) was uploaded before.`);
   };
   const discardPage = (idx) => {
     setFileResults(prev => prev.filter((_, i) => i !== idx));
@@ -3320,7 +3377,8 @@ function FIMSApp() {
                           <EditableTable columns={COLUMNS[activeConfig.register]} rows={page.rows}
                             onUpdate={(rowId, field, value) => updateReviewCell(idx, rowId, field, value)}
                             onDelete={(rowId) => deleteReviewRow(idx, rowId)}
-                            emptyLabel="All rows removed — nothing to add." />
+                            emptyLabel="All rows removed — nothing to add."
+                            sortByDate={false} />
                           <div className="review-actions">
                             <button className="btn btn-primary" onClick={() => confirmPage(idx)} disabled={!page.rows.length}><CheckCircle2 size={15} /> Add {page.rows.length} row(s) to register</button>
                             {page.truncated && (
@@ -3761,6 +3819,11 @@ function FIMSApp() {
                   const mismatchCountForCustomer = reviewTabsForCount.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'mismatch' || r.status === 'unverifiable').length, 0), 0);
                   const newRowsCountForCustomer = reviewTabsForCount.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'new' || r.status === 'fillable').length, 0), 0);
                   const needsAttention = unmatchedForCount.length > 0 || mismatchCountForCustomer > 0;
+                  // Discarded (see the review section below) while there was nothing to do for this
+                  // customer — stays hidden only as long as that's still true; a new confirmed row or a
+                  // fresh discrepancy un-hides it automatically, no explicit "un-dismiss" needed.
+                  const nothingToDoForCustomer = unmatchedForCount.length === 0 && mismatchCountForCustomer === 0 && newRowsCountForCustomer === 0;
+                  if (dismissedReviews.has(customer) && nothingToDoForCustomer) return null;
                   return (
                   <details className="panel customer-review-panel" key={`stock-review-${customer}`} open={needsAttention}>
                     <summary className="customer-review-summary">
@@ -3886,11 +3949,27 @@ function FIMSApp() {
                         <div>
                           {review.loading && <div className="doc-hint"><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle', marginRight: 6 }} />checking against the real Sheet…</div>}
                           {review.error && <div className="error-box"><AlertCircle size={16} /><span>{review.error}</span></div>}
-                          {!review.error && !hasAnyNewRows && !mismatchCount && !review.loading && <div className="doc-hint">Nothing new to push right now — every confirmed entry is already reflected in the real Sheet.</div>}
+                          {!review.error && !hasAnyNewRows && !mismatchCount && !review.loading && (
+                            <div className="doc-hint" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <span>Nothing new to push right now — every confirmed entry is already reflected in the real Sheet.</span>
+                              <button className="btn btn-ghost" style={{ padding: '2px 8px', fontSize: 12 }} onClick={() => setDismissedReviews(prev => new Set(prev).add(customer))} title="Hide this panel until there's something new to look at again">
+                                <XCircle size={13} /> Discard
+                              </button>
+                            </div>
+                          )}
                           {!review.error && !!mismatchCount && (
                             <div className="error-box"><AlertCircle size={16} /><span>{mismatchCount} row{mismatchCount === 1 ? '' : 's'} below {mismatchCount === 1 ? 'is' : 'are'} flagged — already dated in the real Sheet but with different numbers (or unreadable). Nothing flagged gets pushed; edit or delete the row if it needs fixing.</span></div>
                           )}
                           {reviewTabs.map(tab => (tab.variants || []).filter(v => (v.rows || []).length > 0).map(v => {
+                            // A "duplicate" row is already correctly in the real Sheet — nothing to
+                            // review, edit, or push for it (its own controls are disabled below too) —
+                            // so it's dropped from the table entirely rather than padding it out.
+                            // Row indices (i, used by setRowEdit/setRowDeleted/moveKey below) are never
+                            // recomputed from a filtered array — only the RENDER of a duplicate row's
+                            // <tr> is skipped, so every other row's index stays exactly what the rest of
+                            // the review/push pipeline already expects it to be.
+                            const hiddenDuplicateCount = (v.rows || []).filter(r => r.status === 'duplicate').length;
+                            if (hiddenDuplicateCount === (v.rows || []).length) return null; // fully synced — nothing actionable here at all
                             const needsBlock = !tab.isNewTab && v.isNewBlock;
                             const blockOverride = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].blockTitleOverride) || '';
                             const unassigned = needsBlock && !blockOverride;
@@ -3936,6 +4015,7 @@ function FIMSApp() {
                                   </>
                                 )}
                               </div>
+                              {hiddenDuplicateCount > 0 && <p className="doc-hint" style={{ marginBottom: 6 }}>+ {hiddenDuplicateCount} row{hiddenDuplicateCount === 1 ? '' : 's'} already in the Sheet, not shown.</p>}
                               <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
                                 <thead>
                                   <tr style={{ textAlign: 'left', color: 'var(--muted)' }}>
@@ -3951,20 +4031,23 @@ function FIMSApp() {
                                 </thead>
                                 <tbody>
                                   {v.rows.map((r, i) => {
+                                    // Counted in hiddenDuplicateCount above (and summarized in the note
+                                    // above the table) instead of rendered — a duplicate can never be
+                                    // edited or deleted anyway (its controls were always disabled below),
+                                    // so a whole row of it is pure clutter. `i` stays the row's real,
+                                    // original index either way — only the render is skipped.
+                                    if (r.status === 'duplicate') return null;
                                     const variantEdits = (reviewEdits[customer] && reviewEdits[customer][v.title]) || {};
                                     const edit = (variantEdits.rowEdits && variantEdits.rowEdits[i]) || {};
                                     const isDeleted = !!(variantEdits.deletedRows && variantEdits.deletedRows[i]);
-                                    const isDuplicate = r.status === 'duplicate';
-                                    // A duplicate is already in the Sheet with nothing worth changing — editing or
-                                    // deleting it here is a no-op either way (the push never touches an existing
-                                    // row), so the row is shown for visibility but its controls are disabled rather
-                                    // than left live and misleading.
-                                    const rowDisabled = isDeleted || isDuplicate;
+                                    // Duplicates never reach here (filtered above), so this row is
+                                    // always one that's genuinely editable/deletable — only a staged
+                                    // delete disables it.
+                                    const rowDisabled = isDeleted;
                                     const moveKey = `${customer}::${v.title}::${i}`;
                                     const rowDateValue = edit.date ?? r.date;
                                     const rowBg = isDeleted ? 'rgba(162,59,46,0.08)'
                                       : r.status === 'mismatch' || r.status === 'unverifiable' ? 'var(--warn-soft)'
-                                      : isDuplicate ? 'rgba(0,0,0,0.03)'
                                       : r.status === 'fillable' ? 'var(--ok-soft)'
                                       : 'rgba(214,163,80,0.14)';
                                     return (
@@ -3983,7 +4066,6 @@ function FIMSApp() {
                                         <td style={{ padding: '2px 6px' }}>
                                           {r.status === 'new' && <Pill tone="ok">New</Pill>}
                                           {r.status === 'fillable' && <Pill tone="ok" title={fillableTitle(r)}>{fillableLabel(r)}</Pill>}
-                                          {isDuplicate && <Pill tone="neutral" title={`Already in the Sheet — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed again, so this row is disabled.`}>Duplicate</Pill>}
                                           {r.status === 'mismatch' && <Pill tone="warn" title={`Sheet already has a recorded value here that disagrees — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed unless you fix it here.`}>Mismatch</Pill>}
                                           {r.status === 'unverifiable' && <Pill tone="warn" title="Sheet already has this date, but its columns couldn't be read to check. Won't be pushed — verify by hand.">Can't verify</Pill>}
                                         </td>
@@ -4016,7 +4098,7 @@ function FIMSApp() {
                                           </div>
                                         </td>
                                         <td style={{ padding: '2px 6px' }} className="col-action">
-                                          <button className="icon-btn" title={isDuplicate ? "Nothing to delete — this row is a duplicate and won't be pushed" : isDeleted ? 'Undo delete' : 'Delete this row (only from this push — never touches the register)'} disabled={isDuplicate} onClick={() => setRowDeleted(customer, v.title, i, !isDeleted)}>
+                                          <button className="icon-btn" title={isDeleted ? 'Undo delete' : 'Delete this row (only from this push — never touches the register)'} onClick={() => setRowDeleted(customer, v.title, i, !isDeleted)}>
                                             {isDeleted ? <RefreshCw size={13} /> : <Trash2 size={13} />}
                                           </button>
                                         </td>
