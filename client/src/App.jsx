@@ -981,7 +981,23 @@ function BatchFillRow({ columns, rows, onUpdate }) {
 function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow, sortByDate = true, showBatchFill = false }) {
   if (!rows.length) return <div className="empty-state">{emptyLabel}</div>;
   const hasDateColumn = sortByDate && columns.some(c => c.key === 'date');
-  const sortedRows = hasDateColumn ? [...rows].sort((a, b) => dateSortKey(a.date).localeCompare(dateSortKey(b.date))) : rows;
+  const hasSlNoColumn = sortByDate && columns.some(c => c.key === 'sl_no');
+  // Within one date, a daily report (e.g. Consumption) has its own row order — SL. No. — that has
+  // nothing to do with when the row happened to get confirmed into the app, so falling back to
+  // insertion order there produced whatever order the batches were uploaded in, not ascending SL. No.
+  // Compares numerically when both sides parse as numbers (so "10" sorts after "2", not before).
+  const slNoCompare = (a, b) => {
+    const na = parseFloat(a.sl_no), nb = parseFloat(b.sl_no);
+    if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+    return String(a.sl_no ?? '').localeCompare(String(b.sl_no ?? ''), undefined, { numeric: true });
+  };
+  const sortedRows = hasDateColumn
+    ? [...rows].sort((a, b) => {
+        const dateCmp = dateSortKey(a.date).localeCompare(dateSortKey(b.date));
+        if (dateCmp !== 0) return dateCmp;
+        return hasSlNoColumn ? slNoCompare(a, b) : 0;
+      })
+    : (hasSlNoColumn ? [...rows].sort(slNoCompare) : rows);
   return (
     <div className="table-wrap">
       <table>
