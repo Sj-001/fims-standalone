@@ -930,7 +930,7 @@ function PendingGroupBar({ group, guess, isKnownGuess, knownCustomers, onBulkCha
 // order the model returned it (matching the physical page top-to-bottom) so a row can be cross-checked
 // against the original photo by position; sorting THAT one by date would scramble the correspondence.
 // showBatchFill (opt-in, only the pre-confirm extraction review table uses it): a row of per-column
-// batch controls instead of clicking into every row by hand — two actions per column:
+// batch controls instead of clicking into every row by hand — up to three actions per column:
 // - Fill blanks: sets ONLY the currently-blank cells (e.g. no party/customer name written anywhere on
 //   the page, so it's blank on every row) — never overwrites a row that already has a real per-row
 //   value, so a page where only some lines had an exception noted never gets a legitimate value
@@ -940,7 +940,10 @@ function PendingGroupBar({ group, guess, isKnownGuess, knownCustomers, onBulkCha
 //   wrong for every row). Confirms first whenever it would actually replace an existing value (never
 //   for a column that's already all-blank, where it's equivalent to Fill blanks), since this one really
 //   can lose real per-row data if clicked on the wrong column.
-function BatchFillRow({ columns, rows, onUpdate }) {
+// - Apply to selected: only shown once at least one row is selected via the gutter (see EditableTable)
+//   — sets just the selected rows' cell, ignoring blank/non-blank status entirely, since picking exact
+//   rows by hand is itself the deliberate scoping (no confirm needed the way Overwrite all needs one).
+function BatchFillRow({ columns, rows, onUpdate, selectedIds, onClearSelection }) {
   const [batchValues, setBatchValues] = useState({});
   const fillBlanks = (colKey) => {
     const value = (batchValues[colKey] ?? '').trim();
@@ -956,8 +959,21 @@ function BatchFillRow({ columns, rows, onUpdate }) {
     rows.forEach(row => onUpdate(row.id, colKey, value));
     setBatchValues(prev => ({ ...prev, [colKey]: '' }));
   };
+  const applyToSelected = (colKey) => {
+    const value = (batchValues[colKey] ?? '').trim();
+    if (!value || !selectedIds.size) return;
+    rows.forEach(row => { if (selectedIds.has(row.id)) onUpdate(row.id, colKey, value); });
+    setBatchValues(prev => ({ ...prev, [colKey]: '' }));
+  };
   return (
     <tr className="batch-fill-row">
+      <th className="col-select">
+        {selectedIds.size > 0 && (
+          <button type="button" className="icon-btn" title={`${selectedIds.size} row(s) selected — click to clear`} onClick={onClearSelection} style={{ fontSize: 10, padding: '2px 4px' }}>
+            {selectedIds.size}✕
+          </button>
+        )}
+      </th>
       {columns.map(c => {
         const hasBlank = rows.some(r => !String(r[c.key] ?? '').trim());
         return (
@@ -978,6 +994,11 @@ function BatchFillRow({ columns, rows, onUpdate }) {
               <button type="button" className="icon-btn" title={`Set EVERY row's ${c.label} to this value, replacing anything already there`} disabled={!(batchValues[c.key] || '').trim()} onClick={() => overwriteAll(c.key, c.label)}>
                 <RefreshCw size={13} />
               </button>
+              {selectedIds.size > 0 && (
+                <button type="button" className="icon-btn" title={`Set just the ${selectedIds.size} selected row(s)' ${c.label} to this value`} disabled={!(batchValues[c.key] || '').trim()} onClick={() => applyToSelected(c.key)}>
+                  <CheckCircle2 size={13} />
+                </button>
+              )}
             </div>
           </th>
         );
@@ -987,6 +1008,23 @@ function BatchFillRow({ columns, rows, onUpdate }) {
   );
 }
 function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow, sortByDate = true, showBatchFill = false }) {
+  // Row selection (also showBatchFill-only, see BatchFillRow's "Apply to selected"): shift-click for a
+  // range, ctrl/cmd-click to toggle one row without disturbing the rest, and click-drag across the
+  // gutter for an OS-style rubber-band select — mirrors how selection already works everywhere else on
+  // the person's own machine. Declared before the `!rows.length` early return below (rules of hooks:
+  // must run in the same order every render) even though selection is meaningless on an empty table.
+  // Kept local to this table instance rather than lifted to the caller — intersected against the
+  // CURRENT rows on every read rather than reset via an effect keyed on page identity, so switching to
+  // a different file's review table silently drops ids that no longer exist, no extra plumbing needed.
+  const [rawSelectedIds, setRawSelectedIds] = useState(() => new Set());
+  const [dragAnchorId, setDragAnchorId] = useState(null);
+  const [isDragging, setIsDragging] = useState(false);
+  useEffect(() => {
+    if (!isDragging) return;
+    const stop = () => setIsDragging(false);
+    window.addEventListener('mouseup', stop);
+    return () => window.removeEventListener('mouseup', stop);
+  }, [isDragging]);
   if (!rows.length) return <div className="empty-state">{emptyLabel}</div>;
   const hasDateColumn = sortByDate && columns.some(c => c.key === 'date');
   // SL. No. sorts ascending whenever the register has that column, in BOTH the persisted register
@@ -1010,41 +1048,87 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
         return hasSlNoColumn ? slNoCompare(a, b) : 0;
       })
     : (hasSlNoColumn ? [...rows].sort(slNoCompare) : rows);
+  const rowIdOrder = sortedRows.map(r => r.id);
+  // Re-derived every render rather than trusted as-is: an id that no longer exists in the current
+  // `rows` (switched to a different file, or the row got deleted) just silently drops out here.
+  const selectedIds = showBatchFill ? new Set(rowIdOrder.filter(id => rawSelectedIds.has(id))) : rawSelectedIds;
+  const rangeBetween = (fromId, toId) => {
+    const fromIdx = rowIdOrder.indexOf(fromId), toIdx = rowIdOrder.indexOf(toId);
+    if (fromIdx === -1 || toIdx === -1) return [toId];
+    const [lo, hi] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
+    return rowIdOrder.slice(lo, hi + 1);
+  };
+  const handleGutterMouseDown = (rowId, e) => {
+    e.preventDefault(); // stop the browser's own text-selection drag from fighting the row-drag below
+    if (e.shiftKey && dragAnchorId) {
+      setRawSelectedIds(new Set(rangeBetween(dragAnchorId, rowId)));
+    } else if (e.ctrlKey || e.metaKey) {
+      setRawSelectedIds(prev => {
+        const next = new Set(prev);
+        if (next.has(rowId)) next.delete(rowId); else next.add(rowId);
+        return next;
+      });
+      setDragAnchorId(rowId);
+    } else {
+      setRawSelectedIds(new Set([rowId]));
+      setDragAnchorId(rowId);
+      setIsDragging(true);
+    }
+  };
+  const handleGutterMouseEnter = (rowId) => {
+    if (!isDragging || !dragAnchorId) return;
+    setRawSelectedIds(new Set(rangeBetween(dragAnchorId, rowId)));
+  };
   return (
     <div className="table-wrap">
       <table>
         <thead>
-          <tr>{columns.map(c => <th key={c.key}>{c.label}</th>)}<th className="col-action"></th></tr>
-          {showBatchFill && <BatchFillRow columns={columns} rows={rows} onUpdate={onUpdate} />}
+          <tr>
+            {showBatchFill && <th className="col-select"></th>}
+            {columns.map(c => <th key={c.key}>{c.label}</th>)}
+            <th className="col-action"></th>
+          </tr>
+          {showBatchFill && <BatchFillRow columns={columns} rows={rows} onUpdate={onUpdate} selectedIds={selectedIds} onClearSelection={() => setRawSelectedIds(new Set())} />}
         </thead>
         <tbody>
-          {sortedRows.map(row => (
-            <tr key={row.id} className={[
-              (!suppressFlags && row.flagged) ? 'flagged-row' : '',
-              (highlightRow && highlightRow(row)) ? 'needs-customer-row' : '',
-            ].filter(Boolean).join(' ')}>
-              {columns.map((c, ci) => (
-                <td key={c.key}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                    {ci === 0 && !suppressFlags && row.flagged && (
-                      <AlertCircle size={13} color="var(--ledger-red)" style={{ flexShrink: 0 }} title={row.flagReason || 'Flagged during extraction — the model wasn\'t confident about this row. Check it against the original document.'} />
-                    )}
-                    <input
-                      className="cell-input"
-                      type={c.type === 'number' ? 'number' : 'text'}
-                      value={row[c.key] ?? ''}
-                      onChange={(e) => onUpdate(row.id, c.key, c.type === 'number' ? e.target.value : e.target.value)}
-                    />
-                  </div>
+          {sortedRows.map(row => {
+            const isSelected = showBatchFill && selectedIds.has(row.id);
+            return (
+              <tr key={row.id} className={[
+                (!suppressFlags && row.flagged) ? 'flagged-row' : '',
+                (highlightRow && highlightRow(row)) ? 'needs-customer-row' : '',
+                isSelected ? 'row-selected' : '',
+              ].filter(Boolean).join(' ')}>
+                {showBatchFill && (
+                  <td className="col-select"
+                    onMouseDown={(e) => handleGutterMouseDown(row.id, e)}
+                    onMouseEnter={() => handleGutterMouseEnter(row.id)}>
+                    <input type="checkbox" checked={isSelected} readOnly style={{ pointerEvents: 'none' }} />
+                  </td>
+                )}
+                {columns.map((c, ci) => (
+                  <td key={c.key}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      {ci === 0 && !suppressFlags && row.flagged && (
+                        <AlertCircle size={13} color="var(--ledger-red)" style={{ flexShrink: 0 }} title={row.flagReason || 'Flagged during extraction — the model wasn\'t confident about this row. Check it against the original document.'} />
+                      )}
+                      <input
+                        className="cell-input"
+                        type={c.type === 'number' ? 'number' : 'text'}
+                        value={row[c.key] ?? ''}
+                        onChange={(e) => onUpdate(row.id, c.key, c.type === 'number' ? e.target.value : e.target.value)}
+                      />
+                    </div>
+                  </td>
+                ))}
+                <td className="col-action">
+                  <button className="icon-btn danger" title="Delete row" onClick={() => onDelete(row.id)}>
+                    <Trash2 size={15} />
+                  </button>
                 </td>
-              ))}
-              <td className="col-action">
-                <button className="icon-btn danger" title="Delete row" onClick={() => onDelete(row.id)}>
-                  <Trash2 size={15} />
-                </button>
-              </td>
-            </tr>
-          ))}
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -3243,6 +3327,10 @@ function FIMSApp() {
            this counts" meaning) but its own class so it's never confused with extraction confidence. */
         .needs-tabblock-row { background: var(--warn-soft) !important; }
         .batch-fill-row th { background: var(--accent-soft); font-weight: 400; padding: 4px 6px; }
+        .col-select { width: 26px; text-align: center; cursor: pointer; user-select: none; }
+        /* A distinct tone from flagged-row/needs-customer-row's amber/red so a selected row still
+           reads clearly even when it also happens to be flagged. */
+        .row-selected { background: var(--ok-soft) !important; }
         .info-box { display: flex; gap: 8px; align-items: flex-start; background: var(--accent-soft); border: 1px solid var(--rule); color: var(--ink); padding: 10px 12px; border-radius: 5px; font-size: 12.5px; margin: 10px 0; }
         .field-row { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
         .text-input { padding: 8px 10px; border-radius: 5px; border: 1px solid var(--rule); font: inherit; font-size: 13px; }
