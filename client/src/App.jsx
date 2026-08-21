@@ -921,7 +921,49 @@ function PendingGroupBar({ group, guess, isKnownGuess, knownCustomers, onBulkCha
 // caller out — used only by the pre-confirm extraction review table, which must stay in the exact
 // order the model returned it (matching the physical page top-to-bottom) so a row can be cross-checked
 // against the original photo by position; sorting THAT one by date would scramble the correspondence.
-function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow, sortByDate = true }) {
+// showBatchFill (opt-in, only the pre-confirm extraction review table uses it): when a column came
+// back blank on some or all rows — e.g. no party/customer name written anywhere on the page, so it's
+// blank on every single row — this offers a "type it once, fill every blank cell" row instead of
+// clicking into each row by hand. Deliberately fills BLANK cells only, never overwriting a row that
+// already has a real per-row value, so a column that's blank on most rows but genuinely filled on a
+// few (a page where only some lines had an exception noted) never gets a legitimate value clobbered.
+function BatchFillRow({ columns, rows, onUpdate }) {
+  const [batchValues, setBatchValues] = useState({});
+  const applyBatchValue = (colKey) => {
+    const value = (batchValues[colKey] ?? '').trim();
+    if (!value) return;
+    rows.forEach(row => { if (!String(row[colKey] ?? '').trim()) onUpdate(row.id, colKey, value); });
+    setBatchValues(prev => ({ ...prev, [colKey]: '' }));
+  };
+  const columnsWithBlanks = columns.filter(c => rows.some(r => !String(r[c.key] ?? '').trim()));
+  if (!columnsWithBlanks.length) return null;
+  return (
+    <tr className="batch-fill-row">
+      {columns.map(c => (
+        <th key={c.key}>
+          {columnsWithBlanks.includes(c) && (
+            <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+              <input
+                className="cell-input"
+                style={{ fontSize: 11.5 }}
+                placeholder="Set for all blank"
+                type={c.type === 'number' ? 'number' : 'text'}
+                value={batchValues[c.key] || ''}
+                onChange={e => setBatchValues(prev => ({ ...prev, [c.key]: e.target.value }))}
+                onKeyDown={e => { if (e.key === 'Enter') applyBatchValue(c.key); }}
+              />
+              <button type="button" className="icon-btn" title={`Fill every blank ${c.label} cell with this value`} disabled={!(batchValues[c.key] || '').trim()} onClick={() => applyBatchValue(c.key)}>
+                <Check size={13} />
+              </button>
+            </div>
+          )}
+        </th>
+      ))}
+      <th className="col-action"></th>
+    </tr>
+  );
+}
+function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow, sortByDate = true, showBatchFill = false }) {
   if (!rows.length) return <div className="empty-state">{emptyLabel}</div>;
   const hasDateColumn = sortByDate && columns.some(c => c.key === 'date');
   const sortedRows = hasDateColumn ? [...rows].sort((a, b) => dateSortKey(a.date).localeCompare(dateSortKey(b.date))) : rows;
@@ -930,6 +972,7 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
       <table>
         <thead>
           <tr>{columns.map(c => <th key={c.key}>{c.label}</th>)}<th className="col-action"></th></tr>
+          {showBatchFill && <BatchFillRow columns={columns} rows={rows} onUpdate={onUpdate} />}
         </thead>
         <tbody>
           {sortedRows.map(row => (
@@ -3146,6 +3189,7 @@ function FIMSApp() {
            warning tone as .flagged-row (deliberately, since it's the same "needs your attention before
            this counts" meaning) but its own class so it's never confused with extraction confidence. */
         .needs-tabblock-row { background: var(--warn-soft) !important; }
+        .batch-fill-row th { background: var(--accent-soft); font-weight: 400; padding: 4px 6px; }
         .info-box { display: flex; gap: 8px; align-items: flex-start; background: var(--accent-soft); border: 1px solid var(--rule); color: var(--ink); padding: 10px 12px; border-radius: 5px; font-size: 12.5px; margin: 10px 0; }
         .field-row { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
         .text-input { padding: 8px 10px; border-radius: 5px; border: 1px solid var(--rule); font: inherit; font-size: 13px; }
@@ -3378,7 +3422,7 @@ function FIMSApp() {
                             onUpdate={(rowId, field, value) => updateReviewCell(idx, rowId, field, value)}
                             onDelete={(rowId) => deleteReviewRow(idx, rowId)}
                             emptyLabel="All rows removed — nothing to add."
-                            sortByDate={false} />
+                            sortByDate={false} showBatchFill />
                           <div className="review-actions">
                             <button className="btn btn-primary" onClick={() => confirmPage(idx)} disabled={!page.rows.length}><CheckCircle2 size={15} /> Add {page.rows.length} row(s) to register</button>
                             {page.truncated && (
