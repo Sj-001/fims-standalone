@@ -1327,15 +1327,15 @@ function FIMSApp() {
       return next;
     });
   };
-  // Only Production and Customer Dispatch Bills get de-duplicated on add — the two registers a person
-  // is most likely to accidentally re-upload (a page re-photographed, two overlapping scans of the same
-  // invoice). Checked against the CURRENT register via registerState (read from the outer render
-  // closure, not a functional-updater `prev` — safe here specifically because addRows is only ever
-  // called once per user action, never in a loop the way some other multi-row confirms elsewhere in
-  // this app are, so there's no risk of the staleness that pattern would otherwise need guarding
-  // against) plus within the new batch itself, so two copies of the same page queued together in one
-  // "Confirm all" don't both land either. Returns how many were skipped so the caller can tell the user.
-  const DEDUP_REGISTERS = new Set(['production', 'customerDispatch']);
+  // Every extraction-driven register gets de-duplicated on add — any of them can suffer the same
+  // re-photographed-page or overlapping-scan mistake, not just Production/Dispatch. Checked against the
+  // CURRENT register via registerState (read from the outer render closure, not a functional-updater
+  // `prev` — safe here specifically because addRows is only ever called once per user action, never in
+  // a loop the way some other multi-row confirms elsewhere in this app are, so there's no risk of the
+  // staleness that pattern would otherwise need guarding against) plus within the new batch itself, so
+  // two copies of the same page queued together in one "Confirm all" don't both land either. Returns how
+  // many were skipped so the caller can tell the user.
+  const DEDUP_REGISTERS = new Set(['rawMaterialIn', 'consumption', 'production', 'customerDispatch', 'daburSpecs', 'daburPO', 'daburDispatch']);
   const addRows = (registerKey, rows) => {
     let toAdd = rows;
     let skipped = 0;
