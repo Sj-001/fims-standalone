@@ -921,44 +921,59 @@ function PendingGroupBar({ group, guess, isKnownGuess, knownCustomers, onBulkCha
 // caller out — used only by the pre-confirm extraction review table, which must stay in the exact
 // order the model returned it (matching the physical page top-to-bottom) so a row can be cross-checked
 // against the original photo by position; sorting THAT one by date would scramble the correspondence.
-// showBatchFill (opt-in, only the pre-confirm extraction review table uses it): when a column came
-// back blank on some or all rows — e.g. no party/customer name written anywhere on the page, so it's
-// blank on every single row — this offers a "type it once, fill every blank cell" row instead of
-// clicking into each row by hand. Deliberately fills BLANK cells only, never overwriting a row that
-// already has a real per-row value, so a column that's blank on most rows but genuinely filled on a
-// few (a page where only some lines had an exception noted) never gets a legitimate value clobbered.
+// showBatchFill (opt-in, only the pre-confirm extraction review table uses it): a row of per-column
+// batch controls instead of clicking into every row by hand — two actions per column:
+// - Fill blanks: sets ONLY the currently-blank cells (e.g. no party/customer name written anywhere on
+//   the page, so it's blank on every row) — never overwrites a row that already has a real per-row
+//   value, so a page where only some lines had an exception noted never gets a legitimate value
+//   clobbered. Disabled when the column has no blank cells at all (nothing to fill).
+// - Overwrite all: sets EVERY row's cell to this value, replacing anything already there — for
+//   correcting a systematic misread across the whole page (e.g. the model got one column's value
+//   wrong for every row). Confirms first whenever it would actually replace an existing value (never
+//   for a column that's already all-blank, where it's equivalent to Fill blanks), since this one really
+//   can lose real per-row data if clicked on the wrong column.
 function BatchFillRow({ columns, rows, onUpdate }) {
   const [batchValues, setBatchValues] = useState({});
-  const applyBatchValue = (colKey) => {
+  const fillBlanks = (colKey) => {
     const value = (batchValues[colKey] ?? '').trim();
     if (!value) return;
     rows.forEach(row => { if (!String(row[colKey] ?? '').trim()) onUpdate(row.id, colKey, value); });
     setBatchValues(prev => ({ ...prev, [colKey]: '' }));
   };
-  const columnsWithBlanks = columns.filter(c => rows.some(r => !String(r[c.key] ?? '').trim()));
-  if (!columnsWithBlanks.length) return null;
+  const overwriteAll = (colKey, label) => {
+    const value = (batchValues[colKey] ?? '').trim();
+    if (!value) return;
+    const nonBlankCount = rows.filter(r => String(r[colKey] ?? '').trim()).length;
+    if (nonBlankCount > 0 && !window.confirm(`Set every row's ${label} to "${value}"? This REPLACES ${nonBlankCount} row${nonBlankCount === 1 ? '' : 's'} that already ha${nonBlankCount === 1 ? 's' : 've'} a value here — not just the blank ones.`)) return;
+    rows.forEach(row => onUpdate(row.id, colKey, value));
+    setBatchValues(prev => ({ ...prev, [colKey]: '' }));
+  };
   return (
     <tr className="batch-fill-row">
-      {columns.map(c => (
-        <th key={c.key}>
-          {columnsWithBlanks.includes(c) && (
+      {columns.map(c => {
+        const hasBlank = rows.some(r => !String(r[c.key] ?? '').trim());
+        return (
+          <th key={c.key}>
             <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
               <input
                 className="cell-input"
                 style={{ fontSize: 11.5 }}
-                placeholder="Set for all blank"
+                placeholder="Batch value"
                 type={c.type === 'number' ? 'number' : 'text'}
                 value={batchValues[c.key] || ''}
                 onChange={e => setBatchValues(prev => ({ ...prev, [c.key]: e.target.value }))}
-                onKeyDown={e => { if (e.key === 'Enter') applyBatchValue(c.key); }}
+                onKeyDown={e => { if (e.key === 'Enter') fillBlanks(c.key); }}
               />
-              <button type="button" className="icon-btn" title={`Fill every blank ${c.label} cell with this value`} disabled={!(batchValues[c.key] || '').trim()} onClick={() => applyBatchValue(c.key)}>
+              <button type="button" className="icon-btn" title={hasBlank ? `Fill every blank ${c.label} cell with this value` : `No blank ${c.label} cells — nothing to fill`} disabled={!hasBlank || !(batchValues[c.key] || '').trim()} onClick={() => fillBlanks(c.key)}>
                 <Check size={13} />
               </button>
+              <button type="button" className="icon-btn" title={`Set EVERY row's ${c.label} to this value, replacing anything already there`} disabled={!(batchValues[c.key] || '').trim()} onClick={() => overwriteAll(c.key, c.label)}>
+                <RefreshCw size={13} />
+              </button>
             </div>
-          )}
-        </th>
-      ))}
+          </th>
+        );
+      })}
       <th className="col-action"></th>
     </tr>
   );
