@@ -429,14 +429,21 @@ async function saveTraining(obj) {
     });
   } catch (e) { /* noop */ }
 }
+// ex.after === null means the row was deleted entirely during review, not edited — a person decided
+// it should never have been extracted in the first place (e.g. a blank pre-ruled line with no real
+// data, a duplicate, a total row). That's a distinct kind of lesson from a field-level misread, so it
+// gets its own sentence rather than being described as a "correction" to a value.
 function buildPromptWithTraining(basePrompt, examples) {
   if (!examples || !examples.length) return basePrompt;
   const recent = examples.slice(-MAX_EXAMPLES_IN_PROMPT);
-  const examplesText = recent.map((ex, i) =>
-    `Example ${i + 1}:\nExtracted (this had a mistake): ${JSON.stringify(ex.before)}\nHuman-corrected (this is right): ${JSON.stringify(ex.after)}`
-  ).join('\n\n');
+  const examplesText = recent.map((ex, i) => {
+    if (ex.after === null) {
+      return `Example ${i + 1}:\nExtracted (WRONG — a person deleted this row entirely because it should never have been output at all): ${JSON.stringify(ex.before)}\nDo not produce a row like this — recognize the same underlying situation (e.g. a blank line, a duplicate, a total row) and skip it.`;
+    }
+    return `Example ${i + 1}:\nExtracted (this had a mistake): ${JSON.stringify(ex.before)}\nHuman-corrected (this is right): ${JSON.stringify(ex.after)}`;
+  }).join('\n\n');
   return `${basePrompt}
-LEARNED CORRECTIONS — a person has corrected real extraction mistakes on this exact document type before. Each pair below shows a row as it was first extracted (with a mistake) and how a human corrected it. Study the pattern behind each correction — what kind of value was misread, which field it belongs in, how it should be formatted — and apply that same fix logic to this new document. Do not copy these exact values into unrelated rows; only apply the underlying pattern.
+LEARNED CORRECTIONS — a person has corrected real extraction mistakes on this exact document type before. Each item below shows a row as it was first extracted (with a mistake) and how a human corrected it, OR a row a human deleted entirely because it shouldn't have been extracted at all. Study the pattern behind each one — what kind of value was misread, which field it belongs in, when a "row" isn't really a row — and apply that same fix logic to this new document. Do not copy exact values into unrelated rows; only apply the underlying pattern.
 ${examplesText}`;
 }
 // Every date the app touches should end up in the Sheet's own dot-separated D.M.YY convention
@@ -547,12 +554,13 @@ IMPORTANT — column format varies between mills, read carefully:
     hint: 'The handwritten daily sheet workers use to record raw material consumed — columns are usually Shade, GSM, Size, Weight, and Balance Left.',
     register: 'consumption',
     systemPrompt: `You read a handwritten daily raw-material consumption report from a corrugated box factory. The sheet has Hindi column headers. Most rows share one date written once at the top. Return ONLY one JSON object:
-{"date":"as written at the top, DD/MM/YYYY","items":[{"sl_no":"this row's own SL.NO./serial number exactly as printed in that column, as a string — see rules below","shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number","balance_left":"the टुकड़ा / Tukda column value (this is the running balance left, NOT a piece count) as a number, or empty string if that row has none","date_override":"only include this if a specific row has a different date than the header, else omit","flag":"only if you couldn't reliably read this row's weight/balance — e.g. a column looks cut off/missing, or there's a crossed-out number and you're unsure which replacement is correct — a short reason why, else omit"}]}
+{"date":"as written at the top, DD/MM/YYYY","items":[{"sl_no":"this row's own SL.NO./serial number exactly as printed in that column, as a string — see rules below","shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number","date_override":"only include this if a specific row has a different date than the header, else omit","flag":"only if you couldn't reliably read this row's weight — e.g. a column looks cut off/missing, or there's a crossed-out number and you're unsure which replacement is correct — a short reason why, else omit"}]}
 IMPORTANT:
-- SL.NO IS YOUR ROW-ALIGNMENT ANCHOR. This sheet's rows are frequently laid out as narrow vertical strips (SL.NO increasing left-to-right or in whatever direction the page actually runs) with every strip looking nearly identical (same date, same shade, similar GSM) — the kind of layout where it's extremely easy for a value to silently slide into the wrong row. To prevent that: for EACH row, first locate its SL.NO in the image, then read every other field (shade, GSM, size, weight, balance) from that exact same physical strip/line — never from a neighboring one — before moving to the next SL.NO. After you've extracted every row, check your own output: the sl_no values you produced should appear once each, in the same order they run on the page, with no duplicates and no unexplained gaps. If you notice a duplicate or out-of-sequence SL.NO in what you were about to return, that is a sign a value drifted between rows — go back and re-read those specific rows from the image before finalizing, rather than submitting a duplicated or skipped row.
+- SKIP TRULY BLANK LINES. This sheet is pre-ruled with a fixed number of numbered SL.NO. slots/columns, and it is completely normal for a real day's report to only fill in the first several and leave the rest of the printed grid blank. A line that has ONLY a pre-printed SL.NO. with no shade, no GSM, no size, and no weight actually written on it is not a row of data — do not output an item for it. Only extract a line that has genuine handwritten content in it.
+- SL.NO IS YOUR ROW-ALIGNMENT ANCHOR. This sheet's rows are frequently laid out as narrow vertical strips (SL.NO increasing left-to-right or in whatever direction the page actually runs) with every strip looking nearly identical (same date, same shade, similar GSM) — the kind of layout where it's extremely easy for a value to silently slide into the wrong row. To prevent that: for EACH row, first locate its SL.NO in the image, then read every other field (shade, GSM, size, weight) from that exact same physical strip/line — never from a neighboring one — before moving to the next SL.NO. After you've extracted every row, check your own output: the sl_no values you produced should appear once each, in the same order they run on the page, with no duplicates and no unexplained gaps. If you notice a duplicate or out-of-sequence SL.NO in what you were about to return, that is a sign a value drifted between rows — go back and re-read those specific rows from the image before finalizing, rather than submitting a duplicated or skipped row.
 - The column that looks like it's labeled "S/K" is actually the SHADE column, not a party name or code. Decode its handwritten values: "S.K" or "SK" means shade NS (Sada Kraft / natural shade). "G.Y" or "GY" means shade GY (Golden Yellow). If you see a different value you don't recognize, copy it as written rather than forcing it into NS or GY.
 - There is no BF field on this document — do not invent one. What might look like a stray extra column is the Size column.
-- Do not skip the last column (टुकड़ा / Tukda) — it is the balance left, and must be captured for every row that has a value in it.
+- IGNORE the टुकड़ा / Tukda column entirely — it is not tracked by this app, do not extract it even if it has a value.
 - CROSSED-OUT / CORRECTED VALUES: this is a real working register — a number is sometimes struck through with the corrected number written right next to it in that same row. Use only the number that is NOT crossed out; ignore the struck-through one entirely. This stays within one row — never borrow a number from the row above or below because a cell looks messy.
 - MISSING/CUT-OFF COLUMNS: if a column genuinely isn't visible for a row (cropped off the scan, torn page, etc.), do not invent a value by reading unrelated nearby text. Leave that field empty/0 and set "flag" to a short reason instead.
 - Interpret unclear handwriting as best you can; if a value is genuinely illegible leave it as an empty string rather than guessing wildly. If the SL.NO itself is illegible, still extract the row's other fields as best you can and set "flag" to say the serial number wasn't legible — do not drop the row.`,
@@ -560,7 +568,7 @@ IMPORTANT:
       if (!raw || !Array.isArray(raw.items)) return [];
       const rows = raw.items.map(it => ({
         id: genId(), sl_no: it.sl_no != null ? String(it.sl_no) : '', date: normalizeDateToDots(it.date_override || raw.date || ''), shade: it.shade || '', size: it.size || '', gsm: it.gsm || '',
-        weight_consumed: num(it.weight_consumed), balance_left: it.balance_left === '' || it.balance_left == null ? '' : num(it.balance_left),
+        weight_consumed: num(it.weight_consumed),
         flagged: !!(it.flag && String(it.flag).trim()), flagReason: (it.flag || '').trim(),
       }));
       return fillDittoDates(rows);
@@ -572,7 +580,7 @@ IMPORTANT:
     hint: 'The handwritten daily production register — covers both page styles: the shade/size/GSM/weight/tukda style, and the product-description + quantity style. Extracted into one unified register.',
     register: 'production',
     systemPrompt: `You read a handwritten factory production register from a corrugated box factory. There are TWO different page styles used in this register — figure out which one you're looking at and extract accordingly:
-STYLE A — shade/size/GSM style: columns are typically SL.NO. (ignore it), a column commonly headed "S/K" (this records paper SHADE, not a party name — decode 'S.K'/'S/K' as shade NS, 'G.Y' as shade GY, normalize to the 2-letter code, leave blank if unfamiliar rather than guessing), then GMS (GSM), Size (no separate BF column exists here), Weight (kg), and Tukda (count of pieces produced for that row). Most rows share one date at the top of the page.
+STYLE A — shade/size/GSM style: columns are typically SL.NO. (ignore it), a column commonly headed "S/K" (this records paper SHADE, not a party name — decode 'S.K'/'S/K' as shade NS, 'G.Y' as shade GY, normalize to the 2-letter code, leave blank if unfamiliar rather than guessing), then GMS (GSM), Size (no separate BF column exists here), Weight (kg), and Tukda (count of pieces produced for that row). Most rows share one date at the top of the page. This sheet is pre-ruled with a fixed number of numbered SL.NO. slots, and it's completely normal for a real day to only fill in the first several and leave the rest blank — a line that has ONLY a pre-printed SL.NO. with no shade/GSM/size/weight actually written on it is not a row of data; do not output an item for it.
 STYLE B — product ledger style: each line has a DATE and a product DESCRIPTION, plus one or two quantity columns.
 - Extract the FULL item name exactly as it appears in the factory's own product catalog below — including the weight and pack count (e.g. "Butter Bake 65g x60", "T50 64g x60"). Do NOT shorten it to just the brand/family word (do not output just "T50" or "Butter Bake" alone) — the weight and pack count are part of the item name, not separate data.
 - Known handwriting misreads to correct, using the reference catalog below: the letter "g" (grams) is very often misread as the digit "9" — a pattern like "120g x60" is almost always grams, essentially never "1209 x60"; "&" is often misread as "8" or "5"; "Run" is often misread as "Rum". When a line clearly matches one of the catalog items below (allowing for this kind of misread), use the catalog's exact spelling. If it doesn't resemble anything in the catalog, transcribe your best reading rather than forcing a match.
@@ -682,7 +690,7 @@ const COLUMNS = {
   consumption: [
     { key: 'sl_no', label: 'SL. No.' },
     { key: 'date', label: 'Date' }, { key: 'shade', label: 'Shade' }, { key: 'size', label: 'Size' }, { key: 'gsm', label: 'GSM' },
-    { key: 'weight_consumed', label: 'Weight Consumed', type: 'number' }, { key: 'balance_left', label: 'Balance Left (Tukda)', type: 'number' },
+    { key: 'weight_consumed', label: 'Weight Consumed', type: 'number' },
   ],
   production: [
     { key: 'date', label: 'Date' }, { key: 'party', label: 'Party (if noted)' }, { key: 'description', label: 'Description (as written)' },
@@ -981,11 +989,15 @@ function BatchFillRow({ columns, rows, onUpdate }) {
 function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow, sortByDate = true, showBatchFill = false }) {
   if (!rows.length) return <div className="empty-state">{emptyLabel}</div>;
   const hasDateColumn = sortByDate && columns.some(c => c.key === 'date');
-  const hasSlNoColumn = sortByDate && columns.some(c => c.key === 'sl_no');
-  // Within one date, a daily report (e.g. Consumption) has its own row order — SL. No. — that has
-  // nothing to do with when the row happened to get confirmed into the app, so falling back to
-  // insertion order there produced whatever order the batches were uploaded in, not ascending SL. No.
+  // SL. No. sorts ascending whenever the register has that column, in BOTH the persisted register
+  // table and the pre-confirm extraction review — unlike date sorting (gated behind sortByDate, since
+  // scrambling the review table by date would break cross-checking a row against the original photo
+  // by position), SL. No. is the row's own real identity, not something tied to upload/confirm order.
+  // Some source sheets (e.g. Consumption) physically lay their columns out in decreasing SL. No. order
+  // left-to-right, so preserving "the model's read order" there means preserving a page that's
+  // ALREADY backwards — sorting numerically fixes that instead of faithfully reproducing it.
   // Compares numerically when both sides parse as numbers (so "10" sorts after "2", not before).
+  const hasSlNoColumn = columns.some(c => c.key === 'sl_no');
   const slNoCompare = (a, b) => {
     const na = parseFloat(a.sl_no), nb = parseFloat(b.sl_no);
     if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
@@ -1484,7 +1496,11 @@ function FIMSApp() {
   // check could miss, which is why dispatch-bill batches (many requests back-to-back) were slipping
   // through as generic failures instead of being treated as rate limits.
   const isRateLimitError = (e) => e?.status === 429 || /rate limit/i.test(e?.message || '') || /EXTRACT_HTTP_429/.test(e?.message || '');
-  const extractWithRetry = async (prompt, base64, signal, attempts = 2) => {
+  // attempts=3 (was 2): EXTRACT_EMPTY ("no text block in response") shows up occasionally and is a
+  // transient API hiccup, not a property of the image — a plain retry usually succeeds. One extra
+  // attempt costs little (it's only reached on a genuine failure) and cuts down on files landing in
+  // the error state that otherwise just needed a second try, which the person had to trigger by hand.
+  const extractWithRetry = async (prompt, base64, signal, attempts = 3) => {
     let lastErr;
     for (let i = 0; i < attempts; i++) {
       try {
@@ -1683,15 +1699,21 @@ function FIMSApp() {
     setFileResults(prev => prev.map(r => r.id === id ? { ...r, status: 'pending', rows: [], originalRows: [], error: '', truncated: false } : r));
     await extractQueue([page]);
   };
+  // Walks the ORIGINAL rows (not the final ones) specifically so a row deleted entirely during review
+  // — e.g. a blank pre-ruled line the model hallucinated a row for — still gets picked up as a lesson
+  // (recorded as {after: null}, see buildPromptWithTraining), not just rows that survived with an
+  // edited field. Previously only field-level edits were recorded, so "delete the junk rows and
+  // confirm" taught the model nothing and the same blank rows kept coming back on the next upload.
   const recordCorrections = (originalRows, finalRows) => {
-    if (!originalRows || !finalRows.length) return;
+    if (!originalRows || !originalRows.length) return;
     const corrections = [];
-    finalRows.forEach(row => {
-      const orig = originalRows.find(o => o.id === row.id);
-      if (!orig) return;
+    const finalById = new Map(finalRows.map(r => [r.id, r]));
+    originalRows.forEach(orig => {
+      const { id: _oi, ...beforeClean } = orig;
+      const row = finalById.get(orig.id);
+      if (!row) { corrections.push({ before: beforeClean, after: null }); return; }
       const changed = Object.keys(row).some(k => k !== 'id' && String(orig[k] ?? '') !== String(row[k] ?? ''));
       if (changed) {
-        const { id: _i1, ...beforeClean } = orig;
         const { id: _i2, ...afterClean } = row;
         corrections.push({ before: beforeClean, after: afterClean });
       }
