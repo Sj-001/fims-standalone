@@ -545,7 +545,10 @@ IMPORTANT — column format varies between mills, read carefully:
 - SHADE: some slips have their own dedicated "Shade" column (e.g. values like GY, NS) — use that value directly. Other slips have no separate shade column, but the GSM value has a letter code stuck to the end of it, e.g. "120NS" — in that case the number is the GSM (120) and the letters are the shade (NS); split them into "gsm":"120" and "shade":"NS". A third pattern: some slips group reels under bold section headings instead of a shade column — sometimes the heading directly names a shade code as one of its parts (e.g. "Kraft Paper - 25 - GY" means every row under it is shade GY, and the "25" there is the BF, not a separate thing to worry about if BF already has its own column), and sometimes the heading only names a paper type/colour with no explicit code (e.g. "BR Golden Yellow" or "Golden Yellow" means shade GY, "Kraft Paper" alone with no code means shade NS/Natural Shade). Either way, apply the heading's shade to every row listed under it until the next heading appears. Only do this when you are confident in the mapping — if a heading is unfamiliar or ambiguous, leave "shade" as an empty string rather than guessing. If there is genuinely no shade information anywhere for a row (no column, no code, no heading), also leave "shade" as an empty string.`,
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
-      return raw.items.map(it => ({ id: genId(), date: normalizeDateToDots(raw.date || ''), mill: raw.mill || '', reel_no: it.reel_no || '', size: it.size || '', unit: it.unit || '', gsm: it.gsm || '', bf: it.bf || '', shade: it.shade || '', weight_kg: num(it.weight_kg) }));
+      // consumed starts empty on purpose — it's a placeholder for a future feature that matches this
+      // reel/slip against consumption reports and records the date it actually got used up; nothing
+      // populates it yet, so every fresh row just carries the field so it exists to edit/fill by hand.
+      return raw.items.map(it => ({ id: genId(), date: normalizeDateToDots(raw.date || ''), mill: raw.mill || '', reel_no: it.reel_no || '', size: it.size || '', unit: it.unit || '', gsm: it.gsm || '', bf: it.bf || '', shade: it.shade || '', weight_kg: num(it.weight_kg), consumed: '' }));
     },
   },
   {
@@ -685,7 +688,7 @@ const COLUMNS = {
   rawMaterialIn: [
     { key: 'date', label: 'Date' }, { key: 'mill', label: 'Mill' }, { key: 'reel_no', label: 'Reel No' },
     { key: 'size', label: 'Size' }, { key: 'unit', label: 'Unit' }, { key: 'gsm', label: 'GSM' }, { key: 'bf', label: 'BF' }, { key: 'shade', label: 'Shade' },
-    { key: 'weight_kg', label: 'Weight (kg)', type: 'number' },
+    { key: 'weight_kg', label: 'Weight (kg)', type: 'number' }, { key: 'consumed', label: 'Consumed (date)' },
   ],
   consumption: [
     { key: 'sl_no', label: 'SL. No.' },
@@ -717,6 +720,17 @@ const COLUMNS = {
     { key: 'quantity', label: 'Quantity', type: 'number' }, { key: 'rate', label: 'Rate', type: 'number' }, { key: 'amount', label: 'Amount', type: 'number' },
   ],
 };
+// The Raw Material Register view is grouped into one table per size (see rawMaterialBySize in
+// FIMSApp), matching how the physical mill-slip register book itself is organized — a size's own
+// page. "Size" itself is dropped from these per-row columns since it's now the group heading, not a
+// repeated cell; "Reel No" and "Unit" are dropped too since they're not part of what was asked for
+// here. "Consumed" is a real, persisted field on the row (see mill_slip's shape() and COLUMNS.rawMaterialIn
+// above) — deliberately blank for now, to be filled in once a future feature matches this entry
+// against consumption reports.
+const RAW_MATERIAL_SIZE_COLUMNS = [
+  { key: 'date', label: 'Date' }, { key: 'mill', label: 'Mill' }, { key: 'weight_kg', label: 'Weight (kg)', type: 'number' },
+  { key: 'gsm', label: 'GSM' }, { key: 'bf', label: 'BF' }, { key: 'shade', label: 'Shade' }, { key: 'consumed', label: 'Consumed (date)' },
+];
 const NAV = [
   { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { key: 'upload', label: 'Upload & Extract', icon: Upload },
@@ -1860,6 +1874,25 @@ function FIMSApp() {
       map[key].weight_consumed += num(c.weight_consumed);
     });
     return Object.values(map).map(v => ({ ...v, balance: v.weight_in - v.weight_consumed }));
+  })();
+  // One group per distinct size, exactly as the physical register book itself is organized (each
+  // size gets its own page). Deliberately NOT summed the way balanceRows above is — every individual
+  // mill-slip line item stays its own row; grouping only changes which table it's displayed in, never
+  // the data itself. Row order within a group is left to EditableTable's own date sort (its default),
+  // rather than sorted here too, to avoid sorting the same rows twice.
+  const rawMaterialBySize = (() => {
+    const groups = {};
+    rawMaterialIn.forEach(r => {
+      const size = (r.size || '').trim() || '(no size)';
+      (groups[size] = groups[size] || []).push(r);
+    });
+    return Object.entries(groups)
+      .map(([size, rows]) => ({ size, rows }))
+      .sort((a, b) => {
+        const na = parseFloat(a.size), nb = parseFloat(b.size);
+        if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+        return a.size.localeCompare(b.size, undefined, { numeric: true });
+      });
   })();
   /* -------- dabur PO pending calc -------- */
   const PO_TOLERANCE = 0.10; // ±10% — a PO counts as fulfilled once dispatched qty reaches 90% of ordered qty
@@ -3615,8 +3648,20 @@ function FIMSApp() {
                   </div>
                 )}
               </div>
-              <RegisterPanel title="Inward Entries (from mill slips)" columns={COLUMNS.rawMaterialIn} rows={rawMaterialIn}
-                onUpdate={updateRow('rawMaterialIn')} onDelete={deleteRow('rawMaterialIn')} onExport={() => exportSheet('Raw_Material_In', rawMaterialIn, COLUMNS.rawMaterialIn)} />
+              <div className="panel">
+                <div className="panel-header">
+                  <div><h2>Inward Entries (from mill slips)</h2><p className="subtitle">One table per size, same as the physical register book. Nothing is summed here — every mill-slip line stays its own row. "Consumed" is left blank for now; it'll be filled in once entries are matched against consumption reports.</p></div>
+                  <button className="btn btn-ghost" onClick={() => exportSheet('Raw_Material_In', rawMaterialIn, COLUMNS.rawMaterialIn)}><Download size={15} /> Export</button>
+                </div>
+                {!rawMaterialIn.length && <div className="empty-state">Upload some mill slips to see inward entries here.</div>}
+                {rawMaterialBySize.map(group => (
+                  <div key={group.size} style={{ marginBottom: 20 }}>
+                    <div style={{ marginBottom: 6 }}><strong>Size {group.size}</strong></div>
+                    <EditableTable columns={RAW_MATERIAL_SIZE_COLUMNS} rows={group.rows}
+                      onUpdate={updateRow('rawMaterialIn')} onDelete={deleteRow('rawMaterialIn')} />
+                  </div>
+                ))}
+              </div>
               <RegisterPanel title="Consumption Entries (from daily reports)" columns={COLUMNS.consumption} rows={consumption}
                 onUpdate={updateRow('consumption')} onDelete={deleteRow('consumption')} onExport={() => exportSheet('Consumption', consumption, COLUMNS.consumption)} />
             </div>
