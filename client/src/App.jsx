@@ -787,8 +787,8 @@ const GUIDE_STEPS = [
   {
     title: 'New finished-goods rows wait in Customer Stock for your OK',
     tab: 'customerStock',
-    what: 'Any Production Register row with a product description, and any Customer Dispatch Bill row, shows up in "Pending Review" at the top of Customer Stock. Neither counts toward any customer’s balance until you confirm it.',
-    how: 'Check the suggested customer for each row (auto-matched, editable if it’s wrong), then confirm one at a time or use "Confirm all suggested." Once confirmed, production rows add to that customer’s stock and dispatch bill rows subtract from it, in the running balance below.',
+    what: 'Any Production Register row with a product description, and any Customer Dispatch Bill row, shows up in "Pending Review" at the top of Customer Stock. Neither counts toward any customer’s balance, and nothing is pushed to their Sheet, until you confirm it.',
+    how: 'Check the suggested customer for each row (auto-matched, editable if it’s wrong), then confirm one at a time or use "Push to Sheet" to confirm and push everything resolved in one go. Duplicate rows already in the real Sheet are skipped automatically.',
   },
   {
     title: 'Customer Mapping decides who gets what',
@@ -1290,26 +1290,16 @@ function FIMSApp() {
   const [customerNameAliases, setCustomerNameAliases] = useState([]); // [{id, alias, customer}]
   const [pushStatus, setPushStatus] = useState({}); // { [customer]: { state: 'idle'|'pushing'|'done'|'error', message, unmatched } }
   const [serviceAccountEmail, setServiceAccountEmail] = useState('');
-  // Review-before-push: reviewByCustomer holds the last fetched diff (a dry run against the customer's
-  // REAL Sheet — see /api/customer-sheets/preview), reviewEdits holds only what a person has changed
-  // in that preview (date/production/dispatch per row, a deleted row, or which tab an item is routed
-  // to) — never written back into production/customerDispatch, only ever applied on top of the
-  // computed payload at preview-refresh and push time. This CRUD editing lives on the Customer Stock
-  // tab; Customer Sheets only shows a read-only version of the same diff plus the Push button itself —
-  // there's no separate "Approve" step anymore, Push just sends whatever the current edited payload is
-  // (with a plain confirm dialog, same as every other real write in this app).
+  // reviewByCustomer holds the last fetched diff against a customer's REAL Sheet (a dry run — see
+  // /api/customer-sheets/preview): existingTabNames/existingBlockTitles feed the Sheet-tab/Block
+  // datalist suggestions in Pending Review and Customer Sheets. Pushing itself now happens straight
+  // from Pending Review (see pushPendingRows/pushCustomerSheetNow) — no separate review-and-edit UI
+  // reads this anymore, it's purely a background data source for autocomplete suggestions.
   const [reviewByCustomer, setReviewByCustomer] = useState({}); // { [customer]: { loading, error, tabs, existingTabNames } }
+  // Always empty now — nothing sets it since the review-and-edit UI it backed was removed (pushing
+  // happens straight from Pending Review, see pushPendingRows) — kept only because applyReviewEdits/
+  // getEditedPayload still read it as a harmless no-op rather than reworking that whole call chain.
   const [reviewEdits, setReviewEdits] = useState({}); // { [customer]: { [variantTitle]: { tabNameOverride, rowEdits: { [rowIndex]: {date,production,dispatch} }, deletedRows: { [rowIndex]: true } } } }
-  // A customer's review panel dismissed (via the "Discard" button) while it had nothing new to push —
-  // pure local/in-memory UI state, never persisted: hides that customer from the Customer Ledgers list
-  // ONLY while it's still true that there's nothing to do for them, and self-heals the moment that
-  // changes (a new confirmed row, a new mismatch) without needing to explicitly un-dismiss anything.
-  const [dismissedReviews, setDismissedReviews] = useState(new Set());
-  // Inline "+ Add row" form state for the review screen, keyed by `${customer}::${variantTitle}`.
-  const [newRowForms, setNewRowForms] = useState({});
-  const updateNewRowForm = (key, field, value) => setNewRowForms(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
-  // Per-row "move to a different customer" selection, keyed by `${customer}::${variantTitle}::${rowIndex}`.
-  const [moveTargets, setMoveTargets] = useState({});
   const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
   const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch, customerSheetsMirror: setCustomerSheetsMirror };
   useEffect(() => {
@@ -2063,6 +2053,11 @@ function FIMSApp() {
   const addMappingRow = () => persistCustomerMapping([...customerMapping, { id: genId(), keyword: '', customer: '' }]);
   const updateMappingRow = (id, field, value) => persistCustomerMapping(customerMapping.map(r => r.id === id ? { ...r, [field]: value } : r));
   const deleteMappingRow = (id) => persistCustomerMapping(customerMapping.filter(r => r.id !== id));
+  // "Merge duplicate customer" form state — was a per-customer inline dropdown on the (now removed)
+  // Customer Ledgers review panel; moved here since it's a genuine recovery tool worth keeping, not
+  // something that only made sense next to a review UI that no longer exists.
+  const [mergeFromCustomer, setMergeFromCustomer] = useState('');
+  const [mergeToCustomer, setMergeToCustomer] = useState('');
   /* -------- word abbreviations (editable; "J" -> "Jumbo", "CONT" -> "Container", etc.) -------- */
   const persistAbbreviations = (next) => {
     setAbbreviations(next);
@@ -2075,9 +2070,9 @@ function FIMSApp() {
      the one real known customer it means, e.g. "Bindal technopolymer pvt. ltd." -> "BINDAL STOCK
      1.08.26") -------- */
   // Functional setState updater (never a plain `setCustomerNameAliases([...customerNameAliases, entry])`
-  // reading the outer closure) — required because confirmAllPendingProduction/confirmAllPendingDispatch
-  // call this once per row via confirmStockRow in a tight synchronous loop, and a closure-based read
-  // would have every call but the last one silently clobber the ones before it.
+  // reading the outer closure) — required because pushPendingRows calls this once per row via
+  // confirmStockRow in a tight synchronous loop, and a closure-based read would have every call but
+  // the last one silently clobber the ones before it.
   const registerCustomerNameAlias = (alias, customer) => {
     const a = (alias || '').trim();
     const c = (customer || '').trim();
@@ -2189,8 +2184,8 @@ function FIMSApp() {
   // Product Catalog entry (routes to the right Sheet tab) and an exact-match Customer Mapping keyword
   // rule (routes to the right customer) for whichever names aren't already known.
   // Uses FUNCTIONAL setState updaters (reading `prev`, never the outer `productCatalog`/`customerMapping`
-  // closure) — required because confirmAllPendingProduction/confirmAllPendingDispatch now call this once
-  // per row in a tight synchronous loop (via confirmStockRow) to register each row's picked block. With a
+  // closure) — required because pushPendingRows now calls this once per row in a tight synchronous
+  // loop (via confirmStockRow) to register each row's picked block. With a
   // plain `persistCatalog([...productCatalog, ...newEntries])` call, EVERY call in that loop would read
   // the SAME pre-loop snapshot of productCatalog (React doesn't re-render between them), so each call's
   // write would silently clobber the previous one's — only the LAST row's alias would ever actually
@@ -2334,22 +2329,41 @@ function FIMSApp() {
     });
     if (tabBlockDraft) setPendingTabBlockForms(prev => { const next = { ...prev }; delete next[row.id]; return next; });
   };
-  // "Confirm all suggested" must never silently confirm a row onto a fabricated new-customer guess —
-  // only rows that are either already explicitly picked (row.confirmedCustomer set via the dropdown)
-  // or whose automatic guess is a real known customer get bulk-confirmed. Anything genuinely
-  // unresolved is left pending and reported, so it gets a deliberate pick instead of a phantom customer.
-  const confirmAllPendingProduction = () => {
-    const resolved = pendingProductionRows.filter(r => r.confirmedCustomer || isKnownCustomerGuess(r));
-    const skipped = pendingProductionRows.length - resolved.length;
-    resolved.forEach(r => confirmStockRow('production', r));
-    if (skipped > 0) window.alert(`Confirmed ${resolved.length} row${resolved.length === 1 ? '' : 's'}. Skipped ${skipped} row${skipped === 1 ? '' : 's'} whose customer couldn't be matched automatically — pick a customer in the dropdown for ${skipped === 1 ? 'it' : 'them'}, then confirm.`);
+  // "Push to Sheet" (Pending Production/Dispatch Review) must never silently confirm a row onto a
+  // fabricated new-customer guess — only rows that are either already explicitly picked
+  // (row.confirmedCustomer set via the dropdown) or whose automatic guess is a real known customer get
+  // bulk-confirmed and pushed. Anything genuinely unresolved is left pending and reported, so it gets a
+  // deliberate pick instead of a phantom customer.
+  //
+  // Confirming and pushing can't happen in the same synchronous pass: confirmStockRow's setState only
+  // takes effect on the NEXT render, so buildCustomerSheetPayload (which reads live production/
+  // customerDispatch state) would still see the pre-confirm data if called right after. Instead this
+  // queues the touched customers in pendingPushCustomers; the effect below fires once the confirmed
+  // rows have actually landed in state and does the real push then. Duplicate detection happens
+  // entirely server-side during that push (see classifyIncomingRows in server/lib/sheets.js) — a row
+  // that's already correctly in the real Sheet is silently skipped, never re-written.
+  const [pendingPushCustomers, setPendingPushCustomers] = useState(null);
+  const pushPendingRows = (registerKey, rows) => {
+    const resolved = rows.filter(r => r.confirmedCustomer || isKnownCustomerGuess(r));
+    const skipped = rows.length - resolved.length;
+    const customersTouched = new Set();
+    resolved.forEach(r => {
+      const customer = (r.confirmedCustomer || matchCustomer(r)).trim() || 'Unassigned';
+      if (customer !== 'Unassigned') customersTouched.add(customer);
+      confirmStockRow(registerKey, r);
+    });
+    if (skipped > 0) window.alert(`Confirmed and queued ${resolved.length} row${resolved.length === 1 ? '' : 's'} to push. Skipped ${skipped} row${skipped === 1 ? '' : 's'} whose customer couldn't be matched automatically — pick a customer in the dropdown for ${skipped === 1 ? 'it' : 'them'}, then push again.`);
+    if (customersTouched.size) setPendingPushCustomers(prev => new Set([...(prev || []), ...customersTouched]));
   };
-  const confirmAllPendingDispatch = () => {
-    const resolved = pendingDispatchRows.filter(r => r.confirmedCustomer || isKnownCustomerGuess(r));
-    const skipped = pendingDispatchRows.length - resolved.length;
-    resolved.forEach(r => confirmStockRow('customerDispatch', r));
-    if (skipped > 0) window.alert(`Confirmed ${resolved.length} row${resolved.length === 1 ? '' : 's'}. Skipped ${skipped} row${skipped === 1 ? '' : 's'} whose customer couldn't be matched automatically — pick a customer in the dropdown for ${skipped === 1 ? 'it' : 'them'}, then confirm.`);
-  };
+  useEffect(() => {
+    if (!pendingPushCustomers || !pendingPushCustomers.size) return;
+    const toPush = pendingPushCustomers;
+    setPendingPushCustomers(null);
+    toPush.forEach(customer => {
+      if (getCustomerSheetId(customer).trim()) pushCustomerSheetNow(customer);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingPushCustomers, production, customerDispatch]);
   const updatePendingCustomer = (registerKey) => (id, value) => {
     registerSetters[registerKey](prev => {
       const next = prev.map(r => r.id === id ? { ...r, confirmedCustomer: value } : r);
@@ -2373,7 +2387,7 @@ function FIMSApp() {
     });
     // Only surface groups that actually need the help: more than one row, sharing a raw hint, with at
     // least one row still lacking both an explicit pick and a resolvable automatic guess — otherwise
-    // "Confirm all suggested" already handles it without any extra UI.
+    // "Push to Sheet" already handles it without any extra UI.
     return Object.entries(map)
       .map(([key, groupRows]) => ({ key, rows: groupRows }))
       .filter(g => g.rows.length > 1 && g.rows.some(r => !r.confirmedCustomer && !isKnownCustomerGuess(r)));
@@ -2636,14 +2650,8 @@ function FIMSApp() {
     // rewrites it. The app never reads or writes that tab at all now, for any customer.
     return { itemGroups, unmatched: Array.from(new Set(unmatched)) };
   };
-  // Applies whatever's staged in reviewEdits[customer] on top of the freshly computed itemGroups —
-  // used both to regenerate the diff shown on screen and to build the exact payload Push actually
-  // sends, so there's no way for what got approved to differ from what gets written. Edits live ONLY
-  // here — a changed date/production/dispatch value, a deleted row, or a reassigned tab, is never
-  // written back into `production`/`customerDispatch`, so the original register stays exactly as
-  // scanned or entered. (A CREATED row is the one exception — see addManualStockRow below, which adds
-  // a real confirmed register entry instead of a fake payload-only row, so its opening/closing balance
-  // comes out right without reimplementing that math here.)
+  // reviewEdits[customer] is always empty now (see its declaration) — kept as a harmless no-op pass-
+  // through rather than reworking every call site that still asks for the "edited" payload.
   const applyReviewEdits = (itemGroups, editsForCustomer) => {
     if (!editsForCustomer || !Object.keys(editsForCustomer).length) return itemGroups;
     const regrouped = {};
@@ -2667,9 +2675,10 @@ function FIMSApp() {
         .filter(Boolean);
       if (!regrouped[finalTab]) regrouped[finalTab] = [];
       // blockTitleOverride: which of the tab's REAL existing blocks this item was explicitly assigned
-      // to via the block picker (or the "+ New block" choice) — v.title itself (the item's real name)
-      // is never rewritten, so it keeps working as the stable key reviewEdits/moveReviewRow/etc. are
-      // all keyed by. Only sent when actually set, so an untouched item's behavior is unchanged.
+      // to — v.title itself (the item's real name) is never rewritten, so it keeps working as the
+      // stable key reviewEdits is keyed by. Only sent when actually set, so an untouched item's
+      // behavior is unchanged. reviewEdits is always empty now (see its declaration), so this whole
+      // function is a no-op in practice — left in place rather than reworking every caller.
       const blockTitleOverride = (e && e.blockTitleOverride && e.blockTitleOverride.trim()) ? e.blockTitleOverride.trim() : undefined;
       regrouped[finalTab].push(blockTitleOverride ? { ...v, rows, blockTitleOverride } : { ...v, rows });
     }));
@@ -2788,113 +2797,12 @@ function FIMSApp() {
         .map(c => (c.block || c.item || '').trim())
     )).filter(Boolean);
   };
-  const setRowEdit = (customer, variantTitle, rowIndex, field, value) => {
-    setReviewEdits(prev => {
-      const forCustomer = { ...(prev[customer] || {}) };
-      const forVariant = { ...(forCustomer[variantTitle] || {}) };
-      const rowEdits = { ...(forVariant.rowEdits || {}) };
-      rowEdits[rowIndex] = { ...(rowEdits[rowIndex] || {}), [field]: value };
-      forVariant.rowEdits = rowEdits;
-      forCustomer[variantTitle] = forVariant;
-      return { ...prev, [customer]: forCustomer };
-    });
-  };
-  const setTabOverride = (customer, variantTitle, tabName) => {
-    setReviewEdits(prev => {
-      const forCustomer = { ...(prev[customer] || {}) };
-      forCustomer[variantTitle] = { ...(forCustomer[variantTitle] || {}), tabNameOverride: tabName };
-      return { ...prev, [customer]: forCustomer };
-    });
-  };
-  // Assigns which of the tab's REAL existing blocks a not-yet-matched item should be pushed into
-  // (picked from the block-picker dropdown), or an explicit "+ New block" choice — see the block
-  // picker UI below. Mirrors setTabOverride exactly.
-  const setBlockOverride = (customer, variantTitle, blockTitle) => {
-    setReviewEdits(prev => {
-      const forCustomer = { ...(prev[customer] || {}) };
-      forCustomer[variantTitle] = { ...(forCustomer[variantTitle] || {}), blockTitleOverride: blockTitle };
-      return { ...prev, [customer]: forCustomer };
-    });
-  };
-  // Deleting a row here only excludes it from what gets pushed for THIS customer's sheet — same
-  // non-destructive philosophy as the date/production/dispatch edits above. Toggle-able, so unchecking
-  // "delete" on the same row (before the review refreshes and the index shifts) undoes it.
-  const setRowDeleted = (customer, variantTitle, rowIndex, deleted) => {
-    setReviewEdits(prev => {
-      const forCustomer = { ...(prev[customer] || {}) };
-      const forVariant = { ...(forCustomer[variantTitle] || {}) };
-      const deletedRows = { ...(forVariant.deletedRows || {}) };
-      if (deleted) deletedRows[rowIndex] = true; else delete deletedRows[rowIndex];
-      forVariant.deletedRows = deletedRows;
-      forCustomer[variantTitle] = forVariant;
-      return { ...prev, [customer]: forCustomer };
-    });
-  };
-  // "Discard changes" for a specific customer sheet — wipes every staged edit/deletion/tab-override
-  // for that customer, reverting the review screen back to the freshly computed diff. Never touches
-  // the Production Register / Customer Dispatch Bills registers themselves.
-  const discardCustomerReview = (customer) => {
-    setReviewEdits(prev => { const next = { ...prev }; delete next[customer]; return next; });
-  };
-  // "Create a row" in the review screen. A synthetic row bolted directly onto the push payload would
-  // need its own opening/closing balance math duplicating what customerStockGroups already does
-  // correctly from real register data — instead, this adds a genuine CONFIRMED entry to the
-  // Production Register and/or Customer Dispatch Bills register (whichever quantity was filled in,
-  // or both), tagged to this customer and item. It then flows through the exact same pipeline as an
-  // extracted-and-confirmed row, so balances come out right automatically, and the new row stays
-  // visible/editable on its own register tab afterward too — not stuck as a review-only artifact.
-  const addManualStockRow = (customer, variantTitle, date, productionQty, dispatchQty) => {
-    const d = normalizeDateToDots((date || '').trim());
-    const prodQty = num(productionQty);
-    const dispQty = num(dispatchQty);
-    if (!d || (!prodQty && !dispQty)) return;
-    if (prodQty) {
-      const row = { id: genId(), date: d, party: customer, description: variantTitle, customerHint: '', pieces: prodQty, dispatch: 0, stockConfirmed: true, confirmedCustomer: customer };
-      const next = [...production, row];
-      setProduction(next); persist('production', next);
-    }
-    if (dispQty) {
-      const row = { id: genId(), date: d, invoice_no: '', party: customer, buyer_order_no: '', description: variantTitle, quantity: dispQty, rate: '', amount: '', stockConfirmed: true, confirmedCustomer: customer };
-      const next = [...customerDispatch, row];
-      setCustomerDispatch(next); persist('customerDispatch', next);
-    }
-  };
-  // "Move a row to a different customer" — rare, but useful for fixing a misattributed entry without
-  // digging through the Production Register / Customer Dispatch Bills tabs by hand. Matches the
-  // underlying register row(s) by (customer, item, date) rather than an internal id — the id doesn't
-  // survive the trip through the ledger/payload arrays that feed this screen. A customer+item+date is
-  // effectively unique in practice; the one real exception (more than one dispatch bill for the same
-  // item on the same day) moves all of them together, which is flagged in the UI hint next to the
-  // control rather than silently guessing which one was meant.
-  const moveReviewRow = (customer, variantTitle, rowDate, toCustomer) => {
-    const target = (toCustomer || '').trim();
-    if (!target || target === customer) return false;
-    const d = normalizeDateToDots((rowDate || '').trim());
-    let movedAny = false;
-    ['production', 'customerDispatch'].forEach(registerKey => {
-      const rows = registerKey === 'production' ? production : customerDispatch;
-      let changed = false;
-      const next = rows.map(r => {
-        if (!r.stockConfirmed) return r;
-        if ((r.confirmedCustomer || '').trim() !== customer) return r;
-        const desc = stripPackCount(r.description) || r.description;
-        if (desc !== variantTitle) return r;
-        if (normalizeDateToDots(r.date) !== d) return r;
-        changed = true;
-        return { ...r, confirmedCustomer: target };
-      });
-      if (changed) {
-        movedAny = true;
-        registerSetters[registerKey](next);
-        persist(registerKey, next);
-      }
-    });
-    return movedAny;
-  };
-  // Auto-refreshes every customer's review whenever what would actually get pushed changes — a new
-  // production/dispatch entry gets confirmed, a catalog mapping is edited, or a review edit is made.
-  // Debounced so a burst of confirms (e.g. "Confirm all suggested") triggers one preview call per
-  // customer, not one per row.
+  // Keeps the underlying per-customer real-Sheet diff (existingTabNames/existingBlockTitles) fresh in
+  // the background — the visible "Customer Ledgers" review UI this used to feed was removed (pushing
+  // now happens straight from Pending Review, see pushPendingRows), but getRealTabNamesForCustomer/
+  // getRealBlocksForTab still read this to populate the Sheet-tab/Block datalist suggestions there and
+  // on Customer Sheets. Debounced so a burst of confirms (e.g. "Push to Sheet") triggers one preview
+  // call per customer, not one per row.
   const reviewRefreshKey = JSON.stringify({
     groups: customerStockGroups.map(g => ({ c: g.customer, d: g.description, ledger: g.ledger })),
     catalog: productCatalog, sheetIds: customerSheetIds, edits: reviewEdits,
@@ -3889,16 +3797,29 @@ function FIMSApp() {
             <div>
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Customer Stock</h2>
-                <p className="subtitle">Review new Production Register and Customer Dispatch Bill entries here and confirm which customer they belong to. Matching is done by the Customer Mapping tab, plus anything literally bracketed next to the item name. The per-customer ledger, the diff against each customer's real Sheet, and pushing to that Sheet all live here too, below — the Customer Sheets tab is just for adding/syncing a Sheet ID.</p>
+                <p className="subtitle">Review new Production Register and Customer Dispatch Bill entries here and confirm which customer they belong to. Matching is done by the Customer Mapping tab, plus anything literally bracketed next to the item name. "Push to Sheet" below confirms the customer AND pushes straight to their real Google Sheet in one step — duplicate rows already there are skipped automatically, server-side. The Customer Sheets tab is just for adding/syncing a Sheet ID.</p>
               </div>
+              {Object.entries(pushStatus).filter(([, s]) => s && s.state && s.state !== 'idle').length > 0 && (
+                <div className="panel">
+                  <h2 style={{ marginBottom: 6 }}>Push Status</h2>
+                  {Object.entries(pushStatus).filter(([, s]) => s && s.state && s.state !== 'idle').map(([customer, s]) => (
+                    <div key={customer} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                      <strong>{customer}:</strong>
+                      {s.state === 'pushing' && <span className="doc-hint"><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle', marginRight: 4 }} />pushing…</span>}
+                      {s.state === 'done' && <span className="doc-hint" style={{ color: 'var(--ok)' }}>✓ {s.message}</span>}
+                      {s.state === 'error' && <span style={{ color: 'var(--ledger-red)', fontSize: 12.5 }}>{s.message}</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
               {(pendingProductionRows.length > 0 || pendingDispatchRows.length > 0) && (
                 <SectionDivider icon={ListChecks} label="Needs your input" hint="New entries whose customer isn't confirmed yet — nothing here counts toward any balance until you confirm it." />
               )}
               {pendingProductionRows.length > 0 && (
                 <div className="panel" style={{ borderColor: 'var(--accent)' }}>
                   <div className="panel-header">
-                    <div><h2>Pending Production Review ({pendingProductionRows.length})</h2><p className="subtitle">New Production Register entries not yet reflected in the customer stock totals below. Check or fix the suggested customer, then confirm — nothing here counts toward balances until you do.</p></div>
-                    <button className="btn btn-primary" onClick={confirmAllPendingProduction}><CheckCircle2 size={15} /> Confirm all suggested</button>
+                    <div><h2>Pending Production Review ({pendingProductionRows.length})</h2><p className="subtitle">New Production Register entries not yet pushed to any customer's Sheet. Check or fix the suggested customer, then push — nothing here counts toward balances or reaches the real Sheet until you do.</p></div>
+                    <button className="btn btn-primary" onClick={() => pushPendingRows('production', pendingProductionRows)}><FileSpreadsheet size={15} /> Push to Sheet</button>
                   </div>
                   {buildPendingGroups(pendingProductionRows).map(group => (
                     <PendingGroupBar key={group.key} group={group} guess={matchCustomer(group.rows[0])}
@@ -3957,8 +3878,8 @@ function FIMSApp() {
               {pendingDispatchRows.length > 0 && (
                 <div className="panel" style={{ borderColor: 'var(--ledger-red)' }}>
                   <div className="panel-header">
-                    <div><h2>Pending Dispatch Bill Review ({pendingDispatchRows.length})</h2><p className="subtitle">New Customer Dispatch Bill entries not yet reflected in the customer stock totals below. Check or fix the suggested customer, then confirm — nothing here counts toward balances until you do.</p></div>
-                    <button className="btn btn-primary" onClick={confirmAllPendingDispatch}><CheckCircle2 size={15} /> Confirm all suggested</button>
+                    <div><h2>Pending Dispatch Bill Review ({pendingDispatchRows.length})</h2><p className="subtitle">New Customer Dispatch Bill entries not yet pushed to any customer's Sheet. Check or fix the suggested customer, then push — nothing here counts toward balances or reaches the real Sheet until you do.</p></div>
+                    <button className="btn btn-primary" onClick={() => pushPendingRows('customerDispatch', pendingDispatchRows)}><FileSpreadsheet size={15} /> Push to Sheet</button>
                   </div>
                   {buildPendingGroups(pendingDispatchRows).map(group => (
                     <PendingGroupBar key={group.key} group={group} guess={matchCustomer(group.rows[0])}
@@ -4125,400 +4046,33 @@ function FIMSApp() {
                   </>
                 );
               })()}
-              {(() => {
-                // Per-customer ledger + diff-against-the-real-Sheet + full CRUD (edit/delete/move/add a
-                // row, discard staged changes) — moved here from Customer Sheets so there's one review
-                // step, not two. Customer Sheets now just shows a read-only version of the same data
-                // plus the Push button itself. Only customers with something to actually show (an item
-                // that needs routing, or a fetched diff) get a panel — no empty shells for customers
-                // that don't have a Sheet ID set up yet (that setup still happens on Customer Sheets).
-                // A customer with confirmed stock data but no Sheet ID set up yet must still show up
-                // here — that's exactly the bug that made confirmed dispatch-bill rows disappear
-                // entirely when they landed under a customer nobody had connected a Sheet for yet.
-                // Sheet ID is still required for customers with NOTHING confirmed against them (no
-                // point showing an empty shell), but never for ones with real data.
-                const customersToShow = allCustomerTabNames.filter(customer => {
-                  const hasStockData = customerStockGroups.some(g => g.customer === customer);
-                  if (!hasStockData && !getCustomerSheetId(customer).trim()) return false;
-                  const { unmatched } = buildCustomerSheetPayload(customer);
-                  return unmatched.length > 0 || !!reviewByCustomer[customer];
-                });
-                if (!pendingProductionRows.length && !pendingDispatchRows.length && !customerStockGroups.filter(g => g.customer === 'Unassigned').length && !customersToShow.length) {
-                  return <div className="empty-state">Nothing pending review right now.</div>;
-                }
-                if (!customersToShow.length) return null;
-                return (
-                <>
-                <SectionDivider icon={Boxes} label="Customer ledgers" hint="Items already attributed to a real customer — routed items push cleanly; anything below still needs a Sheet tab or has a discrepancy to look at." />
-                {customersToShow.map(customer => {
-                  // Counted up front (not just for display) so the panel can decide, on its own,
-                  // whether it deserves to be open by default. A customer with nothing to look at
-                  // shouldn't take up the same visual weight as one that genuinely needs a decision —
-                  // that's what was making this page feel like one long undifferentiated wall.
-                  const { unmatched: unmatchedForCount } = buildCustomerSheetPayload(customer);
-                  const reviewForCustomer = reviewByCustomer[customer];
-                  const reviewTabsForCount = (reviewForCustomer && reviewForCustomer.tabs) || [];
-                  const mismatchCountForCustomer = reviewTabsForCount.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'mismatch' || r.status === 'unverifiable').length, 0), 0);
-                  const newRowsCountForCustomer = reviewTabsForCount.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'new' || r.status === 'fillable').length, 0), 0);
-                  const needsAttention = unmatchedForCount.length > 0 || mismatchCountForCustomer > 0;
-                  // Discarded (see the review section below) while there was nothing to do for this
-                  // customer — stays hidden only as long as that's still true; a new confirmed row or a
-                  // fresh discrepancy un-hides it automatically, no explicit "un-dismiss" needed.
-                  const nothingToDoForCustomer = unmatchedForCount.length === 0 && mismatchCountForCustomer === 0 && newRowsCountForCustomer === 0;
-                  if (dismissedReviews.has(customer) && nothingToDoForCustomer) return null;
-                  return (
-                  <details className="panel customer-review-panel" key={`stock-review-${customer}`} open={needsAttention}>
-                    <summary className="customer-review-summary">
-                      <div className="customer-review-summary-main">
-                        <ChevronRight size={16} className="details-chevron" />
-                        <h2>{customer}</h2>
-                      </div>
-                      <div className="customer-review-summary-badges">
-                        {unmatchedForCount.length > 0 && <Pill tone="warn">{unmatchedForCount.length} not routed</Pill>}
-                        {mismatchCountForCustomer > 0 && <Pill tone="warn">{mismatchCountForCustomer} discrepanc{mismatchCountForCustomer === 1 ? 'y' : 'ies'}</Pill>}
-                        {newRowsCountForCustomer > 0 && <Pill tone="ok">{newRowsCountForCustomer} ready to push</Pill>}
-                        {!needsAttention && newRowsCountForCustomer === 0 && <Pill tone="neutral">All caught up</Pill>}
-                      </div>
-                    </summary>
-                    <div className="panel-header" style={{ marginTop: 12 }}>
-                      <p className="subtitle">Per-item ledger and what's about to go to their Sheet — fix anything here, then push right below. The Customer Sheets tab is just for adding/syncing a Sheet ID now.</p>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <select
-                          className="cell-input"
-                          style={{ fontSize: 12, width: 160 }}
-                          value=""
-                          onChange={e => { const target = e.target.value; e.target.value = ''; if (target) mergeCustomerInto(customer, target); }}
-                          title={`If "${customer}" is actually a duplicate or misspelling of another customer, merge everything here into the real one instead of fixing it by hand.`}
-                        >
-                          <option value="">Merge into…</option>
-                          {allCustomerTabNames.filter(c => c !== customer).sort().map(c => <option key={c} value={c}>{c}</option>)}
-                        </select>
-                        <button
-                          className="btn btn-ghost"
-                          disabled={(reviewByCustomer[customer] || {}).loading}
-                          onClick={() => refreshReview(customer)}
-                          title="Re-check against the real Sheet right now — the review otherwise only re-fetches when something changes in the app, not when the Sheet itself is edited directly."
-                        >
-                          {(reviewByCustomer[customer] || {}).loading ? <Loader2 size={15} className="spin" /> : <RefreshCw size={15} />} Refresh
-                        </button>
-                        {!!reviewEdits[customer] && Object.keys(reviewEdits[customer]).length > 0 && (
-                          <button className="btn btn-ghost" onClick={() => { if (window.confirm(`Discard every staged change (edited values, deleted rows, tab overrides) for ${customer}'s review? This never touches the Production Register or Customer Dispatch Bills — only what's staged here.`)) discardCustomerReview(customer); }}>
-                            <XCircle size={15} /> Discard changes
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                    {(() => {
-                      const { unmatched } = buildCustomerSheetPayload(customer);
-                      if (!unmatched.length) return null;
-                      const groupsForCustomer = customerStockGroups.filter(g => g.customer === customer);
-                      return (
-                        <div style={{ marginBottom: 14 }}>
-                          <div className="section-label" style={{ color: 'var(--ledger-red)' }}>{unmatched.length} item{unmatched.length === 1 ? '' : 's'} not routed to a Sheet tab yet</div>
-                          <p className="subtitle" style={{ marginBottom: 8 }}>These matched {customer} fine, but the exact wording doesn't match a known item name, so nothing gets pushed for them yet — their ledger is shown below just like an already-routed item's. Pick the Sheet tab (and an existing block name, if this should merge into one) right here to route it.</p>
-                          {unmatched.map(description => {
-                            const key = `${customer}::${description}`;
-                            const form = unmatchedAssignForms[key] || {};
-                            const customerSheetGroups = Array.from(new Set([
-                              ...productCatalog.filter(c => c.customer.toLowerCase() === customer.toLowerCase()).map(c => c.sheetGroup),
-                              ...getRealTabNamesForCustomer(customer),
-                            ])).filter(Boolean);
-                            const chosenSheetGroup = (form.sheetGroup || '').trim();
-                            // Both what physically already exists in the real Sheet tab, AND whatever
-                            // block name other Product Catalog entries under this same tab already use
-                            // (which may not be pushed to the real Sheet yet — see getCatalogBlocksForTab).
-                            const existingBlocks = Array.from(new Set([
-                              ...getRealBlocksForTab(customer, chosenSheetGroup),
-                              ...getCatalogBlocksForTab(customer, chosenSheetGroup),
-                            ])).filter(Boolean);
-                            const canAssign = chosenSheetGroup && (form.item || description || '').trim();
-                            const group = groupsForCustomer.find(g => g.description === description);
-                            return (
-                              <div key={description} style={{ border: '1px solid var(--ledger-red)', borderRadius: 8, padding: 10, marginBottom: 8 }}>
-                                <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
-                                  <strong>{description}</strong>
-                                  <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>— Sheet tab:</span>
-                                  <input className="cell-input" style={{ width: 150, fontSize: 12 }} list={`unmatched-sheetgroup-${key}`} placeholder="Sheet tab" value={form.sheetGroup || ''} onChange={e => updateUnmatchedAssignForm(key, 'sheetGroup', e.target.value)} />
-                                  <datalist id={`unmatched-sheetgroup-${key}`}>{customerSheetGroups.map(s => <option key={s} value={s} />)}</datalist>
-                                  <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>Block:</span>
-                                  <input className="cell-input" style={{ width: 180, fontSize: 12 }} list={`unmatched-item-${key}`} placeholder="Block (blank = new block)" value={form.item || ''} onChange={e => updateUnmatchedAssignForm(key, 'item', e.target.value)} />
-                                  <datalist id={`unmatched-item-${key}`}>
-                                    {existingBlocks.map(i => <option key={i} value={i} />)}
-                                    <option value={description}>{`+ New block: "${description}"`}</option>
-                                  </datalist>
-                                  <button className="btn btn-primary" style={{ marginLeft: 'auto' }} disabled={!canAssign} onClick={() => assignUnmatchedItem(customer, description)}><Check size={13} /> Assign</button>
-                                </div>
-                                {group && (
-                                  <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
-                                    <thead>
-                                      <tr style={{ textAlign: 'left', color: 'var(--muted)' }}>
-                                        <th style={{ padding: '2px 6px', fontWeight: 500 }}>Date</th>
-                                        <th style={{ padding: '2px 6px', fontWeight: 500 }}>Opening</th>
-                                        <th style={{ padding: '2px 6px', fontWeight: 500 }}>Production</th>
-                                        <th style={{ padding: '2px 6px', fontWeight: 500 }}>Dispatch</th>
-                                        <th style={{ padding: '2px 6px', fontWeight: 500 }}>Closing</th>
-                                        <th style={{ padding: '2px 6px' }}></th>
-                                      </tr>
-                                    </thead>
-                                    <tbody>
-                                      {group.ledger.map((e, i) => (
-                                        <tr key={i}>
-                                          <td style={{ padding: '2px 6px' }}>{e.date}</td>
-                                          <td style={{ padding: '2px 6px' }}>{e.opening}</td>
-                                          <td style={{ padding: '2px 6px' }}>{e.pieces || ''}</td>
-                                          <td style={{ padding: '2px 6px' }}>{e.dispatch || ''}</td>
-                                          <td style={{ padding: '2px 6px' }}>{e.closing}</td>
-                                          <td style={{ padding: '2px 6px' }}>
-                                            <div style={{ display: 'flex', gap: 4 }}>
-                                              {(e.productionIds || []).map(id => (
-                                                <button key={`p-${id}`} className="icon-btn danger" title="Delete this date's Production Register row" onClick={() => deleteRow('production')(id)}><Trash2 size={13} /></button>
-                                              ))}
-                                              {(e.dispatchIds || []).map(id => (
-                                                <button key={`d-${id}`} className="icon-btn danger" title="Delete this date's Customer Dispatch Bill row" onClick={() => deleteRow('customerDispatch')(id)}><Trash2 size={13} /></button>
-                                              ))}
-                                            </div>
-                                          </td>
-                                        </tr>
-                                      ))}
-                                    </tbody>
-                                  </table>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      );
-                    })()}
-                    {(() => {
-                      const review = reviewByCustomer[customer];
-                      if (!review) return null;
-                      const reviewTabs = review.tabs || [];
-                      const hasAnyNewRows = reviewTabs.some(t => (t.variants || []).some(v => (v.rows || []).some(r => r.status === 'new' || r.status === 'fillable')));
-                      const mismatchCount = reviewTabs.reduce((s, t) => s + (t.variants || []).reduce((s2, v) => s2 + (v.rows || []).filter(r => r.status === 'mismatch' || r.status === 'unverifiable').length, 0), 0);
-                      return (
-                        <div>
-                          {review.loading && <div className="doc-hint"><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle', marginRight: 6 }} />checking against the real Sheet…</div>}
-                          {review.error && <div className="error-box"><AlertCircle size={16} /><span>{review.error}</span></div>}
-                          {!review.error && !hasAnyNewRows && !mismatchCount && !review.loading && (
-                            <div className="doc-hint" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                              <span>Nothing new to push right now — every confirmed entry is already reflected in the real Sheet.</span>
-                              <button className="btn btn-ghost" style={{ padding: '2px 8px', fontSize: 12 }} onClick={() => setDismissedReviews(prev => new Set(prev).add(customer))} title="Hide this panel until there's something new to look at again">
-                                <XCircle size={13} /> Discard
-                              </button>
-                            </div>
-                          )}
-                          {!review.error && !!mismatchCount && (
-                            <div className="error-box"><AlertCircle size={16} /><span>{mismatchCount} row{mismatchCount === 1 ? '' : 's'} below {mismatchCount === 1 ? 'is' : 'are'} flagged — already dated in the real Sheet but with different numbers (or unreadable). Nothing flagged gets pushed; edit or delete the row if it needs fixing.</span></div>
-                          )}
-                          {reviewTabs.map(tab => (tab.variants || []).filter(v => (v.rows || []).length > 0).map(v => {
-                            // A "duplicate" row is already correctly in the real Sheet — nothing to
-                            // review, edit, or push for it (its own controls are disabled below too) —
-                            // so it's dropped from the table entirely rather than padding it out.
-                            // Row indices (i, used by setRowEdit/setRowDeleted/moveKey below) are never
-                            // recomputed from a filtered array — only the RENDER of a duplicate row's
-                            // <tr> is skipped, so every other row's index stays exactly what the rest of
-                            // the review/push pipeline already expects it to be.
-                            const hiddenDuplicateCount = (v.rows || []).filter(r => r.status === 'duplicate').length;
-                            if (hiddenDuplicateCount === (v.rows || []).length) return null; // fully synced — nothing actionable here at all
-                            const needsBlock = !tab.isNewTab && v.isNewBlock;
-                            const blockOverride = (reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].blockTitleOverride) || '';
-                            const unassigned = needsBlock && !blockOverride;
-                            const existingBlocks = tab.existingBlockTitles || [];
-                            return (
-                            <div key={`${tab.tabName}::${v.title}`} style={{ border: `1px solid ${unassigned ? 'var(--ledger-red)' : 'var(--border)'}`, borderRadius: 8, padding: 10, marginBottom: 8 }}>
-                              <div style={{ display: 'flex', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 6 }}>
-                                <strong>{v.title}</strong>
-                                <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>— Sheet tab:</span>
-                                <input
-                                  className="cell-input"
-                                  style={{ width: 200, fontSize: 12 }}
-                                  list={`review-tabs-${customer}`}
-                                  value={(reviewEdits[customer] && reviewEdits[customer][v.title] && reviewEdits[customer][v.title].tabNameOverride) ?? tab.tabName}
-                                  onChange={e => setTabOverride(customer, v.title, e.target.value)}
-                                />
-                                <datalist id={`review-tabs-${customer}`}>
-                                  {(review.existingTabNames || []).map(t => <option value={t} key={t} />)}
-                                </datalist>
-                                {tab.isNewTab && <span className="doc-hint">(new — this tab doesn't exist yet)</span>}
-                                {/* Always editable, not just when auto-matching couldn't find a block (needsBlock)
-                                    — an auto-match can itself be wrong, and there was previously no way to fix
-                                    that here at all since the field didn't even render once something matched. */}
-                                <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>— Block:</span>
-                                <input
-                                  className="cell-input"
-                                  style={{ width: 200, fontSize: 12, borderColor: unassigned ? 'var(--ledger-red)' : undefined }}
-                                  list={`review-blocks-${customer}-${tab.tabName}`}
-                                  value={blockOverride || v.title}
-                                  onChange={e => setBlockOverride(customer, v.title, e.target.value)}
-                                />
-                                <datalist id={`review-blocks-${customer}-${tab.tabName}`}>
-                                  {existingBlocks.map(t => <option value={t} key={t} />)}
-                                  <option value={v.title}>{`+ New block: "${v.title}"`}</option>
-                                </datalist>
-                                {unassigned && (
-                                  <AlertCircle
-                                    size={15}
-                                    color="var(--ledger-red)"
-                                    style={{ flexShrink: 0 }}
-                                    title="Not yet assigned to a block — pick one from the dropdown, or it'll create a new one named after the item on push."
-                                  />
-                                )}
-                              </div>
-                              {hiddenDuplicateCount > 0 && <p className="doc-hint" style={{ marginBottom: 6 }}>+ {hiddenDuplicateCount} row{hiddenDuplicateCount === 1 ? '' : 's'} already in the Sheet, not shown.</p>}
-                              <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
-                                <thead>
-                                  <tr style={{ textAlign: 'left', color: 'var(--muted)' }}>
-                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Date</th>
-                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Opening</th>
-                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Production</th>
-                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Dispatch</th>
-                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Closing</th>
-                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Status</th>
-                                    <th style={{ padding: '2px 6px', fontWeight: 500 }}>Move to</th>
-                                    <th style={{ padding: '2px 6px', fontWeight: 500 }} className="col-action"></th>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {v.rows.map((r, i) => {
-                                    // Counted in hiddenDuplicateCount above (and summarized in the note
-                                    // above the table) instead of rendered — a duplicate can never be
-                                    // edited or deleted anyway (its controls were always disabled below),
-                                    // so a whole row of it is pure clutter. `i` stays the row's real,
-                                    // original index either way — only the render is skipped.
-                                    if (r.status === 'duplicate') return null;
-                                    const variantEdits = (reviewEdits[customer] && reviewEdits[customer][v.title]) || {};
-                                    const edit = (variantEdits.rowEdits && variantEdits.rowEdits[i]) || {};
-                                    const isDeleted = !!(variantEdits.deletedRows && variantEdits.deletedRows[i]);
-                                    // Duplicates never reach here (filtered above), so this row is
-                                    // always one that's genuinely editable/deletable — only a staged
-                                    // delete disables it.
-                                    const rowDisabled = isDeleted;
-                                    const moveKey = `${customer}::${v.title}::${i}`;
-                                    const rowDateValue = edit.date ?? r.date;
-                                    const rowBg = isDeleted ? 'rgba(162,59,46,0.08)'
-                                      : r.status === 'mismatch' || r.status === 'unverifiable' ? 'var(--warn-soft)'
-                                      : r.status === 'fillable' ? 'var(--ok-soft)'
-                                      : 'rgba(214,163,80,0.14)';
-                                    return (
-                                      <tr key={i} style={{ background: rowBg, opacity: rowDisabled ? 0.55 : 1 }}>
-                                        <td style={{ padding: '2px 6px' }}>
-                                          <input className="cell-input" style={{ width: 100 }} value={rowDateValue} onChange={e => setRowEdit(customer, v.title, i, 'date', e.target.value)} disabled={rowDisabled} />
-                                        </td>
-                                        <td style={{ padding: '2px 6px' }}>{r.opening}</td>
-                                        <td style={{ padding: '2px 6px' }}>
-                                          <input className="cell-input" style={{ width: 80 }} type="number" value={edit.production ?? r.production} onChange={e => setRowEdit(customer, v.title, i, 'production', e.target.value)} disabled={rowDisabled} />
-                                        </td>
-                                        <td style={{ padding: '2px 6px' }}>
-                                          <input className="cell-input" style={{ width: 80 }} type="number" value={edit.dispatch ?? r.dispatch} onChange={e => setRowEdit(customer, v.title, i, 'dispatch', e.target.value)} disabled={rowDisabled} />
-                                        </td>
-                                        <td style={{ padding: '2px 6px' }}>{r.closing}</td>
-                                        <td style={{ padding: '2px 6px' }}>
-                                          {r.status === 'new' && <Pill tone="ok">New</Pill>}
-                                          {r.status === 'fillable' && <Pill tone="ok" title={fillableTitle(r)}>{fillableLabel(r)}</Pill>}
-                                          {r.status === 'mismatch' && <Pill tone="warn" title={`Sheet already has a recorded value here that disagrees — production ${r.existing?.production ?? ''}, dispatch ${r.existing?.dispatch ?? ''}. Won't be pushed unless you fix it here.`}>Mismatch</Pill>}
-                                          {r.status === 'unverifiable' && <Pill tone="warn" title="Sheet already has this date, but its columns couldn't be read to check. Won't be pushed — verify by hand.">Can't verify</Pill>}
-                                        </td>
-                                        <td style={{ padding: '2px 6px' }}>
-                                          <div style={{ display: 'flex', gap: 4 }}>
-                                            <input
-                                              list={`move-customers-${customer}`}
-                                              placeholder="Customer…"
-                                              style={{ width: 110, fontSize: 11.5 }}
-                                              className="cell-input"
-                                              value={moveTargets[moveKey] || ''}
-                                              onChange={e => setMoveTargets(prev => ({ ...prev, [moveKey]: e.target.value }))}
-                                              disabled={isDeleted}
-                                            />
-                                            <button
-                                              className="icon-btn"
-                                              title="Move this row (matched by date + item) to a different customer. If more than one dispatch bill shares this exact date and item, they all move together."
-                                              disabled={isDeleted || !(moveTargets[moveKey] || '').trim()}
-                                              onClick={() => {
-                                                const target = (moveTargets[moveKey] || '').trim();
-                                                if (!target) return;
-                                                if (!window.confirm(`Move the ${rowDateValue} entry for "${v.title}" from ${customer} to ${target}?`)) return;
-                                                const moved = moveReviewRow(customer, v.title, rowDateValue, target);
-                                                if (!moved) { window.alert(`Couldn't find a matching Production/Dispatch register row for ${rowDateValue} · ${v.title} · ${customer} to move — it may already have been edited or moved.`); return; }
-                                                setMoveTargets(prev => { const next = { ...prev }; delete next[moveKey]; return next; });
-                                              }}
-                                            >
-                                              <RefreshCw size={13} />
-                                            </button>
-                                          </div>
-                                        </td>
-                                        <td style={{ padding: '2px 6px' }} className="col-action">
-                                          <button className="icon-btn" title={isDeleted ? 'Undo delete' : 'Delete this row (only from this push — never touches the register)'} onClick={() => setRowDeleted(customer, v.title, i, !isDeleted)}>
-                                            {isDeleted ? <RefreshCw size={13} /> : <Trash2 size={13} />}
-                                          </button>
-                                        </td>
-                                      </tr>
-                                    );
-                                  })}
-                                </tbody>
-                              </table>
-                              <datalist id={`move-customers-${customer}`}>
-                                {allCustomerTabNames.filter(c => c !== customer).map(c => <option value={c} key={c} />)}
-                              </datalist>
-                              {(() => {
-                                const formKey = `${customer}::${v.title}`;
-                                const form = newRowForms[formKey] || {};
-                                return (
-                                  <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 8 }}>
-                                    <input className="cell-input" style={{ width: 100 }} placeholder="Date" value={form.date || ''} onChange={e => updateNewRowForm(formKey, 'date', e.target.value)} />
-                                    <input className="cell-input" style={{ width: 90 }} type="number" placeholder="Production" value={form.production || ''} onChange={e => updateNewRowForm(formKey, 'production', e.target.value)} />
-                                    <input className="cell-input" style={{ width: 90 }} type="number" placeholder="Dispatch" value={form.dispatch || ''} onChange={e => updateNewRowForm(formKey, 'dispatch', e.target.value)} />
-                                    <button
-                                      className="btn btn-ghost"
-                                      disabled={!form.date || (!form.production && !form.dispatch)}
-                                      onClick={() => {
-                                        addManualStockRow(customer, v.title, form.date, form.production, form.dispatch);
-                                        setNewRowForms(prev => { const next = { ...prev }; delete next[formKey]; return next; });
-                                      }}
-                                    >
-                                      <Plus size={13} /> Add row
-                                    </button>
-                                  </div>
-                                );
-                              })()}
-                            </div>
-                            );
-                          }))}
-                        </div>
-                      );
-                    })()}
-                    {(() => {
-                      // Push lives right here now, directly under the preview tables it pushes exactly
-                      // what's shown above — the Customer Sheets tab is just for adding/syncing a Sheet
-                      // ID, no separate read-only copy of this same review to keep in sync with edits
-                      // made here.
-                      const sheetIdForPush = getCustomerSheetId(customer).trim();
-                      const pushStatusForCustomer = pushStatus[customer] || {};
-                      return (
-                        <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-                          <button
-                            className="btn btn-primary"
-                            onClick={() => pushCustomerSheetNow(customer)}
-                            disabled={pushStatusForCustomer.state === 'pushing' || !sheetIdForPush || !newRowsCountForCustomer}
-                            title={!sheetIdForPush ? 'Add a Sheet ID for this customer on the Customer Sheets tab first' : !newRowsCountForCustomer ? 'Nothing new to push right now' : ''}
-                          >
-                            {pushStatusForCustomer.state === 'pushing' ? <Loader2 size={15} className="spin" /> : <FileSpreadsheet size={15} />} Push to Sheet
-                          </button>
-                          {!sheetIdForPush && <span className="doc-hint">No Sheet ID set for {customer} yet — add one on the Customer Sheets tab.</span>}
-                          {pushStatusForCustomer.state === 'done' && <span className="doc-hint" style={{ color: 'var(--ok)' }}>✓ {pushStatusForCustomer.message}</span>}
-                          {pushStatusForCustomer.state === 'error' && <span style={{ color: 'var(--ledger-red)', fontSize: 12.5 }}>{pushStatusForCustomer.message}</span>}
-                        </div>
-                      );
-                    })()}
-                  </details>
-                  );
-                })}
-                </>
-                );
-              })()}
             </div>
           )}
           {loaded && activeTab === 'customerMapping' && (
             <div>
+              <div className="panel">
+                <div className="panel-header">
+                  <div><h2>Merge Duplicate Customer</h2><p className="subtitle">If a name here turns out to be a duplicate or misspelling of another customer (e.g. "Bindal technopolymer pvt. ltd." vs "BINDAL STOCK 1.08.26"), merge everything under it into the real one — moves all confirmed Production/Dispatch rows, Product Catalog entries, Mapping rules, and the Sheet ID over, then remembers the old name as an alias so it routes correctly going forward. Nothing in the underlying registers is ever deleted, only who each row is attributed to.</p></div>
+                </div>
+                <div className="field-row">
+                  <select className="cell-input" style={{ width: 220 }} value={mergeFromCustomer} onChange={e => setMergeFromCustomer(e.target.value)}>
+                    <option value="">Merge this customer…</option>
+                    {allCustomerTabNames.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  <span className="doc-hint">into</span>
+                  <select className="cell-input" style={{ width: 220 }} value={mergeToCustomer} onChange={e => setMergeToCustomer(e.target.value)}>
+                    <option value="">this real customer…</option>
+                    {allCustomerTabNames.filter(c => c !== mergeFromCustomer).map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  <button
+                    className="btn btn-primary"
+                    disabled={!mergeFromCustomer || !mergeToCustomer}
+                    onClick={() => { mergeCustomerInto(mergeFromCustomer, mergeToCustomer); setMergeFromCustomer(''); setMergeToCustomer(''); }}
+                  >
+                    <RefreshCw size={15} /> Merge
+                  </button>
+                </div>
+              </div>
               <div className="panel">
                 <div className="panel-header">
                   <div><h2>Customer Mapping</h2><p className="subtitle">Which keyword in a production-ledger item name routes to which customer. Checked top to bottom — the first match wins, so more specific keywords should sit above general ones. A bracketed customer name found right next to an item always overrides this list.</p></div>
