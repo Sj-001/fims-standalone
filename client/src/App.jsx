@@ -2035,11 +2035,14 @@ function FIMSApp() {
   // re-enters the trackable pool and a later consumption report can match against IT in turn. A
   // consumption row with no match gets flagged 'unmatched' (surfaced in the Consumed Material section
   // below, same "just show it, don't build a picker" treatment as Customer Stock's Unassigned list) —
-  // never silently dropped or guessed. Only ever processes a row ONCE (matchStatus starts unset and
-  // becomes 'matched'/'unmatched' here) — an already-decided row is never re-matched or re-flip-flopped
-  // just because rawMaterialIn changed again later.
+  // never silently dropped or guessed. Self-healing like that Unassigned list too: an 'unmatched' row
+  // is retried on every pass, not just once, so it resolves itself automatically the moment a matching
+  // reel becomes available — no manual re-trigger needed. Only rows already 'matched' are skipped for
+  // good (that reel is genuinely spoken for). Re-flagging an already-'unmatched' row as 'unmatched'
+  // again is deliberately NOT written back to state — it's still the same fact, and writing a fresh
+  // object reference for it every pass would retrigger this same effect forever.
   useEffect(() => {
-    const pending = consumption.filter(r => !r.matchStatus);
+    const pending = consumption.filter(r => r.matchStatus !== 'matched');
     if (!pending.length) return;
     const claimedRawMaterialIds = new Set();
     const rawMaterialConsumedDateById = {};
@@ -2070,7 +2073,7 @@ function FIMSApp() {
             unit: match.unit, gsm: match.gsm, bf: match.bf, shade: match.shade, weight_kg: leftover, consumed: '',
           });
         }
-      } else {
+      } else if (cRow.matchStatus !== 'unmatched') {
         consumptionUpdateById[cRow.id] = { matchStatus: 'unmatched' };
       }
     });
@@ -2109,16 +2112,6 @@ function FIMSApp() {
       });
   })();
   const unmatchedConsumptionRows = consumption.filter(r => r.matchStatus === 'unmatched');
-  // Clears matchStatus on every currently-unmatched row so the matching effect above picks them up
-  // again on its next pass — needed because that effect deliberately never retries an already-decided
-  // row on its own (see its comment), so fixing the MATCHING LOGIC itself (e.g. the size/gsm string-vs-
-  // number comparison bug) doesn't automatically re-resolve rows that were already flagged under the
-  // old, buggier comparison.
-  const retryUnmatchedConsumption = () => {
-    const next = consumption.map(r => r.matchStatus === 'unmatched' ? { ...r, matchStatus: undefined, matchedRawMaterialId: undefined } : r);
-    setConsumption(next);
-    persist('consumption', next);
-  };
   // Consumed Material's own Size/GSM filter — separate state from Inward Entries' since they're
   // different tables a person filters independently.
   const consumedMaterialGsmOptions = Array.from(new Set(rawMaterialIn.filter(r => r.consumed).map(r => (r.gsm || '').trim()).filter(Boolean)))
@@ -3795,7 +3788,6 @@ function FIMSApp() {
                   <div className="error-box" style={{ marginBottom: 14 }}>
                     <AlertCircle size={16} />
                     <span>{unmatchedConsumptionRows.length} consumption row{unmatchedConsumptionRows.length === 1 ? '' : 's'} couldn't be matched to any reel in the Raw Material Register (no unconsumed row there shares the same size, GSM, and weight): {unmatchedConsumptionRows.map(r => `SL.No ${r.sl_no || '?'} on ${r.date} (${r.size || '?'}/${r.gsm || '?'}/${r.weight_consumed || '?'})`).join(', ')}. Check the consumption row and the reel it should match against for a typo, or it may genuinely predate this app's tracking.</span>
-                    <button className="btn btn-ghost" style={{ flexShrink: 0 }} onClick={retryUnmatchedConsumption}><RefreshCw size={13} /> Retry matching</button>
                   </div>
                 )}
                 {!rawMaterialIn.some(r => r.consumed) && <div className="empty-state">Nothing consumed yet — matches appear here automatically once a Daily Consumption Report is confirmed.</div>}
