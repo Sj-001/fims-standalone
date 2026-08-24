@@ -570,13 +570,13 @@ IMPORTANT — column format varies between mills, read carefully:
     hint: 'The handwritten daily sheet workers use to record raw material consumed — columns are usually Shade, GSM, Size, Weight, and Balance Left.',
     register: 'consumption',
     systemPrompt: `You read a handwritten daily raw-material consumption report from a corrugated box factory. The sheet has Hindi column headers. Most rows share one date written once at the top. Return ONLY one JSON object:
-{"date":"as written at the top, DD/MM/YYYY","items":[{"sl_no":"this row's own SL.NO./serial number exactly as printed in that column, as a string — see rules below","shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number","date_override":"only include this if a specific row has a different date than the header, else omit","flag":"only if you couldn't reliably read this row's weight — e.g. a column looks cut off/missing, or there's a crossed-out number and you're unsure which replacement is correct — a short reason why, else omit"}]}
+{"date":"as written at the top, DD/MM/YYYY","items":[{"sl_no":"this row's own SL.NO./serial number exactly as printed in that column, as a string — see rules below","shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number — this is the reel's own TOTAL weight (matches what was recorded when it came in), not an amount used up — see rules below","leftover_weight":"the टुकड़ा / Tukda column value, as a number, ONLY if that row actually has one written — omit entirely if the row has nothing there, do not default it to 0","date_override":"only include this if a specific row has a different date than the header, else omit","flag":"only if you couldn't reliably read this row's weight — e.g. a column looks cut off/missing, or there's a crossed-out number and you're unsure which replacement is correct — a short reason why, else omit"}]}
 IMPORTANT:
 - SKIP TRULY BLANK LINES. This sheet is pre-ruled with a fixed number of numbered SL.NO. slots/columns, and it is completely normal for a real day's report to only fill in the first several and leave the rest of the printed grid blank. A line that has ONLY a pre-printed SL.NO. with no shade, no GSM, no size, and no weight actually written on it is not a row of data — do not output an item for it. Only extract a line that has genuine handwritten content in it.
-- SL.NO IS YOUR ROW-ALIGNMENT ANCHOR. This sheet's rows are frequently laid out as narrow vertical strips (SL.NO increasing left-to-right or in whatever direction the page actually runs) with every strip looking nearly identical (same date, same shade, similar GSM) — the kind of layout where it's extremely easy for a value to silently slide into the wrong row. To prevent that: for EACH row, first locate its SL.NO in the image, then read every other field (shade, GSM, size, weight) from that exact same physical strip/line — never from a neighboring one — before moving to the next SL.NO. After you've extracted every row, check your own output: the sl_no values you produced should appear once each, in the same order they run on the page, with no duplicates and no unexplained gaps. If you notice a duplicate or out-of-sequence SL.NO in what you were about to return, that is a sign a value drifted between rows — go back and re-read those specific rows from the image before finalizing, rather than submitting a duplicated or skipped row.
+- SL.NO IS YOUR ROW-ALIGNMENT ANCHOR. This sheet's rows are frequently laid out as narrow vertical strips (SL.NO increasing left-to-right or in whatever direction the page actually runs) with every strip looking nearly identical (same date, same shade, similar GSM) — the kind of layout where it's extremely easy for a value to silently slide into the wrong row. To prevent that: for EACH row, first locate its SL.NO in the image, then read every other field (shade, GSM, size, weight, leftover) from that exact same physical strip/line — never from a neighboring one — before moving to the next SL.NO. After you've extracted every row, check your own output: the sl_no values you produced should appear once each, in the same order they run on the page, with no duplicates and no unexplained gaps. If you notice a duplicate or out-of-sequence SL.NO in what you were about to return, that is a sign a value drifted between rows — go back and re-read those specific rows from the image before finalizing, rather than submitting a duplicated or skipped row.
+- WEIGHT vs. LEFTOVER — these are two DIFFERENT numbers with two different meanings, never the same value: "weight_consumed" (वजन) is the reel's own original total weight, exactly as it was recorded when that reel first arrived — it identifies WHICH reel this row is about, it is not how much was used today. "leftover_weight" (टुकड़ा) is how much of that reel is left over/remaining after this — genuinely optional, only present when the row actually has a value written in that column (a reel that got fully used up has nothing written there).
 - The column that looks like it's labeled "S/K" is actually the SHADE column, not a party name or code. Decode its handwritten values: "S.K" or "SK" means shade NS (Sada Kraft / natural shade). "G.Y" or "GY" means shade GY (Golden Yellow). If you see a different value you don't recognize, copy it as written rather than forcing it into NS or GY.
 - There is no BF field on this document — do not invent one. What might look like a stray extra column is the Size column.
-- IGNORE the टुकड़ा / Tukda column entirely — it is not tracked by this app, do not extract it even if it has a value.
 - CROSSED-OUT / CORRECTED VALUES: this is a real working register — a number is sometimes struck through with the corrected number written right next to it in that same row. Use only the number that is NOT crossed out; ignore the struck-through one entirely. This stays within one row — never borrow a number from the row above or below because a cell looks messy.
 - MISSING/CUT-OFF COLUMNS: if a column genuinely isn't visible for a row (cropped off the scan, torn page, etc.), do not invent a value by reading unrelated nearby text. Leave that field empty/0 and set "flag" to a short reason instead.
 - Interpret unclear handwriting as best you can; if a value is genuinely illegible leave it as an empty string rather than guessing wildly. If the SL.NO itself is illegible, still extract the row's other fields as best you can and set "flag" to say the serial number wasn't legible — do not drop the row.`,
@@ -585,6 +585,7 @@ IMPORTANT:
       const rows = raw.items.map(it => ({
         id: genId(), sl_no: it.sl_no != null ? String(it.sl_no) : '', date: normalizeDateToDots(it.date_override || raw.date || ''), shade: it.shade || '', size: it.size || '', gsm: it.gsm || '',
         weight_consumed: num(it.weight_consumed),
+        leftover_weight: it.leftover_weight === '' || it.leftover_weight == null ? '' : num(it.leftover_weight),
         flagged: !!(it.flag && String(it.flag).trim()), flagReason: (it.flag || '').trim(),
       }));
       return fillDittoDates(rows);
@@ -706,7 +707,7 @@ const COLUMNS = {
   consumption: [
     { key: 'sl_no', label: 'SL. No.' },
     { key: 'date', label: 'Date' }, { key: 'shade', label: 'Shade' }, { key: 'size', label: 'Size' }, { key: 'gsm', label: 'GSM' },
-    { key: 'weight_consumed', label: 'Weight Consumed', type: 'number' },
+    { key: 'weight_consumed', label: 'Weight Consumed', type: 'number' }, { key: 'leftover_weight', label: 'Leftover (Tukda)', type: 'number' },
   ],
   production: [
     { key: 'date', label: 'Date' }, { key: 'party', label: 'Party (if noted)' }, { key: 'description', label: 'Description (as written)' },
@@ -1338,19 +1339,6 @@ function FIMSApp() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  // Backfills the Raw Material Pivot tab for data that was already sitting in the register before the
-  // auto-rebuild-on-save behavior existed (putTab in server/lib/sheets.js handles every SAVE from here
-  // on). Fires once per session, right after the initial load, purely fire-and-forget — no UI surface
-  // for it (no button, no message), matching how the on-save rebuild is silent too. A failure here just
-  // means the pivot tab stays as it was; it isn't disruptive to anything else in the app.
-  const pivotBackfillFiredRef = useRef(false);
-  useEffect(() => {
-    if (!loaded || pivotBackfillFiredRef.current || !rawMaterialIn.length) return;
-    pivotBackfillFiredRef.current = true;
-    fetch('/api/raw-material/rebuild-pivot', { method: 'POST', credentials: 'include' })
-      .then(res => { if (!res.ok) console.warn('Raw Material Pivot backfill failed:', res.status); })
-      .catch(e => console.warn('Raw Material Pivot backfill failed:', e));
-  }, [loaded, rawMaterialIn.length]);
   // Google Sheets allows only 60 write requests/minute per user (300/minute per project — see
   // https://developers.google.com/workspace/sheets/api/limits). Saving on every single keystroke or
   // row edit blows through that almost immediately — e.g. clicking "Confirm all" on a batch of
@@ -1543,12 +1531,12 @@ function FIMSApp() {
       setDateFixBusy(false);
     }
   };
-  // The Raw Material Pivot tab on the Shyam Adarsh sheet rebuilds itself automatically whenever raw
-  // material data saves (see putTab in server/lib/sheets.js) — no button/trigger needed here.
-  // --- Raw Material Register view: the app-side equivalent of the Sheet pivot's filter — narrows the
-  // per-size tables down to one size and/or one GSM at a time, without summing anything.
+  // --- Raw Material Register view: filter dropdowns narrow the per-size tables down to one size
+  // and/or one GSM at a time, without summing anything.
   const [rmSizeFilter, setRmSizeFilter] = useState('');
   const [rmGsmFilter, setRmGsmFilter] = useState('');
+  const [cmSizeFilter, setCmSizeFilter] = useState('');
+  const [cmGsmFilter, setCmGsmFilter] = useState('');
   const updateRow = (registerKey) => (id, field, value) => {
     registerSetters[registerKey](prev => {
       const next = prev.map(r => r.id === id ? { ...r, [field]: value } : r);
@@ -2029,11 +2017,104 @@ function FIMSApp() {
       if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
       return a.localeCompare(b, undefined, { numeric: true });
     });
-  // The app-side "pivot" — narrows the per-size tables down to just the selected size and/or GSM,
-  // same as the Sheet pivot's filter dropdowns, without summing or hiding anything beyond that.
+  // Narrows the per-size tables down to just the selected size and/or GSM, without summing or hiding
+  // anything else.
   const rawMaterialGroupsFiltered = rawMaterialBySize
     .filter(g => !rmSizeFilter || g.size === rmSizeFilter)
     .map(g => ({ ...g, rows: rmGsmFilter ? g.rows.filter(r => (r.gsm || '').trim() === rmGsmFilter) : g.rows }))
+    .filter(g => g.rows.length > 0);
+  // Matches each Consumption row against the ONE Raw Material In reel it's about — size + GSM + the
+  // "wajan" weight together, since "wajan" is that reel's own original total weight (a lookup key, not
+  // an amount used up), and an exact weight is effectively unique per physical reel. On a match: dates
+  // that reel's `consumed` field (never removes it from rawMaterialIn — see the Inward Entries filter
+  // below, which is what actually hides it from that view; the Sheet tab keeps every row forever too).
+  // If the same consumption row also carries a leftover_weight (Tukda — remaining after a PARTIAL
+  // consumption), a brand-new Raw Material In row is created for that remainder: same mill/size/gsm/bf/
+  // shade, weight_kg = the leftover, dated to the consumption report's own date, unconsumed — so it
+  // re-enters the trackable pool and a later consumption report can match against IT in turn. A
+  // consumption row with no match gets flagged 'unmatched' (surfaced in the Consumed Material section
+  // below, same "just show it, don't build a picker" treatment as Customer Stock's Unassigned list) —
+  // never silently dropped or guessed. Only ever processes a row ONCE (matchStatus starts unset and
+  // becomes 'matched'/'unmatched' here) — an already-decided row is never re-matched or re-flip-flopped
+  // just because rawMaterialIn changed again later.
+  useEffect(() => {
+    const pending = consumption.filter(r => !r.matchStatus);
+    if (!pending.length) return;
+    const claimedRawMaterialIds = new Set();
+    const rawMaterialConsumedDateById = {};
+    const leftoverRowsToAdd = [];
+    const consumptionUpdateById = {};
+    pending.forEach(cRow => {
+      const size = (cRow.size || '').trim();
+      const gsm = (cRow.gsm || '').trim();
+      const weight = num(cRow.weight_consumed);
+      const match = rawMaterialIn.find(rRow =>
+        !rRow.consumed && !claimedRawMaterialIds.has(rRow.id) &&
+        (rRow.size || '').trim() === size &&
+        (rRow.gsm || '').trim() === gsm &&
+        num(rRow.weight_kg) === weight
+      );
+      if (match) {
+        claimedRawMaterialIds.add(match.id);
+        rawMaterialConsumedDateById[match.id] = cRow.date;
+        consumptionUpdateById[cRow.id] = { matchStatus: 'matched', matchedRawMaterialId: match.id };
+        const leftover = num(cRow.leftover_weight);
+        if (leftover > 0) {
+          leftoverRowsToAdd.push({
+            id: genId(), date: cRow.date, mill: match.mill, reel_no: match.reel_no, size: match.size,
+            unit: match.unit, gsm: match.gsm, bf: match.bf, shade: match.shade, weight_kg: leftover, consumed: '',
+          });
+        }
+      } else {
+        consumptionUpdateById[cRow.id] = { matchStatus: 'unmatched' };
+      }
+    });
+    if (Object.keys(consumptionUpdateById).length) {
+      const nextConsumption = consumption.map(r => consumptionUpdateById[r.id] ? { ...r, ...consumptionUpdateById[r.id] } : r);
+      setConsumption(nextConsumption);
+      persist('consumption', nextConsumption);
+    }
+    if (Object.keys(rawMaterialConsumedDateById).length || leftoverRowsToAdd.length) {
+      const nextRawMaterial = [
+        ...rawMaterialIn.map(r => rawMaterialConsumedDateById[r.id] ? { ...r, consumed: rawMaterialConsumedDateById[r.id] } : r),
+        ...leftoverRowsToAdd,
+      ];
+      setRawMaterialIn(nextRawMaterial);
+      persist('rawMaterialIn', nextRawMaterial);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [consumption, rawMaterialIn]);
+  // Consumed Material: a filtered VIEW of rawMaterialIn (rows with `consumed` set), never a separate
+  // register — the Sheet tab (fims_raw_material_in) never has rows removed, only consumed filled in, so
+  // reading it back this way keeps the app and the Sheet describing exactly the same underlying data.
+  const consumedMaterialBySize = (() => {
+    const groups = {};
+    rawMaterialIn.filter(r => r.consumed).forEach(r => {
+      const raw = (r.size || '').trim();
+      const n = parseFloat(raw);
+      const size = raw ? (Number.isNaN(n) ? raw : String(n)) : '(no size)';
+      (groups[size] = groups[size] || []).push(r);
+    });
+    return Object.entries(groups)
+      .map(([size, rows]) => ({ size, rows }))
+      .sort((a, b) => {
+        const na = parseFloat(a.size), nb = parseFloat(b.size);
+        if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+        return a.size.localeCompare(b.size, undefined, { numeric: true });
+      });
+  })();
+  const unmatchedConsumptionRows = consumption.filter(r => r.matchStatus === 'unmatched');
+  // Consumed Material's own Size/GSM filter — separate state from Inward Entries' since they're
+  // different tables a person filters independently.
+  const consumedMaterialGsmOptions = Array.from(new Set(rawMaterialIn.filter(r => r.consumed).map(r => (r.gsm || '').trim()).filter(Boolean)))
+    .sort((a, b) => {
+      const na = parseFloat(a), nb = parseFloat(b);
+      if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+      return a.localeCompare(b, undefined, { numeric: true });
+    });
+  const consumedMaterialGroupsFiltered = consumedMaterialBySize
+    .filter(g => !cmSizeFilter || g.size === cmSizeFilter)
+    .map(g => ({ ...g, rows: cmGsmFilter ? g.rows.filter(r => (r.gsm || '').trim() === cmGsmFilter) : g.rows }))
     .filter(g => g.rows.length > 0);
   /* -------- dabur PO pending calc -------- */
   const PO_TOLERANCE = 0.10; // ±10% — a PO counts as fulfilled once dispatched qty reaches 90% of ordered qty
@@ -3675,6 +3756,41 @@ function FIMSApp() {
                 {!rawMaterialIn.length && <div className="empty-state">Upload some mill slips to see inward entries here.</div>}
                 {!!rawMaterialIn.length && !rawMaterialGroupsFiltered.length && <div className="empty-state">No entries match that filter.</div>}
                 {rawMaterialGroupsFiltered.map(group => (
+                  <div key={group.size} style={{ marginBottom: 20 }}>
+                    <div style={{ marginBottom: 6 }}><strong>Size {group.size}</strong></div>
+                    <EditableTable columns={RAW_MATERIAL_SIZE_COLUMNS} rows={group.rows}
+                      onUpdate={updateRow('rawMaterialIn')} onDelete={deleteRow('rawMaterialIn')} />
+                  </div>
+                ))}
+              </div>
+              <div className="panel">
+                <div className="panel-header">
+                  <div><h2>Consumed Material</h2><p className="subtitle">Raw Material In entries matched against a Daily Consumption Report — matched by Size + GSM + Weight, since that combination identifies one specific reel. These rows are the same underlying entries as Inward Entries above (nothing is duplicated or removed from that tab — "Consumed" just gets filled in), shown here separately so what's left in stock is easy to tell apart from what's already used.</p></div>
+                  <button className="btn btn-ghost" onClick={() => exportSheet('Consumed_Material', rawMaterialIn.filter(r => r.consumed), COLUMNS.rawMaterialIn)}><Download size={15} /> Export</button>
+                </div>
+                {!!unmatchedConsumptionRows.length && (
+                  <div className="error-box" style={{ marginBottom: 14 }}>
+                    <AlertCircle size={16} />
+                    <span>{unmatchedConsumptionRows.length} consumption row{unmatchedConsumptionRows.length === 1 ? '' : 's'} couldn't be matched to any reel in Inward Entries (no unconsumed row there shares the same size, GSM, and weight): {unmatchedConsumptionRows.map(r => `SL.No ${r.sl_no || '?'} on ${r.date} (${r.size || '?'}/${r.gsm || '?'}/${r.weight_consumed || '?'})`).join(', ')}. Check the consumption row and the reel it should match against for a typo, or it may genuinely predate this app's tracking.</span>
+                  </div>
+                )}
+                {!rawMaterialIn.some(r => r.consumed) && <div className="empty-state">Nothing consumed yet — matches appear here automatically once a Daily Consumption Report is confirmed.</div>}
+                {rawMaterialIn.some(r => r.consumed) && (
+                  <div className="field-row" style={{ marginBottom: 14 }}>
+                    <select className="doc-select" style={{ width: 160, marginBottom: 0 }} value={cmSizeFilter} onChange={e => setCmSizeFilter(e.target.value)}>
+                      <option value="">All sizes</option>
+                      {consumedMaterialBySize.map(g => <option value={g.size} key={g.size}>Size {g.size}</option>)}
+                    </select>
+                    <select className="doc-select" style={{ width: 160, marginBottom: 0 }} value={cmGsmFilter} onChange={e => setCmGsmFilter(e.target.value)}>
+                      <option value="">All GSM</option>
+                      {consumedMaterialGsmOptions.map(g => <option value={g} key={g}>GSM {g}</option>)}
+                    </select>
+                    {(cmSizeFilter || cmGsmFilter) && (
+                      <button className="btn btn-ghost" onClick={() => { setCmSizeFilter(''); setCmGsmFilter(''); }}>Clear filters</button>
+                    )}
+                  </div>
+                )}
+                {consumedMaterialGroupsFiltered.map(group => (
                   <div key={group.size} style={{ marginBottom: 20 }}>
                     <div style={{ marginBottom: 6 }}><strong>Size {group.size}</strong></div>
                     <EditableTable columns={RAW_MATERIAL_SIZE_COLUMNS} rows={group.rows}

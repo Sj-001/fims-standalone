@@ -1589,13 +1589,6 @@ async function putTab(req, res) {
     const rows = (req.body && Array.isArray(req.body.rows)) ? req.body.rows : [];
     await writeTab(req.params.tab, rows);
     res.json({ ok: true, count: rows.length });
-    // Fire-and-forget, AFTER responding: keeps the Raw Material Pivot tab in sync automatically
-    // whenever raw material data itself saves, so there's no separate button to remember to click.
-    // Runs post-response so a slow or failed pivot rebuild never delays or breaks the actual save the
-    // person is waiting on — a failure here is logged, not surfaced as if the save itself failed.
-    if (req.params.tab === sanitizeTabName('fims_raw_material_in')) {
-      rebuildRawMaterialPivot().catch(e => console.error('Auto pivot rebuild failed:', e));
-    }
   } catch (e) {
     console.error(`Sheets write error [${req.params.tab}]:`, e);
     res.status(502).json({ error: friendlyGoogleError(e) });
@@ -1613,7 +1606,7 @@ async function putBlocksTab(req, res) {
   }
 }
 
-// --- main-sheet maintenance: list/delete tabs, build the Raw Material pivot ---
+// --- main-sheet maintenance: list/delete tabs ---
 // Only used to LABEL every tab in the report the app shows before anyone deletes anything — never to
 // auto-delete. "known": a register/lookup the app itself reads or writes and something on an app page
 // is built from. "internal": bookkeeping the app needs but that never renders as a table anywhere —
@@ -1676,124 +1669,4 @@ async function deleteTabsHandler(req, res) {
   }
 }
 
-// Builds (or fully rebuilds) a native Google Sheets pivot table in its own tab, sourced from the Raw
-// Material In tab — deliberately simple: Size and GSM sit in the pivot's FILTERS section (a plain
-// dropdown value-picker in the pivot editor), not Rows/Columns, so the rendered output is just ONE
-// totals line (Total Weight, Entries) that updates to match whatever's checked — not a nested,
-// collapsible, subtotal-per-group table. Reads the live header row to find the size/gsm/weight_kg/date
-// columns rather than assuming a fixed layout, since writeTab's header is a union built from whatever
-// keys rows happen to carry. Always deletes and recreates the destination tab first so re-running this
-// (e.g. after the source data grew) never stacks a second pivot table or errors on "cell already
-// contains a pivot table" — safe to run as many times as it likes, which matters since putTab below
-// calls this automatically on every Raw Material In save, not from a button. Returns {skipped: true}
-// rather than throwing when there's nothing to pivot yet (an empty/just-cleared register) — a normal,
-// expected state, not a failure.
-const RAW_MATERIAL_PIVOT_TAB_NAME = 'Raw Material Pivot';
-async function rebuildRawMaterialPivot() {
-  const sheets = getSheetsClient();
-  const spreadsheetId = getSpreadsheetId();
-  const sourceTabName = sanitizeTabName('fims_raw_material_in');
-  const destTabName = sanitizeTabName(RAW_MATERIAL_PIVOT_TAB_NAME);
-  const meta = await getSheetMeta(sheets, spreadsheetId);
-  const sourceMeta = meta[sourceTabName];
-  if (!sourceMeta) return { skipped: true, reason: 'no-source-tab' };
-
-  // Reads the WHOLE tab (not just row 1) so the pivot's source range can be sized to the REAL data
-  // extent (values.get trims trailing empty rows/columns) instead of the tab's full allocated grid —
-  // writeValuesClearingStale pads a save out to the tab's PREVIOUS size to clear stale content, so
-  // using sourceMeta.rowCount/columnCount here previously dragged hundreds of blank padding rows into
-  // the pivot, which then showed up as a bogus "no size/gsm" group with a large Entries count.
-  const dataResp = await sheets.spreadsheets.values.get({
-    spreadsheetId, range: wholeSheetRangeA1(sourceTabName, sourceMeta),
-  });
-  const dataValues = dataResp.data.values || [];
-  const header = dataValues[0] || [];
-  const sizeIdx = header.indexOf('size');
-  const gsmIdx = header.indexOf('gsm');
-  const dateIdx = header.indexOf('date');
-  // weight_kg is referenced by name in the pivot's calculated value formula below, not by offset —
-  // still needs to actually be a header, or that formula would point at a column that doesn't exist.
-  if (sizeIdx === -1 || gsmIdx === -1 || header.indexOf('weight_kg') === -1) return { skipped: true, reason: 'no-data' };
-  const realRowCount = dataValues.length;
-  const realColumnCount = Math.max(header.length, ...dataValues.map(r => r.length), 1);
-  // Every distinct value currently in each column, so the filter starts unrestricted (everything
-  // visible/checked) — matches what the Sheets UI itself does when a person adds a field to a pivot's
-  // Filters section by hand, rather than the filter silently hiding everything until touched.
-  const distinctValues = (idx) => Array.from(new Set(dataValues.slice(1).map(r => (r[idx] ?? '').toString()).filter(v => v !== '')));
-  const sizeValues = distinctValues(sizeIdx);
-  const gsmValues = distinctValues(gsmIdx);
-
-  if (meta[destTabName]) {
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId,
-      requestBody: { requests: [{ deleteSheet: { sheetId: meta[destTabName].sheetId } }] },
-    });
-  }
-  const addResp = await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    requestBody: { requests: [{ addSheet: { properties: { title: destTabName } } }] },
-  });
-  const destSheetId = addResp.data.replies[0].addSheet.properties.sheetId;
-
-  const values = [{
-    pivotTable: {
-      source: {
-        sheetId: sourceMeta.sheetId,
-        startRowIndex: 0,
-        startColumnIndex: 0,
-        endRowIndex: realRowCount,
-        endColumnIndex: realColumnCount,
-      },
-      // Size and GSM live in FILTERS, not Rows — Rows/Columns is what produces the nested,
-      // collapsible, subtotal-per-group structure (the confusing "− 106.50 / 106.50 Total / − 108.50
-      // / 108.50 Total..." layout from the first attempt at this). Filters instead render as a plain
-      // dropdown value-picker in the pivot editor and leave the output as ONE simple totals line that
-      // updates to match whatever's checked — the "just filter by size and gsm" a plain pivot means.
-      filterSpecs: [
-        { filterCriteria: { visibleValues: sizeValues }, columnOffsetIndex: sizeIdx },
-        { filterCriteria: { visibleValues: gsmValues }, columnOffsetIndex: gsmIdx },
-      ],
-      values: [
-        // Every cell writeTab puts on the sheet is stored as literal text (see writeValuesClearingStale
-        // — RAW input, never parsed into a real number), so a plain SUM over weight_kg's column adds
-        // zero every time: Sheets treats a text cell as 0 in a numeric sum. A calculated pivot value
-        // (formula referencing the column by its header name, same as "Add calculated field" in the
-        // Sheets UI) runs VALUE() per source row to coerce the text into a real number FIRST, then SUM
-        // aggregates those — sidesteps the storage issue without changing how every other tab is written.
-        { formula: '=VALUE(weight_kg)', summarizeFunction: 'SUM', name: 'Total Weight (kg)' },
-        { summarizeFunction: 'COUNTA', sourceColumnOffset: dateIdx !== -1 ? dateIdx : sizeIdx, name: 'Entries' },
-      ],
-      valueLayout: 'HORIZONTAL',
-    },
-  }];
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      requests: [{
-        updateCells: {
-          rows: [{ values }],
-          start: { sheetId: destSheetId, rowIndex: 0, columnIndex: 0 },
-          fields: 'pivotTable',
-        },
-      }],
-    },
-  });
-  return { tabName: destTabName };
-}
-
-// Manual-trigger endpoint, kept as a fallback/debug path (e.g. to force a rebuild without a new save)
-// even though nothing in the app's UI calls it — the pivot now rebuilds automatically, see putTab.
-async function createRawMaterialPivotHandler(req, res) {
-  try {
-    const result = await rebuildRawMaterialPivot();
-    if (result.skipped) {
-      return res.status(400).json({ error: 'Raw Material In has no size/gsm data yet — upload at least one mill slip first.' });
-    }
-    res.json({ ok: true, ...result });
-  } catch (e) {
-    console.error('Create raw material pivot error:', e);
-    res.status(502).json({ error: friendlyGoogleError(e) });
-  }
-}
-
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler, listTabsHandler, deleteTabsHandler, createRawMaterialPivotHandler };
+module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler, listTabsHandler, deleteTabsHandler };
