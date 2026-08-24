@@ -1677,16 +1677,17 @@ async function deleteTabsHandler(req, res) {
 }
 
 // Builds (or fully rebuilds) a native Google Sheets pivot table in its own tab, sourced from the Raw
-// Material In tab — Rows grouped Size then GSM (each level gets Sheets' own built-in per-value filter
-// dropdown right in the pivot header, which is what actually gives "filter by size and gsm" rather
-// than anything this app has to build itself), Values showing total weight and entry count. Reads the
-// live header row to find the size/gsm/weight_kg/date column offsets rather than assuming a fixed
-// layout, since writeTab's header is a union built from whatever keys rows happen to carry. Always
-// deletes and recreates the destination tab first so re-running this (e.g. after the source data grew)
-// never stacks a second pivot table or errors on "cell already contains a pivot table" — safe to run
-// as many times as it likes, which matters since putTab below calls this automatically on every Raw
-// Material In save, not from a button. Returns {skipped: true} rather than throwing when there's
-// nothing to pivot yet (an empty/just-cleared register) — a normal, expected state, not a failure.
+// Material In tab — deliberately simple: Size and GSM sit in the pivot's FILTERS section (a plain
+// dropdown value-picker in the pivot editor), not Rows/Columns, so the rendered output is just ONE
+// totals line (Total Weight, Entries) that updates to match whatever's checked — not a nested,
+// collapsible, subtotal-per-group table. Reads the live header row to find the size/gsm/weight_kg/date
+// columns rather than assuming a fixed layout, since writeTab's header is a union built from whatever
+// keys rows happen to carry. Always deletes and recreates the destination tab first so re-running this
+// (e.g. after the source data grew) never stacks a second pivot table or errors on "cell already
+// contains a pivot table" — safe to run as many times as it likes, which matters since putTab below
+// calls this automatically on every Raw Material In save, not from a button. Returns {skipped: true}
+// rather than throwing when there's nothing to pivot yet (an empty/just-cleared register) — a normal,
+// expected state, not a failure.
 const RAW_MATERIAL_PIVOT_TAB_NAME = 'Raw Material Pivot';
 async function rebuildRawMaterialPivot() {
   const sheets = getSheetsClient();
@@ -1715,6 +1716,12 @@ async function rebuildRawMaterialPivot() {
   if (sizeIdx === -1 || gsmIdx === -1 || header.indexOf('weight_kg') === -1) return { skipped: true, reason: 'no-data' };
   const realRowCount = dataValues.length;
   const realColumnCount = Math.max(header.length, ...dataValues.map(r => r.length), 1);
+  // Every distinct value currently in each column, so the filter starts unrestricted (everything
+  // visible/checked) — matches what the Sheets UI itself does when a person adds a field to a pivot's
+  // Filters section by hand, rather than the filter silently hiding everything until touched.
+  const distinctValues = (idx) => Array.from(new Set(dataValues.slice(1).map(r => (r[idx] ?? '').toString()).filter(v => v !== '')));
+  const sizeValues = distinctValues(sizeIdx);
+  const gsmValues = distinctValues(gsmIdx);
 
   if (meta[destTabName]) {
     await sheets.spreadsheets.batchUpdate({
@@ -1737,9 +1744,14 @@ async function rebuildRawMaterialPivot() {
         endRowIndex: realRowCount,
         endColumnIndex: realColumnCount,
       },
-      rows: [
-        { sourceColumnOffset: sizeIdx, showTotals: true, sortOrder: 'ASCENDING' },
-        { sourceColumnOffset: gsmIdx, showTotals: true, sortOrder: 'ASCENDING' },
+      // Size and GSM live in FILTERS, not Rows — Rows/Columns is what produces the nested,
+      // collapsible, subtotal-per-group structure (the confusing "− 106.50 / 106.50 Total / − 108.50
+      // / 108.50 Total..." layout from the first attempt at this). Filters instead render as a plain
+      // dropdown value-picker in the pivot editor and leave the output as ONE simple totals line that
+      // updates to match whatever's checked — the "just filter by size and gsm" a plain pivot means.
+      filterSpecs: [
+        { filterCriteria: { visibleValues: sizeValues }, columnOffsetIndex: sizeIdx },
+        { filterCriteria: { visibleValues: gsmValues }, columnOffsetIndex: gsmIdx },
       ],
       values: [
         // Every cell writeTab puts on the sheet is stored as literal text (see writeValuesClearingStale
