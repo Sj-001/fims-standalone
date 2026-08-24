@@ -391,6 +391,11 @@ const MAX_EXAMPLES_IN_PROMPT = 6;
 // growing each time in case the window hasn't reset yet. After exhausting these, we stop and let the
 // person resume manually via "Retry remaining" — that way we never spin forever silently.
 const RATE_LIMIT_BACKOFFS_MS = [20000, 40000, 60000];
+// A 502/503/504 here comes from Render's own proxy in front of OUR backend, never from Anthropic —
+// it means the backend itself was momentarily unreachable (mid-restart/redeploy, or waking back up
+// from an idle sleep on plans that do that), not a problem with the image or the request. That kind
+// of gap is usually much shorter than a rate-limit window, hence its own, snappier schedule.
+const SERVER_ERROR_BACKOFFS_MS = [5000, 10000, 20000];
 // Pacing gap between consecutive requests in a batch. Our backend uses a dedicated, spend-capped
 // Anthropic API key (1,000 requests/minute standard limit) instead of Claude.ai's shared free quota,
 // so this just needs to avoid firing a literal burst in the same instant — no long throttling needed.
@@ -1594,6 +1599,8 @@ function FIMSApp() {
   // check could miss, which is why dispatch-bill batches (many requests back-to-back) were slipping
   // through as generic failures instead of being treated as rate limits.
   const isRateLimitError = (e) => e?.status === 429 || /rate limit/i.test(e?.message || '') || /EXTRACT_HTTP_429/.test(e?.message || '');
+  // See SERVER_ERROR_BACKOFFS_MS above for what these actually are (Render's proxy, not Anthropic).
+  const isTransientServerError = (e) => [502, 503, 504].includes(e?.status) || /EXTRACT_HTTP_50[234]/.test(e?.message || '');
   // attempts=3 (was 2): EXTRACT_EMPTY ("no text block in response") shows up occasionally and is a
   // transient API hiccup, not a property of the image — a plain retry usually succeeds. One extra
   // attempt costs little (it's only reached on a genuine failure) and cuts down on files landing in
@@ -1605,25 +1612,31 @@ function FIMSApp() {
         return await callClaudeExtract(prompt, base64, signal);
       } catch (e) {
         lastErr = e;
-        if (isCancelled(e) || isRateLimitError(e)) break; // let the caller handle rate limits with a longer backoff, cancellation with a clean stop — not this quick retry
+        // let the caller handle rate limits/gateway blips with a longer backoff, cancellation with a
+        // clean stop — not this quick retry (600ms is nowhere near enough for either of those to clear)
+        if (isCancelled(e) || isRateLimitError(e) || isTransientServerError(e)) break;
         if (i < attempts - 1) await sleep(600, signal); // brief pause before retry
       }
     }
     throw lastErr;
   };
-  // Runs one extraction, and if it's specifically a rate-limit error, waits and retries automatically
-  // (growing backoff) before giving up — rate limits are usually a per-minute window that clears on
-  // its own, so a short wait-and-retry recovers most of the time without the person having to do anything.
+  // Runs one extraction, and if it's specifically a rate-limit or transient-server error, waits and
+  // retries automatically (growing backoff, on whichever schedule matches the error) before giving up
+  // — both are usually gone within seconds to a couple minutes, so a wait-and-retry recovers most of
+  // the time without the person having to notice the failure and click retry themselves.
   // onTick fires every second during a wait so the UI can show a live countdown instead of a frozen
   // message, and the whole wait aborts immediately if `signal` is cancelled (the person hit Cancel).
   const extractWithRateLimitBackoff = async (prompt, base64, signal, onWaiting, onTick) => {
-    for (let i = 0; i <= RATE_LIMIT_BACKOFFS_MS.length; i++) {
+    const maxAttempts = Math.max(RATE_LIMIT_BACKOFFS_MS.length, SERVER_ERROR_BACKOFFS_MS.length);
+    for (let i = 0; i <= maxAttempts; i++) {
       try {
         return await extractWithRetry(prompt, base64, signal);
       } catch (e) {
-        if (isRateLimitError(e) && i < RATE_LIMIT_BACKOFFS_MS.length) {
-          const waitMs = e.retryAfterMs && e.retryAfterMs > 0 ? e.retryAfterMs : RATE_LIMIT_BACKOFFS_MS[i];
-          if (onWaiting) onWaiting(waitMs, i + 1, RATE_LIMIT_BACKOFFS_MS.length);
+        const kind = isRateLimitError(e) ? 'rate_limit' : isTransientServerError(e) ? 'server_error' : null;
+        const backoffs = kind === 'rate_limit' ? RATE_LIMIT_BACKOFFS_MS : kind === 'server_error' ? SERVER_ERROR_BACKOFFS_MS : null;
+        if (backoffs && i < backoffs.length) {
+          const waitMs = e.retryAfterMs && e.retryAfterMs > 0 ? e.retryAfterMs : backoffs[i];
+          if (onWaiting) onWaiting(waitMs, i + 1, backoffs.length, kind);
           let remaining = Math.ceil(waitMs / 1000);
           if (onTick) onTick(remaining);
           const tickTimer = setInterval(() => { remaining -= 1; if (onTick) onTick(Math.max(remaining, 0)); }, 1000);
@@ -1656,8 +1669,10 @@ function FIMSApp() {
   // The friendly explanation appends the raw server response (what e.message actually contains, e.g.
   // "EXTRACT_HTTP_429: {...}") so the real diagnostic text is right there to copy over if needed,
   // instead of requiring browser DevTools.
-  const rateLimitExplainer = (e) => {
-    const friendly = 'Still hitting a rate limit even after automatic retries — unusual at normal usage (this app\'s API key gets 1,000 requests/minute). Wait a minute and try again, or check the Anthropic Console for the account this key belongs to.';
+  const retryExhaustedExplainer = (e) => {
+    const friendly = isTransientServerError(e)
+      ? 'The server hosting this app (Render, not Anthropic) was still unreachable even after automatic retries — usually a brief restart, redeploy, or the service waking back up from being idle. This almost always clears within well under a minute; wait a bit and try again.'
+      : 'Still hitting a rate limit even after automatic retries — unusual at normal usage (this app\'s API key gets 1,000 requests/minute). Wait a minute and try again, or check the Anthropic Console for the account this key belongs to.';
     const detail = e && e.message ? String(e.message).slice(0, 300) : '';
     return detail ? `${friendly} (Server said: ${detail})` : friendly;
   };
@@ -1679,8 +1694,9 @@ function FIMSApp() {
     try {
       const basePrompt = activeConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog)).replace('{{ABBREVIATIONS}}', buildAbbreviationsText(abbreviations));
       const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[docType]);
-      const { raw, truncated } = await extractWithRateLimitBackoff(promptWithTraining, base64Img, abortControllerRef.current.signal, (waitMs, attempt, total) => {
-        setErrorMsg(`Rate limit hit — waiting ${Math.round(waitMs / 1000)}s and retrying automatically (attempt ${attempt} of ${total})… Click Cancel below if you'd rather stop.`);
+      const { raw, truncated } = await extractWithRateLimitBackoff(promptWithTraining, base64Img, abortControllerRef.current.signal, (waitMs, attempt, total, kind) => {
+        const label = kind === 'server_error' ? 'Server temporarily unreachable' : 'Rate limit hit';
+        setErrorMsg(`${label} — waiting ${Math.round(waitMs / 1000)}s and retrying automatically (attempt ${attempt} of ${total})… Click Cancel below if you'd rather stop.`);
       }, (secondsLeft) => {
         setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
       });
@@ -1694,8 +1710,8 @@ function FIMSApp() {
       if (isCancelled(e)) {
         setErrorMsg('Cancelled.');
         setFileResults(prev => prev.map(r => r.id === current.id ? { ...r, status: 'pending', error: '' } : r));
-      } else if (isRateLimitError(e)) {
-        setErrorMsg(rateLimitExplainer(e));
+      } else if (isRateLimitError(e) || isTransientServerError(e)) {
+        setErrorMsg(retryExhaustedExplainer(e));
         setFileResults(prev => prev.map(r => r.id === current.id ? { ...r, status: 'pending', error: '' } : r));
       } else {
         const msg = e.message || 'unknown error';
@@ -1716,8 +1732,8 @@ function FIMSApp() {
     const gapMs = BATCH_REQUEST_GAP_MS;
     let anySucceeded = false;
     let anyTruncated = false;
-    let rateLimited = false;
-    let lastRateLimitError = null;
+    let haltedForRetry = false;
+    let lastHaltError = null;
     let cancelled = false;
     for (let t = 0; t < targets.length; t++) {
       const p = targets[t];
@@ -1730,8 +1746,9 @@ function FIMSApp() {
       } catch (e) { cancelled = true; break; }
       setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'extracting' } : r));
       try {
-        const { raw, truncated } = await extractWithRateLimitBackoff(promptWithTraining, p.base64, signal, (waitMs, attempt, total) => {
-          setErrorMsg(`Rate limit hit on "${p.label}" — waiting ${Math.round(waitMs / 1000)}s and retrying automatically (attempt ${attempt} of ${total})… Click Cancel below if you'd rather stop.`);
+        const { raw, truncated } = await extractWithRateLimitBackoff(promptWithTraining, p.base64, signal, (waitMs, attempt, total, kind) => {
+          const label = kind === 'server_error' ? `Server temporarily unreachable while extracting "${p.label}"` : `Rate limit hit on "${p.label}"`;
+          setErrorMsg(`${label} — waiting ${Math.round(waitMs / 1000)}s and retrying automatically (attempt ${attempt} of ${total})… Click Cancel below if you'd rather stop.`);
         }, (secondsLeft) => {
           setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
         });
@@ -1746,9 +1763,9 @@ function FIMSApp() {
           setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'pending', error: '' } : r));
           break;
         }
-        if (isRateLimitError(e)) {
-          rateLimited = true;
-          lastRateLimitError = e;
+        if (isRateLimitError(e) || isTransientServerError(e)) {
+          haltedForRetry = true;
+          lastHaltError = e;
           setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'pending', error: '' } : r));
           break; // stop hammering the same wall even after retries — leftover files stay pending, resumable
         }
@@ -1757,8 +1774,8 @@ function FIMSApp() {
     }
     if (cancelled) {
       setErrorMsg('Cancelled — files not yet extracted are still queued below, untouched. Remove any you don\'t want with the × on its thumbnail, or hit "Retry remaining" to pick back up.');
-    } else if (rateLimited) {
-      setErrorMsg(`${rateLimitExplainer(lastRateLimitError)} Anything already extracted in this batch is safe and untouched — use "Retry remaining" below once you're ready to continue.`);
+    } else if (haltedForRetry) {
+      setErrorMsg(`${retryExhaustedExplainer(lastHaltError)} Anything already extracted in this batch is safe and untouched — use "Retry remaining" below once you're ready to continue.`);
     } else if (!anySucceeded && targets.length) {
       setErrorMsg('Every file in this batch failed to extract. Check your connection and try again, or extract one file at a time to isolate the problem.');
     } else if (anyTruncated) {
@@ -1883,7 +1900,12 @@ function FIMSApp() {
   const rawMaterialBySize = (() => {
     const groups = {};
     rawMaterialIn.forEach(r => {
-      const size = (r.size || '').trim() || '(no size)';
+      const raw = (r.size || '').trim();
+      const n = parseFloat(raw);
+      // Collapse an all-zero decimal tail ("62.00" -> "62") so it groups with plain "62" instead of
+      // splitting into its own table — String(Number(...)) drops trailing zeros but keeps a real
+      // fraction intact ("56.50" -> "56.5"), so nothing here ever changes the actual size value.
+      const size = raw ? (Number.isNaN(n) ? raw : String(n)) : '(no size)';
       (groups[size] = groups[size] || []).push(r);
     });
     return Object.entries(groups)
@@ -3622,32 +3644,6 @@ function FIMSApp() {
           )}
           {loaded && activeTab === 'rawMaterialIn' && (
             <div>
-              <div className="panel">
-                <div className="panel-header">
-                  <div><h2>Raw Material Balance</h2><p className="subtitle">Computed automatically from inward slips minus consumption entries, grouped by size / GSM. (BF isn't part of the match — the handwritten consumption sheets don't record it.)</p></div>
-                  <button className="btn btn-ghost" onClick={() => exportSheet('RM_Balance', balanceRows, [
-                    { key: 'size', label: 'Size' }, { key: 'gsm', label: 'GSM' },
-                    { key: 'weight_in', label: 'Total In (kg)' }, { key: 'weight_consumed', label: 'Total Consumed (kg)' }, { key: 'balance', label: 'Balance Left (kg)' },
-                  ])}><Download size={15} /> Export</button>
-                </div>
-                {!balanceRows.length && <div className="empty-state">Upload some mill slips and consumption reports to see balances here.</div>}
-                {!!balanceRows.length && (
-                  <div className="table-wrap">
-                    <table>
-                      <thead><tr><th>Size</th><th>GSM</th><th>Total In (kg)</th><th>Total Consumed (kg)</th><th>Balance Left (kg)</th></tr></thead>
-                      <tbody>
-                        {balanceRows.map(b => (
-                          <tr key={b.id}>
-                            <td style={{ padding: '6px 10px' }}>{b.size}</td><td style={{ padding: '6px 10px' }}>{b.gsm}</td>
-                            <td style={{ padding: '6px 10px' }}>{b.weight_in.toFixed(1)}</td><td style={{ padding: '6px 10px' }}>{b.weight_consumed.toFixed(1)}</td>
-                            <td style={{ padding: '6px 10px' }}><Pill tone={b.balance <= 0 ? 'warn' : 'ok'}>{b.balance.toFixed(1)} kg</Pill></td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
               <div className="panel">
                 <div className="panel-header">
                   <div><h2>Inward Entries (from mill slips)</h2><p className="subtitle">One table per size, same as the physical register book. Nothing is summed here — every mill-slip line stays its own row. "Consumed" is left blank for now; it'll be filled in once entries are matched against consumption reports.</p></div>
