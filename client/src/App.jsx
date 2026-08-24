@@ -3785,9 +3785,11 @@ function FIMSApp() {
                   <button className="btn btn-ghost" onClick={() => exportSheet('Consumed_Material', rawMaterialIn.filter(r => r.consumed), COLUMNS.rawMaterialIn)}><Download size={15} /> Export</button>
                 </div>
                 {!!unmatchedConsumptionRows.length && (
-                  <div className="error-box" style={{ marginBottom: 14 }}>
-                    <AlertCircle size={16} />
-                    <span>{unmatchedConsumptionRows.length} consumption row{unmatchedConsumptionRows.length === 1 ? '' : 's'} couldn't be matched to any reel in the Raw Material Register (no unconsumed row there shares the same size, GSM, and weight): {unmatchedConsumptionRows.map(r => `SL.No ${r.sl_no || '?'} on ${r.date} (${r.size || '?'}/${r.gsm || '?'}/${r.weight_consumed || '?'})`).join(', ')}. Check the consumption row and the reel it should match against for a typo, or it may genuinely predate this app's tracking.</span>
+                  <div style={{ marginBottom: 20 }}>
+                    <div className="section-label" style={{ color: 'var(--ledger-red)' }}>{unmatchedConsumptionRows.length} consumption row{unmatchedConsumptionRows.length === 1 ? '' : 's'} not matched to any reel</div>
+                    <p className="subtitle" style={{ marginBottom: 8 }}>No unconsumed row in the Raw Material Register shares this row's exact size, GSM, and weight. Fix a typo here (or on the matching reel in Inward Entries) and it'll match automatically — no re-check needed.</p>
+                    <EditableTable columns={COLUMNS.consumption} rows={unmatchedConsumptionRows}
+                      onUpdate={updateRow('consumption')} onDelete={deleteRow('consumption')} sortByDate={false} />
                   </div>
                 )}
                 {!rawMaterialIn.some(r => r.consumed) && <div className="empty-state">Nothing consumed yet — matches appear here automatically once a Daily Consumption Report is confirmed.</div>}
