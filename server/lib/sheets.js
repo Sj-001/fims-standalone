@@ -1606,4 +1606,150 @@ async function putBlocksTab(req, res) {
   }
 }
 
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler };
+// --- main-sheet maintenance: list/delete tabs, build the Raw Material pivot ---
+// Only used to LABEL every tab in the report the app shows before anyone deletes anything — never to
+// auto-delete. "known": a register/lookup the app itself reads or writes and something on an app page
+// is built from. "internal": bookkeeping the app needs but that never renders as a table anywhere —
+// safe to offer as a one-click default. Anything else comes back "unrecognized" so a person can look
+// it over themselves rather than this list silently deciding for them. A customer's own generated
+// Sheet structure (via generateCustomerSheetStructureHandler) lives in THAT customer's spreadsheet,
+// never this one, so it never appears here at all.
+const KNOWN_APP_TAB_KEYS = [
+  'fims_raw_material_in', 'fims_consumption', 'fims_production', 'fims_customer_dispatch',
+  'fims_dabur_specs', 'fims_dabur_po', 'fims_dabur_dispatch',
+  'fims_product_catalog', 'fims_customer_mapping', 'fims_customer_sheet_ids', 'fims_customer_name_aliases',
+  'fims_abbreviations',
+];
+const INTERNAL_ONLY_TAB_KEYS = ['fims_training_examples', 'fims_customer_sheets_mirror'];
+
+async function listTabsHandler(req, res) {
+  try {
+    const sheets = getSheetsClient();
+    const spreadsheetId = getSpreadsheetId();
+    const meta = await getSheetMeta(sheets, spreadsheetId);
+    const known = new Set(KNOWN_APP_TAB_KEYS.map(sanitizeTabName));
+    const internalOnly = new Set(INTERNAL_ONLY_TAB_KEYS.map(sanitizeTabName));
+    const tabs = Object.keys(meta).map(title => ({
+      title,
+      kind: internalOnly.has(title) ? 'internal' : known.has(title) ? 'known' : 'unrecognized',
+    }));
+    res.json({ tabs });
+  } catch (e) {
+    console.error('List tabs error:', e);
+    res.status(502).json({ error: friendlyGoogleError(e) });
+  }
+}
+
+// Deletes exactly the tab names given in the request body — nothing implicit, nothing pattern-
+// matched. The app only ever sends this the names a person reviewed and confirmed in the Settings
+// screen (defaulting to the two INTERNAL_ONLY_TAB_KEYS above, extendable to any "unrecognized" tab
+// they explicitly pick). A name that doesn't currently exist is reported back, not treated as an error
+// — deleting something already gone is a no-op, not a failure.
+async function deleteTabsHandler(req, res) {
+  try {
+    const tabNames = (req.body && Array.isArray(req.body.tabNames)) ? req.body.tabNames : [];
+    if (!tabNames.length) return res.status(400).json({ error: 'tabNames must be a non-empty array.' });
+    const sheets = getSheetsClient();
+    const spreadsheetId = getSpreadsheetId();
+    const meta = await getSheetMeta(sheets, spreadsheetId);
+    const requests = [];
+    const notFound = [];
+    tabNames.forEach(name => {
+      const m = meta[name];
+      if (m) requests.push({ deleteSheet: { sheetId: m.sheetId } });
+      else notFound.push(name);
+    });
+    if (requests.length) {
+      await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } });
+    }
+    res.json({ deleted: tabNames.filter(n => !notFound.includes(n)), notFound });
+  } catch (e) {
+    console.error('Delete tabs error:', e);
+    res.status(502).json({ error: friendlyGoogleError(e) });
+  }
+}
+
+// Builds (or fully rebuilds) a native Google Sheets pivot table in its own tab, sourced from the Raw
+// Material In tab — Rows grouped Size then GSM (each level gets Sheets' own built-in per-value filter
+// dropdown right in the pivot header, which is what actually gives "filter by size and gsm" rather
+// than anything this app has to build itself), Values showing total weight and entry count. Reads the
+// live header row to find the size/gsm/weight_kg/date column offsets rather than assuming a fixed
+// layout, since writeTab's header is a union built from whatever keys rows happen to carry. Always
+// deletes and recreates the destination tab first so re-running this (e.g. after the source data grew)
+// never stacks a second pivot table or errors on "cell already contains a pivot table" — safe to click
+// as many times as wanted.
+const RAW_MATERIAL_PIVOT_TAB_NAME = 'Raw Material Pivot';
+async function createRawMaterialPivotHandler(req, res) {
+  try {
+    const sheets = getSheetsClient();
+    const spreadsheetId = getSpreadsheetId();
+    const sourceTabName = sanitizeTabName('fims_raw_material_in');
+    const destTabName = sanitizeTabName(RAW_MATERIAL_PIVOT_TAB_NAME);
+    const meta = await getSheetMeta(sheets, spreadsheetId);
+    const sourceMeta = meta[sourceTabName];
+    if (!sourceMeta) return res.status(400).json({ error: 'Raw Material In has no data yet — upload at least one mill slip first.' });
+
+    const headerResp = await sheets.spreadsheets.values.get({
+      spreadsheetId, range: wholeSheetRangeA1(sourceTabName, { rowCount: 1, columnCount: sourceMeta.columnCount }),
+    });
+    const header = (headerResp.data.values && headerResp.data.values[0]) || [];
+    const sizeIdx = header.indexOf('size');
+    const gsmIdx = header.indexOf('gsm');
+    const weightIdx = header.indexOf('weight_kg');
+    const dateIdx = header.indexOf('date');
+    if (sizeIdx === -1 || gsmIdx === -1) {
+      return res.status(400).json({ error: 'Raw Material In tab is missing its size/gsm columns — nothing to build a pivot from yet.' });
+    }
+
+    if (meta[destTabName]) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: { requests: [{ deleteSheet: { sheetId: meta[destTabName].sheetId } }] },
+      });
+    }
+    const addResp = await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests: [{ addSheet: { properties: { title: destTabName } } }] },
+    });
+    const destSheetId = addResp.data.replies[0].addSheet.properties.sheetId;
+
+    const values = [{
+      pivotTable: {
+        source: {
+          sheetId: sourceMeta.sheetId,
+          startRowIndex: 0,
+          startColumnIndex: 0,
+          endRowIndex: sourceMeta.rowCount,
+          endColumnIndex: sourceMeta.columnCount,
+        },
+        rows: [
+          { sourceColumnOffset: sizeIdx, showTotals: true, sortOrder: 'ASCENDING' },
+          { sourceColumnOffset: gsmIdx, showTotals: true, sortOrder: 'ASCENDING' },
+        ],
+        values: [
+          { summarizeFunction: 'SUM', sourceColumnOffset: weightIdx, name: 'Total Weight (kg)' },
+          { summarizeFunction: 'COUNTA', sourceColumnOffset: dateIdx !== -1 ? dateIdx : sizeIdx, name: 'Entries' },
+        ],
+        valueLayout: 'HORIZONTAL',
+      },
+    }];
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{
+          updateCells: {
+            rows: [{ values }],
+            start: { sheetId: destSheetId, rowIndex: 0, columnIndex: 0 },
+            fields: 'pivotTable',
+          },
+        }],
+      },
+    });
+    res.json({ ok: true, tabName: destTabName });
+  } catch (e) {
+    console.error('Create raw material pivot error:', e);
+    res.status(502).json({ error: friendlyGoogleError(e) });
+  }
+}
+
+module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler, listTabsHandler, deleteTabsHandler, createRawMaterialPivotHandler };

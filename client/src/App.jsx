@@ -1444,6 +1444,71 @@ function FIMSApp() {
       setClearBusy(false);
     }
   };
+  // --- Google Sheet maintenance (Settings tab): scan every tab in the main Shyam Adarsh sheet and
+  // delete a person-confirmed list. Only "internal" tabs (bookkeeping the app needs but that never
+  // renders as a table anywhere — training examples, the customer-sheets search mirror) get
+  // pre-checked; "unrecognized" tabs are shown but left unchecked, since only a person looking at the
+  // actual name can tell whether one is stray clutter or something still needed. See
+  // KNOWN_APP_TAB_KEYS/INTERNAL_ONLY_TAB_KEYS in server/lib/sheets.js for how a tab gets labeled.
+  const [sheetTabs, setSheetTabs] = useState(null); // null = not scanned yet this session
+  const [sheetTabsBusy, setSheetTabsBusy] = useState(false);
+  const [sheetTabsMessage, setSheetTabsMessage] = useState('');
+  const [tabsToDelete, setTabsToDelete] = useState({});
+  const scanSheetTabs = async () => {
+    setSheetTabsBusy(true); setSheetTabsMessage('');
+    try {
+      const res = await fetch('/api/maintenance/tabs', { credentials: 'include' });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+      const data = await res.json();
+      setSheetTabs(data.tabs || []);
+      setTabsToDelete(Object.fromEntries((data.tabs || []).filter(t => t.kind === 'internal').map(t => [t.title, true])));
+    } catch (e) {
+      setSheetTabsMessage(`Couldn't scan the sheet (${e.message || 'unknown error'}).`);
+    } finally {
+      setSheetTabsBusy(false);
+    }
+  };
+  const toggleTabToDelete = (title) => setTabsToDelete(prev => ({ ...prev, [title]: !prev[title] }));
+  const deleteSelectedTabs = async () => {
+    const chosen = Object.keys(tabsToDelete).filter(t => tabsToDelete[t]);
+    if (!chosen.length) return;
+    if (!window.confirm(`Permanently delete these tabs from the Shyam Adarsh sheet:\n\n${chosen.join('\n')}\n\nThis cannot be undone.`)) return;
+    setSheetTabsBusy(true); setSheetTabsMessage('');
+    try {
+      const res = await fetch('/api/maintenance/delete-tabs', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+        body: JSON.stringify({ tabNames: chosen }),
+      });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+      const data = await res.json();
+      setSheetTabsMessage(`Deleted: ${data.deleted.length ? data.deleted.join(', ') : '(none)'}.${data.notFound.length ? ` Already gone: ${data.notFound.join(', ')}.` : ''}`);
+      await scanSheetTabs();
+    } catch (e) {
+      setSheetTabsMessage(`Something went wrong (${e.message || 'unknown error'}).`);
+    } finally {
+      setSheetTabsBusy(false);
+    }
+  };
+  // --- Raw Material pivot table (Google Sheet side) ---
+  const [rmPivotBusy, setRmPivotBusy] = useState(false);
+  const [rmPivotMessage, setRmPivotMessage] = useState('');
+  const rebuildRawMaterialPivot = async () => {
+    setRmPivotBusy(true); setRmPivotMessage('');
+    try {
+      const res = await fetch('/api/raw-material/rebuild-pivot', { method: 'POST', credentials: 'include' });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+      const data = await res.json();
+      setRmPivotMessage(`Done — see the "${data.tabName}" tab in the Shyam Adarsh sheet. Click the small filter icon next to Size or GSM in the pivot table to narrow it down.`);
+    } catch (e) {
+      setRmPivotMessage(`Couldn't build the pivot table (${e.message || 'unknown error'}).`);
+    } finally {
+      setRmPivotBusy(false);
+    }
+  };
+  // --- Raw Material Register view: the app-side equivalent of the Sheet pivot's filter — narrows the
+  // per-size tables down to one size and/or one GSM at a time, without summing anything.
+  const [rmSizeFilter, setRmSizeFilter] = useState('');
+  const [rmGsmFilter, setRmGsmFilter] = useState('');
   const updateRow = (registerKey) => (id, field, value) => {
     registerSetters[registerKey](prev => {
       const next = prev.map(r => r.id === id ? { ...r, [field]: value } : r);
@@ -1916,6 +1981,20 @@ function FIMSApp() {
         return a.size.localeCompare(b.size, undefined, { numeric: true });
       });
   })();
+  // Distinct GSM values present, for the filter dropdown below — sorted numerically the same way
+  // sizes are, so "100" doesn't land before "62" the way a plain string sort would.
+  const rawMaterialGsmOptions = Array.from(new Set(rawMaterialIn.map(r => (r.gsm || '').trim()).filter(Boolean)))
+    .sort((a, b) => {
+      const na = parseFloat(a), nb = parseFloat(b);
+      if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+      return a.localeCompare(b, undefined, { numeric: true });
+    });
+  // The app-side "pivot" — narrows the per-size tables down to just the selected size and/or GSM,
+  // same as the Sheet pivot's filter dropdowns, without summing or hiding anything beyond that.
+  const rawMaterialGroupsFiltered = rawMaterialBySize
+    .filter(g => !rmSizeFilter || g.size === rmSizeFilter)
+    .map(g => ({ ...g, rows: rmGsmFilter ? g.rows.filter(r => (r.gsm || '').trim() === rmGsmFilter) : g.rows }))
+    .filter(g => g.rows.length > 0);
   /* -------- dabur PO pending calc -------- */
   const PO_TOLERANCE = 0.10; // ±10% — a PO counts as fulfilled once dispatched qty reaches 90% of ordered qty
   const daburPOWithPending = daburPO.map(po => {
@@ -3649,8 +3728,29 @@ function FIMSApp() {
                   <div><h2>Inward Entries (from mill slips)</h2><p className="subtitle">One table per size, same as the physical register book. Nothing is summed here — every mill-slip line stays its own row. "Consumed" is left blank for now; it'll be filled in once entries are matched against consumption reports.</p></div>
                   <button className="btn btn-ghost" onClick={() => exportSheet('Raw_Material_In', rawMaterialIn, COLUMNS.rawMaterialIn)}><Download size={15} /> Export</button>
                 </div>
+                {!!rawMaterialIn.length && (
+                  <div className="field-row" style={{ marginBottom: 14 }}>
+                    <select className="doc-select" style={{ width: 160, marginBottom: 0 }} value={rmSizeFilter} onChange={e => setRmSizeFilter(e.target.value)}>
+                      <option value="">All sizes</option>
+                      {rawMaterialBySize.map(g => <option value={g.size} key={g.size}>Size {g.size}</option>)}
+                    </select>
+                    <select className="doc-select" style={{ width: 160, marginBottom: 0 }} value={rmGsmFilter} onChange={e => setRmGsmFilter(e.target.value)}>
+                      <option value="">All GSM</option>
+                      {rawMaterialGsmOptions.map(g => <option value={g} key={g}>GSM {g}</option>)}
+                    </select>
+                    {(rmSizeFilter || rmGsmFilter) && (
+                      <button className="btn btn-ghost" onClick={() => { setRmSizeFilter(''); setRmGsmFilter(''); }}>Clear filters</button>
+                    )}
+                    <span style={{ flex: 1 }} />
+                    <button className="btn btn-ghost" disabled={rmPivotBusy} onClick={rebuildRawMaterialPivot}>
+                      {rmPivotBusy ? <Loader2 size={15} className="spin" /> : <RefreshCw size={15} />} Create/rebuild pivot table in Sheet
+                    </button>
+                  </div>
+                )}
+                {rmPivotMessage && <div className="doc-hint" style={{ marginBottom: 14 }}>{rmPivotMessage}</div>}
                 {!rawMaterialIn.length && <div className="empty-state">Upload some mill slips to see inward entries here.</div>}
-                {rawMaterialBySize.map(group => (
+                {!!rawMaterialIn.length && !rawMaterialGroupsFiltered.length && <div className="empty-state">No entries match that filter.</div>}
+                {rawMaterialGroupsFiltered.map(group => (
                   <div key={group.size} style={{ marginBottom: 20 }}>
                     <div style={{ marginBottom: 6 }}><strong>Size {group.size}</strong></div>
                     <EditableTable columns={RAW_MATERIAL_SIZE_COLUMNS} rows={group.rows}
@@ -4693,6 +4793,33 @@ function FIMSApp() {
                   </button>
                 </div>
                 {clearMessage && <div className="doc-hint" style={{ marginTop: 10 }}>{clearMessage}</div>}
+              </div>
+              <div className="panel">
+                <div className="panel-header">
+                  <div><h2>Shyam Adarsh Sheet — Tabs</h2><p className="subtitle">Scans the main Google Sheet and shows every tab it finds. "Internal" tabs are bookkeeping the app needs but that never shows up as a table anywhere in the app (training corrections, the customer-sheets search mirror) — checked by default, safe to delete. "Unrecognized" tabs aren't anything this app manages — look at the name before deleting one. This never touches any customer's own external Sheet.</p></div>
+                  <button className="btn btn-ghost" disabled={sheetTabsBusy} onClick={scanSheetTabs}>
+                    {sheetTabsBusy ? <Loader2 size={15} className="spin" /> : <Search size={15} />} Scan tabs
+                  </button>
+                </div>
+                {sheetTabs === null && <div className="empty-state">Click "Scan tabs" to see what's currently in the Shyam Adarsh sheet.</div>}
+                {sheetTabs !== null && !sheetTabs.length && <div className="empty-state">No tabs found.</div>}
+                {sheetTabs !== null && !!sheetTabs.length && (
+                  <>
+                    {sheetTabs.map(t => (
+                      <label key={t.title} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, cursor: 'pointer' }}>
+                        <input type="checkbox" checked={!!tabsToDelete[t.title]} onChange={() => toggleTabToDelete(t.title)} />
+                        <span style={{ fontSize: 13.5 }}>{t.title}</span>
+                        <span className={`pill ${t.kind === 'internal' ? 'pill-warn' : t.kind === 'unrecognized' ? 'pill-neutral' : 'pill-ok'}`}>{t.kind}</span>
+                      </label>
+                    ))}
+                    <div className="review-actions" style={{ marginTop: 10 }}>
+                      <button className="btn btn-danger" disabled={sheetTabsBusy || !Object.values(tabsToDelete).some(Boolean)} onClick={deleteSelectedTabs}>
+                        {sheetTabsBusy ? <Loader2 size={15} className="spin" /> : <Trash2 size={15} />} Delete selected tabs
+                      </button>
+                    </div>
+                  </>
+                )}
+                {sheetTabsMessage && <div className="doc-hint" style={{ marginTop: 10 }}>{sheetTabsMessage}</div>}
               </div>
             </div>
           )}

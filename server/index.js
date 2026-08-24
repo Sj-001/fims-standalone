@@ -4,7 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const { requireEnv, login, logout, requireAuth } = require('./lib/auth');
 const { extract } = require('./lib/anthropic');
-const { getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler } = require('./lib/sheets');
+const { getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler, listTabsHandler, deleteTabsHandler, createRawMaterialPivotHandler } = require('./lib/sheets');
 
 // Fail fast and loud if required secrets are missing, instead of the app half-working with
 // confusing downstream errors — matches the "no guesses" standard this project was built to.
@@ -76,6 +76,12 @@ app.get('/api/service-account-email', getServiceAccountEmailHandler);
 // accounts have no Drive storage of their own), but writing into an already-shared blank sheet needs
 // nothing beyond the existing Sheets permission. See generateCustomerSheetStructure in lib/sheets.js.
 app.post('/api/customer-sheets/generate-structure', generateCustomerSheetStructureHandler);
+// Main-sheet maintenance: list every tab (labeled known/internal/unrecognized, see lib/sheets.js) and
+// delete a person-confirmed list of them — surfaced in the app's Settings screen. Also builds the Raw
+// Material In pivot table (Size -> GSM, with weight/entry totals) in its own tab on the main sheet.
+app.get('/api/maintenance/tabs', listTabsHandler);
+app.post('/api/maintenance/delete-tabs', deleteTabsHandler);
+app.post('/api/raw-material/rebuild-pivot', createRawMaterialPivotHandler);
 
 // --- serve the built frontend (client/dist), if present, so this is a single deployable service ---
 const clientDist = path.join(__dirname, '..', 'client', 'dist');
