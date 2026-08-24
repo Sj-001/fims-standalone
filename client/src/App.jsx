@@ -468,10 +468,18 @@ const MONTH_ABBR_TO_NUM = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul:
 function normalizeDateToDots(raw) {
   const s = String(raw || '').trim();
   if (!s) return s;
-  // Already dot-separated ("5.1.24", "13.08.24") — leave as-is, that's the target format.
-  if (/^\d{1,2}\.\d{1,2}\.\d{2,4}$/.test(s)) return s;
+  // Dot-separated ("5.1.24", "13.08.24", "23.07.2026") — normalize even when it already matches this
+  // pattern, since a leading-zero month/day ("08" not "8") or a 4-digit year ("2026" not "26") would
+  // otherwise pass through completely untouched and sit inconsistently next to rows that came out the
+  // "clean" way — this is exactly what let "23.07.2026" and "12.4.26" end up side by side in the same
+  // register. Number(...) strips the leading zero; the year is always truncated to its last 2 digits.
+  let m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$/);
+  if (m) {
+    const yy = m[3].length > 2 ? m[3].slice(-2) : m[3];
+    return `${Number(m[1])}.${Number(m[2])}.${yy}`;
+  }
   // Slash-separated DD/MM/YYYY or D/M/YY (what the Production Register's OCR tends to produce).
-  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
   if (m) {
     const yy = m[3].length > 2 ? m[3].slice(-2) : m[3];
     return `${Number(m[1])}.${Number(m[2])}.${yy}`;
@@ -1340,6 +1348,19 @@ function FIMSApp() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // Backfills the Raw Material Pivot tab for data that was already sitting in the register before the
+  // auto-rebuild-on-save behavior existed (putTab in server/lib/sheets.js handles every SAVE from here
+  // on). Fires once per session, right after the initial load, purely fire-and-forget — no UI surface
+  // for it (no button, no message), matching how the on-save rebuild is silent too. A failure here just
+  // means the pivot tab stays as it was; it isn't disruptive to anything else in the app.
+  const pivotBackfillFiredRef = useRef(false);
+  useEffect(() => {
+    if (!loaded || pivotBackfillFiredRef.current || !rawMaterialIn.length) return;
+    pivotBackfillFiredRef.current = true;
+    fetch('/api/raw-material/rebuild-pivot', { method: 'POST', credentials: 'include' })
+      .then(res => { if (!res.ok) console.warn('Raw Material Pivot backfill failed:', res.status); })
+      .catch(e => console.warn('Raw Material Pivot backfill failed:', e));
+  }, [loaded, rawMaterialIn.length]);
   // Google Sheets allows only 60 write requests/minute per user (300/minute per project — see
   // https://developers.google.com/workspace/sheets/api/limits). Saving on every single keystroke or
   // row edit blows through that almost immediately — e.g. clicking "Confirm all" on a batch of
@@ -1487,6 +1508,49 @@ function FIMSApp() {
       setSheetTabsMessage(`Something went wrong (${e.message || 'unknown error'}).`);
     } finally {
       setSheetTabsBusy(false);
+    }
+  };
+  // --- Date-format cleanup (Settings tab): normalizeDateToDots (above) runs on every FRESH
+  // extraction, but a row that entered the ledger before a normalizer bug was fixed, or was typed/
+  // edited by hand, can still be sitting there in the wrong shape (e.g. "23.07.2026" next to "12.4.26"
+  // in the same register). One-time, on-demand sweep — not automatic on every load — since it's a
+  // retroactive cleanup for already-bad data, not an ongoing need once the root cause is fixed.
+  const DATE_FIELD_REGISTERS = {
+    rawMaterialIn: ['date'], consumption: ['date'], production: ['date'], customerDispatch: ['date'],
+    daburPO: ['date', 'delivery_date'], daburDispatch: ['date'],
+  };
+  const [dateFixBusy, setDateFixBusy] = useState(false);
+  const [dateFixMessage, setDateFixMessage] = useState('');
+  const normalizeAllDates = async () => {
+    setDateFixBusy(true); setDateFixMessage('');
+    try {
+      let totalFixed = 0;
+      const perRegister = [];
+      for (const [registerKey, fields] of Object.entries(DATE_FIELD_REGISTERS)) {
+        const rows = registerState[registerKey] || [];
+        let changedInThisRegister = 0;
+        const next = rows.map(r => {
+          const patched = { ...r };
+          let rowChanged = false;
+          fields.forEach(f => {
+            const normalized = normalizeDateToDots(r[f]);
+            if (normalized !== (r[f] || '')) { patched[f] = normalized; rowChanged = true; }
+          });
+          if (rowChanged) changedInThisRegister++;
+          return patched;
+        });
+        if (changedInThisRegister > 0) {
+          registerSetters[registerKey](next);
+          await saveRegister(STORAGE_KEYS[registerKey], next);
+          totalFixed += changedInThisRegister;
+          perRegister.push(`${changedInThisRegister} in ${registerKey}`);
+        }
+      }
+      setDateFixMessage(totalFixed ? `Fixed ${totalFixed} row(s): ${perRegister.join(', ')}.` : 'Every date was already consistent — nothing to fix.');
+    } catch (e) {
+      setDateFixMessage(`Something went wrong partway through (${e.message || 'unknown error'}) — safe to run again, it only touches rows that still need it.`);
+    } finally {
+      setDateFixBusy(false);
     }
   };
   // The Raw Material Pivot tab on the Shyam Adarsh sheet rebuilds itself automatically whenever raw
@@ -4774,6 +4838,15 @@ function FIMSApp() {
                   </button>
                 </div>
                 {clearMessage && <div className="doc-hint" style={{ marginTop: 10 }}>{clearMessage}</div>}
+              </div>
+              <div className="panel">
+                <div className="panel-header">
+                  <div><h2>Date Formatting</h2><p className="subtitle">Every date should read D.M.YY (e.g. "16.7.26") throughout — a bug let some rows through with a leading zero and/or a 4-digit year instead (e.g. "23.07.2026"), which is now fixed for anything freshly extracted. This is a one-time sweep for rows that entered the ledger before that fix, or were typed/edited by hand — it rewrites the date field(s) in place across every register, nothing else. Safe to run more than once; it only touches rows that still need it.</p></div>
+                  <button className="btn btn-primary" disabled={dateFixBusy} onClick={normalizeAllDates}>
+                    {dateFixBusy ? <Loader2 size={15} className="spin" /> : <RefreshCw size={15} />} Fix date formatting
+                  </button>
+                </div>
+                {dateFixMessage && <div className="doc-hint">{dateFixMessage}</div>}
               </div>
               <div className="panel">
                 <div className="panel-header">
