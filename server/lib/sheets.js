@@ -1697,15 +1697,24 @@ async function rebuildRawMaterialPivot() {
   const sourceMeta = meta[sourceTabName];
   if (!sourceMeta) return { skipped: true, reason: 'no-source-tab' };
 
-  const headerResp = await sheets.spreadsheets.values.get({
-    spreadsheetId, range: wholeSheetRangeA1(sourceTabName, { rowCount: 1, columnCount: sourceMeta.columnCount }),
+  // Reads the WHOLE tab (not just row 1) so the pivot's source range can be sized to the REAL data
+  // extent (values.get trims trailing empty rows/columns) instead of the tab's full allocated grid —
+  // writeValuesClearingStale pads a save out to the tab's PREVIOUS size to clear stale content, so
+  // using sourceMeta.rowCount/columnCount here previously dragged hundreds of blank padding rows into
+  // the pivot, which then showed up as a bogus "no size/gsm" group with a large Entries count.
+  const dataResp = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: wholeSheetRangeA1(sourceTabName, sourceMeta),
   });
-  const header = (headerResp.data.values && headerResp.data.values[0]) || [];
+  const dataValues = dataResp.data.values || [];
+  const header = dataValues[0] || [];
   const sizeIdx = header.indexOf('size');
   const gsmIdx = header.indexOf('gsm');
-  const weightIdx = header.indexOf('weight_kg');
   const dateIdx = header.indexOf('date');
-  if (sizeIdx === -1 || gsmIdx === -1) return { skipped: true, reason: 'no-data' };
+  // weight_kg is referenced by name in the pivot's calculated value formula below, not by offset —
+  // still needs to actually be a header, or that formula would point at a column that doesn't exist.
+  if (sizeIdx === -1 || gsmIdx === -1 || header.indexOf('weight_kg') === -1) return { skipped: true, reason: 'no-data' };
+  const realRowCount = dataValues.length;
+  const realColumnCount = Math.max(header.length, ...dataValues.map(r => r.length), 1);
 
   if (meta[destTabName]) {
     await sheets.spreadsheets.batchUpdate({
@@ -1725,15 +1734,21 @@ async function rebuildRawMaterialPivot() {
         sheetId: sourceMeta.sheetId,
         startRowIndex: 0,
         startColumnIndex: 0,
-        endRowIndex: sourceMeta.rowCount,
-        endColumnIndex: sourceMeta.columnCount,
+        endRowIndex: realRowCount,
+        endColumnIndex: realColumnCount,
       },
       rows: [
         { sourceColumnOffset: sizeIdx, showTotals: true, sortOrder: 'ASCENDING' },
         { sourceColumnOffset: gsmIdx, showTotals: true, sortOrder: 'ASCENDING' },
       ],
       values: [
-        { summarizeFunction: 'SUM', sourceColumnOffset: weightIdx, name: 'Total Weight (kg)' },
+        // Every cell writeTab puts on the sheet is stored as literal text (see writeValuesClearingStale
+        // — RAW input, never parsed into a real number), so a plain SUM over weight_kg's column adds
+        // zero every time: Sheets treats a text cell as 0 in a numeric sum. A calculated pivot value
+        // (formula referencing the column by its header name, same as "Add calculated field" in the
+        // Sheets UI) runs VALUE() per source row to coerce the text into a real number FIRST, then SUM
+        // aggregates those — sidesteps the storage issue without changing how every other tab is written.
+        { formula: '=VALUE(weight_kg)', summarizeFunction: 'SUM', name: 'Total Weight (kg)' },
         { summarizeFunction: 'COUNTA', sourceColumnOffset: dateIdx !== -1 ? dateIdx : sizeIdx, name: 'Entries' },
       ],
       valueLayout: 'HORIZONTAL',
