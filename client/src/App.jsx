@@ -749,6 +749,7 @@ const NAV = [
   { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { key: 'upload', label: 'Upload & Extract', icon: Upload },
   { key: 'rawMaterialIn', label: 'Raw Material Register', icon: Archive },
+  { key: 'consumption', label: 'Consumption', icon: ListChecks },
   { key: 'production', label: 'Production Register', icon: ClipboardList },
   { key: 'customerDispatch', label: 'Customer Dispatch Bills', icon: Package },
   { key: 'daburSpecs', label: 'Dabur — Spec Master', icon: FileText },
@@ -2045,13 +2046,17 @@ function FIMSApp() {
     const leftoverRowsToAdd = [];
     const consumptionUpdateById = {};
     pending.forEach(cRow => {
-      const size = (cRow.size || '').trim();
-      const gsm = (cRow.gsm || '').trim();
+      // Numeric comparison for ALL THREE fields, not just weight — "59.5" (consumption) and "59.50"
+      // (raw material, or vice versa) are the exact same size but different STRINGS, so a strict
+      // string match here would silently flag a genuine match as "unmatched" purely over formatting.
+      // This is the same class of bug fixed for display grouping earlier (see rawMaterialBySize).
+      const size = num(cRow.size);
+      const gsm = num(cRow.gsm);
       const weight = num(cRow.weight_consumed);
       const match = rawMaterialIn.find(rRow =>
         !rRow.consumed && !claimedRawMaterialIds.has(rRow.id) &&
-        (rRow.size || '').trim() === size &&
-        (rRow.gsm || '').trim() === gsm &&
+        num(rRow.size) === size &&
+        num(rRow.gsm) === gsm &&
         num(rRow.weight_kg) === weight
       );
       if (match) {
@@ -2104,6 +2109,16 @@ function FIMSApp() {
       });
   })();
   const unmatchedConsumptionRows = consumption.filter(r => r.matchStatus === 'unmatched');
+  // Clears matchStatus on every currently-unmatched row so the matching effect above picks them up
+  // again on its next pass — needed because that effect deliberately never retries an already-decided
+  // row on its own (see its comment), so fixing the MATCHING LOGIC itself (e.g. the size/gsm string-vs-
+  // number comparison bug) doesn't automatically re-resolve rows that were already flagged under the
+  // old, buggier comparison.
+  const retryUnmatchedConsumption = () => {
+    const next = consumption.map(r => r.matchStatus === 'unmatched' ? { ...r, matchStatus: undefined, matchedRawMaterialId: undefined } : r);
+    setConsumption(next);
+    persist('consumption', next);
+  };
   // Consumed Material's own Size/GSM filter — separate state from Inward Entries' since they're
   // different tables a person filters independently.
   const consumedMaterialGsmOptions = Array.from(new Set(rawMaterialIn.filter(r => r.consumed).map(r => (r.gsm || '').trim()).filter(Boolean)))
@@ -3763,15 +3778,24 @@ function FIMSApp() {
                   </div>
                 ))}
               </div>
+            </div>
+          )}
+          {loaded && activeTab === 'consumption' && (
+            <div>
+              <div className="panel">
+                <h2 style={{ marginBottom: 6 }}>Consumption</h2>
+                <p className="subtitle">Daily Consumption Reports and what they matched against in the Raw Material Register. Matching runs automatically by Size + GSM + Weight — see Consumed Material below for the result.</p>
+              </div>
               <div className="panel">
                 <div className="panel-header">
-                  <div><h2>Consumed Material</h2><p className="subtitle">Raw Material In entries matched against a Daily Consumption Report — matched by Size + GSM + Weight, since that combination identifies one specific reel. These rows are the same underlying entries as Inward Entries above (nothing is duplicated or removed from that tab — "Consumed" just gets filled in), shown here separately so what's left in stock is easy to tell apart from what's already used.</p></div>
+                  <div><h2>Consumed Material</h2><p className="subtitle">Raw Material In entries matched against a Daily Consumption Report — matched by Size + GSM + Weight, since that combination identifies one specific reel. These rows are the same underlying entries as the Raw Material Register's Inward Entries (nothing is duplicated or removed from there — "Consumed" just gets filled in), shown here separately so what's left in stock is easy to tell apart from what's already used.</p></div>
                   <button className="btn btn-ghost" onClick={() => exportSheet('Consumed_Material', rawMaterialIn.filter(r => r.consumed), COLUMNS.rawMaterialIn)}><Download size={15} /> Export</button>
                 </div>
                 {!!unmatchedConsumptionRows.length && (
                   <div className="error-box" style={{ marginBottom: 14 }}>
                     <AlertCircle size={16} />
-                    <span>{unmatchedConsumptionRows.length} consumption row{unmatchedConsumptionRows.length === 1 ? '' : 's'} couldn't be matched to any reel in Inward Entries (no unconsumed row there shares the same size, GSM, and weight): {unmatchedConsumptionRows.map(r => `SL.No ${r.sl_no || '?'} on ${r.date} (${r.size || '?'}/${r.gsm || '?'}/${r.weight_consumed || '?'})`).join(', ')}. Check the consumption row and the reel it should match against for a typo, or it may genuinely predate this app's tracking.</span>
+                    <span>{unmatchedConsumptionRows.length} consumption row{unmatchedConsumptionRows.length === 1 ? '' : 's'} couldn't be matched to any reel in the Raw Material Register (no unconsumed row there shares the same size, GSM, and weight): {unmatchedConsumptionRows.map(r => `SL.No ${r.sl_no || '?'} on ${r.date} (${r.size || '?'}/${r.gsm || '?'}/${r.weight_consumed || '?'})`).join(', ')}. Check the consumption row and the reel it should match against for a typo, or it may genuinely predate this app's tracking.</span>
+                    <button className="btn btn-ghost" style={{ flexShrink: 0 }} onClick={retryUnmatchedConsumption}><RefreshCw size={13} /> Retry matching</button>
                   </div>
                 )}
                 {!rawMaterialIn.some(r => r.consumed) && <div className="empty-state">Nothing consumed yet — matches appear here automatically once a Daily Consumption Report is confirmed.</div>}
