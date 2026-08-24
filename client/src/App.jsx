@@ -4193,6 +4193,14 @@ function FIMSApp() {
                           <option value="">Merge into…</option>
                           {allCustomerTabNames.filter(c => c !== customer).sort().map(c => <option key={c} value={c}>{c}</option>)}
                         </select>
+                        <button
+                          className="btn btn-ghost"
+                          disabled={(reviewByCustomer[customer] || {}).loading}
+                          onClick={() => refreshReview(customer)}
+                          title="Re-check against the real Sheet right now — the review otherwise only re-fetches when something changes in the app, not when the Sheet itself is edited directly."
+                        >
+                          {(reviewByCustomer[customer] || {}).loading ? <Loader2 size={15} className="spin" /> : <RefreshCw size={15} />} Refresh
+                        </button>
                         {!!reviewEdits[customer] && Object.keys(reviewEdits[customer]).length > 0 && (
                           <button className="btn btn-ghost" onClick={() => { if (window.confirm(`Discard every staged change (edited values, deleted rows, tab overrides) for ${customer}'s review? This never touches the Production Register or Customer Dispatch Bills — only what's staged here.`)) discardCustomerReview(customer); }}>
                             <XCircle size={15} /> Discard changes
