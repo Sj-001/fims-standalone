@@ -3021,65 +3021,37 @@ function FIMSApp() {
   // registry, then re-checks every confirmed-but-Unassigned production/dispatch row against the newly
   // widened mapping — the "if you find anything that matches in unassigned, add it to the respective
   // customer sheet" half of the request.
+  // Purely additive for BOTH the catalog and Customer Mapping, resync or not — an item already in the
+  // catalog (same customer + item, see catalogDedupKey) is left completely untouched: not regenerated
+  // with a new id, not duplicated, not removed even if it's no longer in the Sheet. Only a genuinely
+  // new item gets appended. Resync used to treat the Sheet as the source of truth and replace/drop
+  // whatever wasn't currently in `included` — which meant an item temporarily missing from the Sheet (a
+  // bad push undone, a row someone deleted by mistake) silently lost its catalog entry on the next
+  // resync, the same class of data loss the Customer Mapping side was already fixed for. Resync and
+  // import now share this identical additive logic; the only remaining difference between them is which
+  // items even reach the review screen (resync shows everything currently in the Sheet, import already
+  // pre-filtered to just the new ones) and the wording in the result message.
   const confirmSheetImport = () => {
     if (!sheetReview || !sheetReview.customerName.trim()) return;
     const customer = sheetReview.customerName.trim();
     const included = sheetReview.items.filter(it => it.include && it.item.trim());
     const isFullResync = sheetReview.mode === 'resync';
-    const oldCustomerItems = productCatalog.filter(c => c.customer === customer);
-    const staleRemovedCount = isFullResync
-      ? oldCustomerItems.filter(c => !included.some(it => catalogDedupKey(customer, it.item.trim()) === catalogDedupKey(customer, c.item))).length
-      : 0;
-    if (isFullResync) {
-      // Destructive — the Sheet becomes the source of truth for this customer's catalog from here on,
-      // so anything currently there that isn't in `included` is about to be dropped. Confirm first,
-      // same as every other real write in this app (Push to Sheet, Discard changes, Clear Data).
-      if (!window.confirm(`Re-sync ${customer}: replace all ${oldCustomerItems.length} existing catalog item${oldCustomerItems.length === 1 ? '' : 's'} for this customer with the ${included.length} item${included.length === 1 ? '' : 's'} currently in their Sheet${staleRemovedCount ? ` (${staleRemovedCount} no longer there will be removed)` : ''}? Customer Mapping keyword rules (and Aliases) are never removed by this — only added to — even for an item that drops out of the catalog here.`)) return;
-    }
-    let nextCatalog;
-    let nextMapping;
-    let addedCount;
-    if (isFullResync) {
-      // The CATALOG is genuinely replaced (the Sheet is the source of truth for "what items this
-      // customer has"), but Customer Mapping keyword rules are NEVER removed here, even for an item
-      // that just dropped out of the catalog — confirmed directly: clearing a customer's real Sheet
-      // (e.g. to undo a bad push) and re-syncing used to also silently delete the keyword rules
-      // matchCustomer relies on to guess that customer from an item's description alone (the ONLY
-      // signal available for a handwritten Production Register page with no party/hint written on it),
-      // so every past row for that item would show up as Unassigned on the next upload — a genuine data
-      // loss, not the intended "sync the catalog to the Sheet" behavior. Purely additive now, same as
-      // the non-resync branch below: existing rules (auto-generated or hand-typed) always survive.
-      const freshEntries = included.map(it => ({ id: genId(), customer, item: it.item.trim(), sheetGroup: (it.sheetGroup || it.item).trim() }));
-      addedCount = freshEntries.length;
-      nextCatalog = [...productCatalog.filter(c => c.customer !== customer), ...freshEntries];
-      const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
-      const exactRules = [];
-      const fallbackRules = [];
-      included.forEach(it => {
-        const exact = mappingDedupKey(it.item);
-        if (exact && !existingKeywords.has(exact)) { exactRules.push({ id: genId(), keyword: exact, customer }); existingKeywords.add(exact); }
-        const fallback = exact.replace(/[\d].*$/, '').trim();
-        if (fallback && fallback.length > 2 && !existingKeywords.has(fallback)) { fallbackRules.push({ id: genId(), keyword: fallback, customer }); existingKeywords.add(fallback); }
-      });
-      nextMapping = [...exactRules, ...customerMapping, ...fallbackRules];
-    } else {
-      const existingItems = new Set(productCatalog.map(c => catalogDedupKey(c.customer, c.item)));
-      const newCatalogEntries = included
-        .filter(it => !existingItems.has(catalogDedupKey(customer, it.item)))
-        .map(it => ({ id: genId(), customer, item: it.item.trim(), sheetGroup: (it.sheetGroup || it.item).trim() }));
-      addedCount = newCatalogEntries.length;
-      nextCatalog = [...productCatalog, ...newCatalogEntries];
-      const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
-      const exactRules = [];
-      const fallbackRules = [];
-      included.forEach(it => {
-        const exact = it.item.trim().toLowerCase();
-        if (exact && !existingKeywords.has(exact)) { exactRules.push({ id: genId(), keyword: exact, customer }); existingKeywords.add(exact); }
-        const fallback = exact.replace(/[\d].*$/, '').trim();
-        if (fallback && fallback.length > 2 && !existingKeywords.has(fallback)) { fallbackRules.push({ id: genId(), keyword: fallback, customer }); existingKeywords.add(fallback); }
-      });
-      nextMapping = [...exactRules, ...customerMapping, ...fallbackRules];
-    }
+    const existingItems = new Set(productCatalog.map(c => catalogDedupKey(c.customer, c.item)));
+    const newCatalogEntries = included
+      .filter(it => !existingItems.has(catalogDedupKey(customer, it.item)))
+      .map(it => ({ id: genId(), customer, item: it.item.trim(), sheetGroup: (it.sheetGroup || it.item).trim() }));
+    const addedCount = newCatalogEntries.length;
+    const nextCatalog = [...productCatalog, ...newCatalogEntries];
+    const existingKeywords = new Set(customerMapping.map(r => mappingDedupKey(r.keyword)));
+    const exactRules = [];
+    const fallbackRules = [];
+    included.forEach(it => {
+      const exact = mappingDedupKey(it.item);
+      if (exact && !existingKeywords.has(exact)) { exactRules.push({ id: genId(), keyword: exact, customer }); existingKeywords.add(exact); }
+      const fallback = exact.replace(/[\d].*$/, '').trim();
+      if (fallback && fallback.length > 2 && !existingKeywords.has(fallback)) { fallbackRules.push({ id: genId(), keyword: fallback, customer }); existingKeywords.add(fallback); }
+    });
+    const nextMapping = [...exactRules, ...customerMapping, ...fallbackRules];
     persistCatalog(nextCatalog);
     persistCustomerMapping(nextMapping);
     patchCustomerSheetEntry(customer, {
@@ -3093,9 +3065,8 @@ function FIMSApp() {
     const reassignedCount = reassignUnassignedRows();
     const verb = isFullResync ? 'Re-synced' : sheetReview.mode === 'generate' ? 'Generated' : 'Imported';
     setImportResultMessage(
-      `${verb} ${customer}: ${isFullResync ? `catalog now has ${addedCount} item${addedCount === 1 ? '' : 's'}` : `added ${addedCount} new catalog item${addedCount === 1 ? '' : 's'}`}` +
-      (isFullResync && staleRemovedCount ? `, removed ${staleRemovedCount} stale item${staleRemovedCount === 1 ? '' : 's'}` : '') +
-      (!isFullResync && sheetReview.skippedExisting ? ` (${sheetReview.skippedExisting} already known, skipped)` : '') +
+      `${verb} ${customer}: added ${addedCount} new catalog item${addedCount === 1 ? '' : 's'}` +
+      (sheetReview.skippedExisting ? ` (${sheetReview.skippedExisting} already known, skipped)` : '') +
       (reassignedCount ? `, reassigned ${reassignedCount} previously-Unassigned row${reassignedCount === 1 ? '' : 's'} to ${customer}` : '') + '.'
     );
     setSheetReview(null);
@@ -4361,29 +4332,28 @@ function FIMSApp() {
                                   {(review.existingTabNames || []).map(t => <option value={t} key={t} />)}
                                 </datalist>
                                 {tab.isNewTab && <span className="doc-hint">(new — this tab doesn't exist yet)</span>}
-                                {needsBlock && (
-                                  <>
-                                    <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>— Block:</span>
-                                    <input
-                                      className="cell-input"
-                                      style={{ width: 200, fontSize: 12, borderColor: unassigned ? 'var(--ledger-red)' : undefined }}
-                                      list={`review-blocks-${customer}-${tab.tabName}`}
-                                      value={blockOverride}
-                                      onChange={e => setBlockOverride(customer, v.title, e.target.value)}
-                                    />
-                                    <datalist id={`review-blocks-${customer}-${tab.tabName}`}>
-                                      {existingBlocks.map(t => <option value={t} key={t} />)}
-                                      <option value={v.title}>{`+ New block: "${v.title}"`}</option>
-                                    </datalist>
-                                    {unassigned && (
-                                      <AlertCircle
-                                        size={15}
-                                        color="var(--ledger-red)"
-                                        style={{ flexShrink: 0 }}
-                                        title="Not yet assigned to a block — pick one from the dropdown, or it'll create a new one named after the item on push."
-                                      />
-                                    )}
-                                  </>
+                                {/* Always editable, not just when auto-matching couldn't find a block (needsBlock)
+                                    — an auto-match can itself be wrong, and there was previously no way to fix
+                                    that here at all since the field didn't even render once something matched. */}
+                                <span className="doc-hint" style={{ whiteSpace: 'nowrap' }}>— Block:</span>
+                                <input
+                                  className="cell-input"
+                                  style={{ width: 200, fontSize: 12, borderColor: unassigned ? 'var(--ledger-red)' : undefined }}
+                                  list={`review-blocks-${customer}-${tab.tabName}`}
+                                  value={blockOverride || v.title}
+                                  onChange={e => setBlockOverride(customer, v.title, e.target.value)}
+                                />
+                                <datalist id={`review-blocks-${customer}-${tab.tabName}`}>
+                                  {existingBlocks.map(t => <option value={t} key={t} />)}
+                                  <option value={v.title}>{`+ New block: "${v.title}"`}</option>
+                                </datalist>
+                                {unassigned && (
+                                  <AlertCircle
+                                    size={15}
+                                    color="var(--ledger-red)"
+                                    style={{ flexShrink: 0 }}
+                                    title="Not yet assigned to a block — pick one from the dropdown, or it'll create a new one named after the item on push."
+                                  />
                                 )}
                               </div>
                               {hiddenDuplicateCount > 0 && <p className="doc-hint" style={{ marginBottom: 6 }}>+ {hiddenDuplicateCount} row{hiddenDuplicateCount === 1 ? '' : 's'} already in the Sheet, not shown.</p>}
@@ -4735,7 +4705,7 @@ function FIMSApp() {
                       </table>
                     </div>
                     <div className="review-actions">
-                      <button className="btn btn-primary" onClick={confirmSheetImport} disabled={!sheetReview.customerName.trim()}><CheckCircle2 size={15} /> {sheetReview.mode === 'resync' ? 'Replace catalog with Sheet' : 'Add to catalog & mapping'}</button>
+                      <button className="btn btn-primary" onClick={confirmSheetImport} disabled={!sheetReview.customerName.trim()}><CheckCircle2 size={15} /> Add new items to catalog & mapping</button>
                       <button className="btn btn-ghost" onClick={() => setSheetReview(null)}><XCircle size={15} /> Discard</button>
                     </div>
                   </div>
