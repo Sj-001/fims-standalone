@@ -1489,22 +1489,8 @@ function FIMSApp() {
       setSheetTabsBusy(false);
     }
   };
-  // --- Raw Material pivot table (Google Sheet side) ---
-  const [rmPivotBusy, setRmPivotBusy] = useState(false);
-  const [rmPivotMessage, setRmPivotMessage] = useState('');
-  const rebuildRawMaterialPivot = async () => {
-    setRmPivotBusy(true); setRmPivotMessage('');
-    try {
-      const res = await fetch('/api/raw-material/rebuild-pivot', { method: 'POST', credentials: 'include' });
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
-      const data = await res.json();
-      setRmPivotMessage(`Done — see the "${data.tabName}" tab in the Shyam Adarsh sheet. Click the small filter icon next to Size or GSM in the pivot table to narrow it down.`);
-    } catch (e) {
-      setRmPivotMessage(`Couldn't build the pivot table (${e.message || 'unknown error'}).`);
-    } finally {
-      setRmPivotBusy(false);
-    }
-  };
+  // The Raw Material Pivot tab on the Shyam Adarsh sheet rebuilds itself automatically whenever raw
+  // material data saves (see putTab in server/lib/sheets.js) — no button/trigger needed here.
   // --- Raw Material Register view: the app-side equivalent of the Sheet pivot's filter — narrows the
   // per-size tables down to one size and/or one GSM at a time, without summing anything.
   const [rmSizeFilter, setRmSizeFilter] = useState('');
@@ -3741,13 +3727,8 @@ function FIMSApp() {
                     {(rmSizeFilter || rmGsmFilter) && (
                       <button className="btn btn-ghost" onClick={() => { setRmSizeFilter(''); setRmGsmFilter(''); }}>Clear filters</button>
                     )}
-                    <span style={{ flex: 1 }} />
-                    <button className="btn btn-ghost" disabled={rmPivotBusy} onClick={rebuildRawMaterialPivot}>
-                      {rmPivotBusy ? <Loader2 size={15} className="spin" /> : <RefreshCw size={15} />} Create/rebuild pivot table in Sheet
-                    </button>
                   </div>
                 )}
-                {rmPivotMessage && <div className="doc-hint" style={{ marginBottom: 14 }}>{rmPivotMessage}</div>}
                 {!rawMaterialIn.length && <div className="empty-state">Upload some mill slips to see inward entries here.</div>}
                 {!!rawMaterialIn.length && !rawMaterialGroupsFiltered.length && <div className="empty-state">No entries match that filter.</div>}
                 {rawMaterialGroupsFiltered.map(group => (

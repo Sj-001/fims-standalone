@@ -1589,6 +1589,13 @@ async function putTab(req, res) {
     const rows = (req.body && Array.isArray(req.body.rows)) ? req.body.rows : [];
     await writeTab(req.params.tab, rows);
     res.json({ ok: true, count: rows.length });
+    // Fire-and-forget, AFTER responding: keeps the Raw Material Pivot tab in sync automatically
+    // whenever raw material data itself saves, so there's no separate button to remember to click.
+    // Runs post-response so a slow or failed pivot rebuild never delays or breaks the actual save the
+    // person is waiting on — a failure here is logged, not surfaced as if the save itself failed.
+    if (req.params.tab === sanitizeTabName('fims_raw_material_in')) {
+      rebuildRawMaterialPivot().catch(e => console.error('Auto pivot rebuild failed:', e));
+    }
   } catch (e) {
     console.error(`Sheets write error [${req.params.tab}]:`, e);
     res.status(502).json({ error: friendlyGoogleError(e) });
@@ -1676,76 +1683,86 @@ async function deleteTabsHandler(req, res) {
 // live header row to find the size/gsm/weight_kg/date column offsets rather than assuming a fixed
 // layout, since writeTab's header is a union built from whatever keys rows happen to carry. Always
 // deletes and recreates the destination tab first so re-running this (e.g. after the source data grew)
-// never stacks a second pivot table or errors on "cell already contains a pivot table" — safe to click
-// as many times as wanted.
+// never stacks a second pivot table or errors on "cell already contains a pivot table" — safe to run
+// as many times as it likes, which matters since putTab below calls this automatically on every Raw
+// Material In save, not from a button. Returns {skipped: true} rather than throwing when there's
+// nothing to pivot yet (an empty/just-cleared register) — a normal, expected state, not a failure.
 const RAW_MATERIAL_PIVOT_TAB_NAME = 'Raw Material Pivot';
-async function createRawMaterialPivotHandler(req, res) {
-  try {
-    const sheets = getSheetsClient();
-    const spreadsheetId = getSpreadsheetId();
-    const sourceTabName = sanitizeTabName('fims_raw_material_in');
-    const destTabName = sanitizeTabName(RAW_MATERIAL_PIVOT_TAB_NAME);
-    const meta = await getSheetMeta(sheets, spreadsheetId);
-    const sourceMeta = meta[sourceTabName];
-    if (!sourceMeta) return res.status(400).json({ error: 'Raw Material In has no data yet — upload at least one mill slip first.' });
+async function rebuildRawMaterialPivot() {
+  const sheets = getSheetsClient();
+  const spreadsheetId = getSpreadsheetId();
+  const sourceTabName = sanitizeTabName('fims_raw_material_in');
+  const destTabName = sanitizeTabName(RAW_MATERIAL_PIVOT_TAB_NAME);
+  const meta = await getSheetMeta(sheets, spreadsheetId);
+  const sourceMeta = meta[sourceTabName];
+  if (!sourceMeta) return { skipped: true, reason: 'no-source-tab' };
 
-    const headerResp = await sheets.spreadsheets.values.get({
-      spreadsheetId, range: wholeSheetRangeA1(sourceTabName, { rowCount: 1, columnCount: sourceMeta.columnCount }),
-    });
-    const header = (headerResp.data.values && headerResp.data.values[0]) || [];
-    const sizeIdx = header.indexOf('size');
-    const gsmIdx = header.indexOf('gsm');
-    const weightIdx = header.indexOf('weight_kg');
-    const dateIdx = header.indexOf('date');
-    if (sizeIdx === -1 || gsmIdx === -1) {
-      return res.status(400).json({ error: 'Raw Material In tab is missing its size/gsm columns — nothing to build a pivot from yet.' });
-    }
+  const headerResp = await sheets.spreadsheets.values.get({
+    spreadsheetId, range: wholeSheetRangeA1(sourceTabName, { rowCount: 1, columnCount: sourceMeta.columnCount }),
+  });
+  const header = (headerResp.data.values && headerResp.data.values[0]) || [];
+  const sizeIdx = header.indexOf('size');
+  const gsmIdx = header.indexOf('gsm');
+  const weightIdx = header.indexOf('weight_kg');
+  const dateIdx = header.indexOf('date');
+  if (sizeIdx === -1 || gsmIdx === -1) return { skipped: true, reason: 'no-data' };
 
-    if (meta[destTabName]) {
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: { requests: [{ deleteSheet: { sheetId: meta[destTabName].sheetId } }] },
-      });
-    }
-    const addResp = await sheets.spreadsheets.batchUpdate({
-      spreadsheetId,
-      requestBody: { requests: [{ addSheet: { properties: { title: destTabName } } }] },
-    });
-    const destSheetId = addResp.data.replies[0].addSheet.properties.sheetId;
-
-    const values = [{
-      pivotTable: {
-        source: {
-          sheetId: sourceMeta.sheetId,
-          startRowIndex: 0,
-          startColumnIndex: 0,
-          endRowIndex: sourceMeta.rowCount,
-          endColumnIndex: sourceMeta.columnCount,
-        },
-        rows: [
-          { sourceColumnOffset: sizeIdx, showTotals: true, sortOrder: 'ASCENDING' },
-          { sourceColumnOffset: gsmIdx, showTotals: true, sortOrder: 'ASCENDING' },
-        ],
-        values: [
-          { summarizeFunction: 'SUM', sourceColumnOffset: weightIdx, name: 'Total Weight (kg)' },
-          { summarizeFunction: 'COUNTA', sourceColumnOffset: dateIdx !== -1 ? dateIdx : sizeIdx, name: 'Entries' },
-        ],
-        valueLayout: 'HORIZONTAL',
-      },
-    }];
+  if (meta[destTabName]) {
     await sheets.spreadsheets.batchUpdate({
       spreadsheetId,
-      requestBody: {
-        requests: [{
-          updateCells: {
-            rows: [{ values }],
-            start: { sheetId: destSheetId, rowIndex: 0, columnIndex: 0 },
-            fields: 'pivotTable',
-          },
-        }],
-      },
+      requestBody: { requests: [{ deleteSheet: { sheetId: meta[destTabName].sheetId } }] },
     });
-    res.json({ ok: true, tabName: destTabName });
+  }
+  const addResp = await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: { requests: [{ addSheet: { properties: { title: destTabName } } }] },
+  });
+  const destSheetId = addResp.data.replies[0].addSheet.properties.sheetId;
+
+  const values = [{
+    pivotTable: {
+      source: {
+        sheetId: sourceMeta.sheetId,
+        startRowIndex: 0,
+        startColumnIndex: 0,
+        endRowIndex: sourceMeta.rowCount,
+        endColumnIndex: sourceMeta.columnCount,
+      },
+      rows: [
+        { sourceColumnOffset: sizeIdx, showTotals: true, sortOrder: 'ASCENDING' },
+        { sourceColumnOffset: gsmIdx, showTotals: true, sortOrder: 'ASCENDING' },
+      ],
+      values: [
+        { summarizeFunction: 'SUM', sourceColumnOffset: weightIdx, name: 'Total Weight (kg)' },
+        { summarizeFunction: 'COUNTA', sourceColumnOffset: dateIdx !== -1 ? dateIdx : sizeIdx, name: 'Entries' },
+      ],
+      valueLayout: 'HORIZONTAL',
+    },
+  }];
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [{
+        updateCells: {
+          rows: [{ values }],
+          start: { sheetId: destSheetId, rowIndex: 0, columnIndex: 0 },
+          fields: 'pivotTable',
+        },
+      }],
+    },
+  });
+  return { tabName: destTabName };
+}
+
+// Manual-trigger endpoint, kept as a fallback/debug path (e.g. to force a rebuild without a new save)
+// even though nothing in the app's UI calls it — the pivot now rebuilds automatically, see putTab.
+async function createRawMaterialPivotHandler(req, res) {
+  try {
+    const result = await rebuildRawMaterialPivot();
+    if (result.skipped) {
+      return res.status(400).json({ error: 'Raw Material In has no size/gsm data yet — upload at least one mill slip first.' });
+    }
+    res.json({ ok: true, ...result });
   } catch (e) {
     console.error('Create raw material pivot error:', e);
     res.status(502).json({ error: friendlyGoogleError(e) });
