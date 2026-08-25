@@ -91,14 +91,18 @@ function sanitizeTabName(name) {
   return base.slice(0, 31);
 }
 
-// One read call that returns each tab's title AND its current allocated grid size
-// (rowCount/columnCount). The grid size is what makes it possible to "clear" a tab's stale content
-// in the SAME call as writing new data (see writeValuesClearingStale below), instead of a separate
-// values.clear call — cutting every save from 2-3 write requests down to 1.
+// One read call that returns each tab's title, its current allocated grid size (rowCount/
+// columnCount), AND any native Sheets "Table" objects (the filterable-range feature, Insert > Table
+// — distinct from a pivot table) someone has manually drawn on it. The grid size is what makes it
+// possible to "clear" a tab's stale content in the SAME call as writing new data (see
+// writeValuesClearingStale below), instead of a separate values.clear call — cutting every save from
+// 2-3 write requests down to 1. The `tables` list is what lets writeTab keep a person's own Table
+// object in sync with the data instead of leaving it to cover only however many rows existed when
+// they first drew it, with every row added afterwards sitting unformatted below it.
 async function getSheetMeta(sheets, spreadsheetId) {
   const meta = await sheets.spreadsheets.get({
     spreadsheetId,
-    fields: 'sheets.properties(sheetId,title,gridProperties(rowCount,columnCount))',
+    fields: 'sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)),tables(tableId,name,range))',
   });
   const byTitle = {};
   (meta.data.sheets || []).forEach(s => {
@@ -106,9 +110,40 @@ async function getSheetMeta(sheets, spreadsheetId) {
       sheetId: s.properties.sheetId,
       rowCount: (s.properties.gridProperties && s.properties.gridProperties.rowCount) || 1000,
       columnCount: (s.properties.gridProperties && s.properties.gridProperties.columnCount) || 26,
+      tables: s.tables || [],
     };
   });
   return byTitle;
+}
+
+// Extends (or shrinks) every native Table object on this tab so its range exactly covers the data
+// just written — header row plus all data rows, no more and no less. Without this, a Table someone
+// draws over an initial batch of rows stays frozen at that original size forever: every row the app
+// adds afterwards lands below the table's bottom edge, unformatted and outside its filters, which is
+// exactly what was found on fims_raw_material_in (a ~38-row Table with every later reel sitting below
+// it, invisible to the Table's own filter/sort UI). Skipped entirely (no extra API call) when the tab
+// has no Table object, and skipped when a Table's range already matches (nothing to sync) — so a save
+// to a tab nobody has drawn a Table on still costs exactly the one write call writeTab is built around.
+async function syncTableRanges(sheets, spreadsheetId, tabMeta, rowCount, colCount) {
+  const tables = (tabMeta && tabMeta.tables) || [];
+  if (!tables.length) return;
+  const requests = tables
+    .filter(t => t.range && t.range.sheetId === tabMeta.sheetId)
+    .filter(t => {
+      const r = t.range;
+      return r.startRowIndex !== 0 || r.startColumnIndex !== 0 || r.endRowIndex !== rowCount || r.endColumnIndex !== colCount;
+    })
+    .map(t => ({
+      updateTable: {
+        table: {
+          tableId: t.tableId,
+          range: { sheetId: tabMeta.sheetId, startRowIndex: 0, startColumnIndex: 0, endRowIndex: rowCount, endColumnIndex: colCount },
+        },
+        fields: 'range',
+      },
+    }));
+  if (!requests.length) return;
+  await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests } });
 }
 
 // Converts a 1-based column number to its A1 letter(s) (1 -> A, 26 -> Z, 27 -> AA, ...).
@@ -205,7 +240,9 @@ async function readTab(tabKey) {
 // Overwrites a tab's entire contents with `rows` — matches the artifact's original storage
 // semantics exactly (window.storage.set always wrote the full current array, never an incremental
 // diff), so the frontend's save logic needed no restructuring, just a different destination.
-// Costs exactly ONE write call (plus one more, only the first time a given tab is created).
+// Costs exactly ONE write call (plus one more, only the first time a given tab is created, and one
+// more still if the tab has a native Table object whose range needs to grow/shrink to match — see
+// syncTableRanges, which itself costs nothing extra when there's no Table or it's already in sync).
 async function writeTab(tabKey, rows) {
   const sheets = getSheetsClient();
   const spreadsheetId = getSpreadsheetId();
@@ -222,6 +259,7 @@ async function writeTab(tabKey, rows) {
   const header = keys.includes('id') ? ['id', ...keys.filter(k => k !== 'id')] : keys;
   const values = [header, ...rows.map(r => header.map(k => (r[k] === undefined || r[k] === null) ? '' : String(r[k])))];
   await writeValuesClearingStale(sheets, spreadsheetId, tabName, values, gridSize);
+  await syncTableRanges(sheets, spreadsheetId, gridSize, values.length, header.length);
 }
 
 // Writes a tab as a stack of titled tables — one block per item, each block being a title row, a

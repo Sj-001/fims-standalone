@@ -493,8 +493,33 @@ function normalizeDateToDots(raw) {
       return `${Number(m[1])}.${monthNum}.${yy}`;
     }
   }
+  // Slash + month-abbreviation ("24/Jul/2026") — confirmed directly: this exact format let the same
+  // physical reel get entered into Raw Material In twice, once as "24.7.26" and once as "24/Jul/2026",
+  // since a format this normalizer didn't recognize passed through untouched and never matched the
+  // dot-formatted version by rowDedupKey's exact-string comparison.
+  m = s.match(/^(\d{1,2})\/([A-Za-z]{3})\/(\d{2,4})$/);
+  if (m) {
+    const monthNum = MONTH_ABBR_TO_NUM[m[2].toLowerCase()];
+    if (monthNum) {
+      const yy = m[3].length > 2 ? m[3].slice(-2) : m[3];
+      return `${Number(m[1])}.${monthNum}.${yy}`;
+    }
+  }
   // Unrecognized format — don't guess, leave untouched.
   return s;
+}
+// Collapses a numeric-looking string down to its plain numeric form — "59.50" -> "59.5", "140.0" ->
+// "140" — so the SAME real size/GSM written with a different number of trailing zero decimals is
+// stored as the exact same string everywhere, not just compared loosely downstream. Applied at
+// extraction shape() time (mill_slip, consumption_sheet) so the inconsistency is never created in the
+// first place — matching normalizeDateToDots's approach. Non-numeric input (blank, illegible) passes
+// through unchanged rather than being coerced to "0".
+function normalizeNumericStr(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return s;
+  const n = parseFloat(s);
+  if (Number.isNaN(n)) return s;
+  return String(n);
 }
 // Real chronological ordering for D.M.YY / D.M.YYYY dot-formatted dates. A plain string compare
 // (what the ledger sort used before) sorts "11.8.26" before "3.8.26" because '1' < '3' character by
@@ -561,7 +586,7 @@ IMPORTANT — column format varies between mills, read carefully:
       // consumed starts empty on purpose — it's a placeholder for a future feature that matches this
       // reel/slip against consumption reports and records the date it actually got used up; nothing
       // populates it yet, so every fresh row just carries the field so it exists to edit/fill by hand.
-      return raw.items.map(it => ({ id: genId(), date: normalizeDateToDots(raw.date || ''), mill: raw.mill || '', reel_no: it.reel_no || '', size: it.size || '', unit: it.unit || '', gsm: it.gsm || '', bf: it.bf || '', shade: it.shade || '', weight_kg: num(it.weight_kg), consumed: '' }));
+      return raw.items.map(it => ({ id: genId(), date: normalizeDateToDots(raw.date || ''), mill: raw.mill || '', reel_no: it.reel_no || '', size: normalizeNumericStr(it.size), unit: it.unit || '', gsm: normalizeNumericStr(it.gsm), bf: normalizeNumericStr(it.bf), shade: it.shade || '', weight_kg: num(it.weight_kg), consumed: '' }));
     },
   },
   {
@@ -575,6 +600,7 @@ IMPORTANT:
 - SKIP TRULY BLANK LINES. This sheet is pre-ruled with a fixed number of numbered SL.NO. slots/columns, and it is completely normal for a real day's report to only fill in the first several and leave the rest of the printed grid blank. A line that has ONLY a pre-printed SL.NO. with no shade, no GSM, no size, and no weight actually written on it is not a row of data — do not output an item for it. Only extract a line that has genuine handwritten content in it.
 - SL.NO IS YOUR ROW-ALIGNMENT ANCHOR. This sheet's rows are frequently laid out as narrow vertical strips (SL.NO increasing left-to-right or in whatever direction the page actually runs) with every strip looking nearly identical (same date, same shade, similar GSM) — the kind of layout where it's extremely easy for a value to silently slide into the wrong row. To prevent that: for EACH row, first locate its SL.NO in the image, then read every other field (shade, GSM, size, weight, leftover) from that exact same physical strip/line — never from a neighboring one — before moving to the next SL.NO. After you've extracted every row, check your own output: the sl_no values you produced should appear once each, in the same order they run on the page, with no duplicates and no unexplained gaps. If you notice a duplicate or out-of-sequence SL.NO in what you were about to return, that is a sign a value drifted between rows — go back and re-read those specific rows from the image before finalizing, rather than submitting a duplicated or skipped row.
 - WEIGHT vs. LEFTOVER — these are two DIFFERENT numbers with two different meanings, never the same value: "weight_consumed" (वजन) is the reel's own original total weight, exactly as it was recorded when that reel first arrived — it identifies WHICH reel this row is about, it is not how much was used today. "leftover_weight" (टुकड़ा) is how much of that reel is left over/remaining after this — genuinely optional, only present when the row actually has a value written in that column (a reel that got fully used up has nothing written there).
+- LEFTOVER/TUKDA IS THE COLUMN MOST LIKELY TO DRIFT BETWEEN ROWS — it's usually blank for most rows and only has a handwritten value here and there, which makes it easy to accidentally attach the one value you DO see to the wrong nearby row instead of leaving the blank ones blank. Before including a leftover_weight for a row, re-confirm it is physically written on THAT row's own strip/line, at THAT row's SL.NO, not just "somewhere near it" or "the closest number below it." If you are not fully certain which row a leftover figure belongs to, omit leftover_weight for that row entirely rather than guessing — an omitted value is far less harmful than one attached to the wrong reel, which would misidentify which physical reel gets marked as used up.
 - The column that looks like it's labeled "S/K" is actually the SHADE column, not a party name or code. Decode its handwritten values: "S.K" or "SK" means shade NS (Sada Kraft / natural shade). "G.Y" or "GY" means shade GY (Golden Yellow). If you see a different value you don't recognize, copy it as written rather than forcing it into NS or GY.
 - There is no BF field on this document — do not invent one. What might look like a stray extra column is the Size column.
 - CROSSED-OUT / CORRECTED VALUES: this is a real working register — a number is sometimes struck through with the corrected number written right next to it in that same row. Use only the number that is NOT crossed out; ignore the struck-through one entirely. This stays within one row — never borrow a number from the row above or below because a cell looks messy.
@@ -583,7 +609,7 @@ IMPORTANT:
     shape: (raw) => {
       if (!raw || !Array.isArray(raw.items)) return [];
       const rows = raw.items.map(it => ({
-        id: genId(), sl_no: it.sl_no != null ? String(it.sl_no) : '', date: normalizeDateToDots(it.date_override || raw.date || ''), shade: it.shade || '', size: it.size || '', gsm: it.gsm || '',
+        id: genId(), sl_no: it.sl_no != null ? String(it.sl_no) : '', date: normalizeDateToDots(it.date_override || raw.date || ''), shade: it.shade || '', size: normalizeNumericStr(it.size), gsm: normalizeNumericStr(it.gsm),
         weight_consumed: num(it.weight_consumed),
         leftover_weight: it.leftover_weight === '' || it.leftover_weight == null ? '' : num(it.leftover_weight),
         flagged: !!(it.flag && String(it.flag).trim()), flagReason: (it.flag || '').trim(),
@@ -1489,55 +1515,47 @@ function FIMSApp() {
       setSheetTabsBusy(false);
     }
   };
-  // --- Date-format cleanup (Settings tab): normalizeDateToDots (above) runs on every FRESH
-  // extraction, but a row that entered the ledger before a normalizer bug was fixed, or was typed/
-  // edited by hand, can still be sitting there in the wrong shape (e.g. "23.07.2026" next to "12.4.26"
-  // in the same register). One-time, on-demand sweep — not automatic on every load — since it's a
-  // retroactive cleanup for already-bad data, not an ongoing need once the root cause is fixed.
-  const DATE_FIELD_REGISTERS = {
-    rawMaterialIn: ['date'], consumption: ['date'], production: ['date'], customerDispatch: ['date'],
-    daburPO: ['date', 'delivery_date'], daburDispatch: ['date'],
+  // --- Date & numeric-format self-healing sweep: normalizeDateToDots/normalizeNumericStr (above) run
+  // on every FRESH extraction, but a row that entered a register before a normalizer bug was fixed, or
+  // was typed/edited by hand, can still be sitting there in the wrong shape (e.g. "23.07.2026" next to
+  // "12.4.26", or "59.50" next to "59.5", in the same register). Runs automatically on every load and
+  // on every register change — no manual button — same self-healing pattern as the consumption↔raw
+  // material matching effect below: a row already in canonical form is never rewritten again, so this
+  // can never loop or fight a person's own in-progress edit.
+  const NORMALIZE_FIELD_REGISTERS = {
+    rawMaterialIn: { date: normalizeDateToDots, size: normalizeNumericStr, gsm: normalizeNumericStr, bf: normalizeNumericStr },
+    consumption: { date: normalizeDateToDots, size: normalizeNumericStr, gsm: normalizeNumericStr },
+    production: { date: normalizeDateToDots },
+    customerDispatch: { date: normalizeDateToDots },
+    daburPO: { date: normalizeDateToDots, delivery_date: normalizeDateToDots },
+    daburDispatch: { date: normalizeDateToDots },
   };
-  const [dateFixBusy, setDateFixBusy] = useState(false);
-  const [dateFixMessage, setDateFixMessage] = useState('');
-  const normalizeAllDates = async () => {
-    setDateFixBusy(true); setDateFixMessage('');
-    try {
-      let totalFixed = 0;
-      const perRegister = [];
-      for (const [registerKey, fields] of Object.entries(DATE_FIELD_REGISTERS)) {
-        const rows = registerState[registerKey] || [];
-        let changedInThisRegister = 0;
-        const next = rows.map(r => {
-          const patched = { ...r };
-          let rowChanged = false;
-          fields.forEach(f => {
-            const normalized = normalizeDateToDots(r[f]);
-            if (normalized !== (r[f] || '')) { patched[f] = normalized; rowChanged = true; }
-          });
-          if (rowChanged) changedInThisRegister++;
-          return patched;
+  useEffect(() => {
+    Object.entries(NORMALIZE_FIELD_REGISTERS).forEach(([registerKey, fieldNormalizers]) => {
+      const rows = registerState[registerKey] || [];
+      if (!rows.length) return;
+      let changed = false;
+      const next = rows.map(r => {
+        let patched = null;
+        Object.entries(fieldNormalizers).forEach(([field, normalize]) => {
+          const current = r[field] || '';
+          const normalized = normalize(current);
+          if (normalized !== current) { patched = patched || { ...r }; patched[field] = normalized; }
         });
-        if (changedInThisRegister > 0) {
-          registerSetters[registerKey](next);
-          await saveRegister(STORAGE_KEYS[registerKey], next);
-          totalFixed += changedInThisRegister;
-          perRegister.push(`${changedInThisRegister} in ${registerKey}`);
-        }
+        if (patched) changed = true;
+        return patched || r;
+      });
+      if (changed) {
+        registerSetters[registerKey](next);
+        persist(registerKey, next);
       }
-      setDateFixMessage(totalFixed ? `Fixed ${totalFixed} row(s): ${perRegister.join(', ')}.` : 'Every date was already consistent — nothing to fix.');
-    } catch (e) {
-      setDateFixMessage(`Something went wrong partway through (${e.message || 'unknown error'}) — safe to run again, it only touches rows that still need it.`);
-    } finally {
-      setDateFixBusy(false);
-    }
-  };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rawMaterialIn, consumption, production, customerDispatch, daburPO, daburDispatch]);
   // --- Raw Material Register view: filter dropdowns narrow the per-size tables down to one size
   // and/or one GSM at a time, without summing anything.
   const [rmSizeFilter, setRmSizeFilter] = useState('');
   const [rmGsmFilter, setRmGsmFilter] = useState('');
-  const [cmSizeFilter, setCmSizeFilter] = useState('');
-  const [cmGsmFilter, setCmGsmFilter] = useState('');
   const updateRow = (registerKey) => (id, field, value) => {
     registerSetters[registerKey](prev => {
       const next = prev.map(r => r.id === id ? { ...r, [field]: value } : r);
@@ -1990,10 +2008,12 @@ function FIMSApp() {
   // size gets its own page). Deliberately NOT summed the way balanceRows above is — every individual
   // mill-slip line item stays its own row; grouping only changes which table it's displayed in, never
   // the data itself. Row order within a group is left to EditableTable's own date sort (its default),
-  // rather than sorted here too, to avoid sorting the same rows twice.
+  // rather than sorted here too, to avoid sorting the same rows twice. Excludes consumed rows — this
+  // is "what's still in stock," not the full history; the underlying rawMaterialIn array (and the
+  // fims_raw_material_in Sheet tab) still has every row forever, this view just doesn't show them.
   const rawMaterialBySize = (() => {
     const groups = {};
-    rawMaterialIn.forEach(r => {
+    rawMaterialIn.filter(r => !r.consumed).forEach(r => {
       const raw = (r.size || '').trim();
       const n = parseFloat(raw);
       // Collapse an all-zero decimal tail ("62.00" -> "62") so it groups with plain "62" instead of
@@ -2010,9 +2030,10 @@ function FIMSApp() {
         return a.size.localeCompare(b.size, undefined, { numeric: true });
       });
   })();
-  // Distinct GSM values present, for the filter dropdown below — sorted numerically the same way
-  // sizes are, so "100" doesn't land before "62" the way a plain string sort would.
-  const rawMaterialGsmOptions = Array.from(new Set(rawMaterialIn.map(r => (r.gsm || '').trim()).filter(Boolean)))
+  // Distinct GSM values present among UNCONSUMED stock, for the filter dropdown below — sorted
+  // numerically the same way sizes are, so "100" doesn't land before "62" the way a plain string sort
+  // would.
+  const rawMaterialGsmOptions = Array.from(new Set(rawMaterialIn.filter(r => !r.consumed).map(r => (r.gsm || '').trim()).filter(Boolean)))
     .sort((a, b) => {
       const na = parseFloat(a), nb = parseFloat(b);
       if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
@@ -2024,6 +2045,43 @@ function FIMSApp() {
     .filter(g => !rmSizeFilter || g.size === rmSizeFilter)
     .map(g => ({ ...g, rows: rmGsmFilter ? g.rows.filter(r => (r.gsm || '').trim() === rmGsmFilter) : g.rows }))
     .filter(g => g.rows.length > 0);
+  // --- Raw Material In duplicate-reel merge: rowDedupKey (via addRows) only stops a NEW row from
+  // being added on top of an identical EXISTING one — it can't undo damage from before a date/number
+  // normalizer bug was fixed, when the same physical reel got written twice under two different-
+  // looking strings that only became identical after normalization (confirmed directly: a
+  // "24.7.26"/"24/Jul/2026" pair for the same reel, invisible to the date-format bug that let it
+  // through, only converges once the format fix above runs). Self-healing merge, not a one-time
+  // cleanup: groups by every real identity field EXCEPT `consumed` — a genuine duplicate reel can have
+  // one copy marked consumed and the other not (that's the bug itself, not a reason to treat them as
+  // two different reels) — and collapses each group down to ONE row, preferring whichever copy
+  // already has `consumed` set (the more complete, more recently-confirmed information) over a still-
+  // unconsumed copy. Runs off the same `rawMaterialIn` the format-normalize effect above also writes
+  // to, so a pair that needs BOTH a format fix and a merge resolves automatically over two passes —
+  // no ordering dependency between the two effects to get right.
+  useEffect(() => {
+    if (rawMaterialIn.length < 2) return;
+    const groups = new Map();
+    rawMaterialIn.forEach(r => {
+      const key = Object.keys(r)
+        .filter(k => !['id', 'consumed', 'stockConfirmed', 'confirmedCustomer', 'flagged', 'flagReason'].includes(k))
+        .sort()
+        .map(k => `${k}=${String(r[k] ?? '').trim().toLowerCase()}`)
+        .join('|');
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    });
+    let mergedAny = false;
+    const next = [];
+    groups.forEach(rowsInGroup => {
+      if (rowsInGroup.length === 1) { next.push(rowsInGroup[0]); return; }
+      mergedAny = true;
+      next.push(rowsInGroup.find(r => r.consumed) || rowsInGroup[0]);
+    });
+    if (mergedAny) {
+      setRawMaterialIn(next);
+      persist('rawMaterialIn', next);
+    }
+  }, [rawMaterialIn]);
   // Matches each Consumption row against the ONE Raw Material In reel it's about — size + GSM + the
   // "wajan" weight together, since "wajan" is that reel's own original total weight (a lookup key, not
   // an amount used up), and an exact weight is effectively unique per physical reel. On a match: dates
@@ -2092,38 +2150,32 @@ function FIMSApp() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [consumption, rawMaterialIn]);
-  // Consumed Material: a filtered VIEW of rawMaterialIn (rows with `consumed` set), never a separate
-  // register — the Sheet tab (fims_raw_material_in) never has rows removed, only consumed filled in, so
-  // reading it back this way keeps the app and the Sheet describing exactly the same underlying data.
-  const consumedMaterialBySize = (() => {
-    const groups = {};
-    rawMaterialIn.filter(r => r.consumed).forEach(r => {
-      const raw = (r.size || '').trim();
-      const n = parseFloat(raw);
-      const size = raw ? (Number.isNaN(n) ? raw : String(n)) : '(no size)';
-      (groups[size] = groups[size] || []).push(r);
-    });
-    return Object.entries(groups)
-      .map(([size, rows]) => ({ size, rows }))
-      .sort((a, b) => {
-        const na = parseFloat(a.size), nb = parseFloat(b.size);
-        if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
-        return a.size.localeCompare(b.size, undefined, { numeric: true });
-      });
-  })();
-  const unmatchedConsumptionRows = consumption.filter(r => r.matchStatus === 'unmatched');
-  // Consumed Material's own Size/GSM filter — separate state from Inward Entries' since they're
-  // different tables a person filters independently.
-  const consumedMaterialGsmOptions = Array.from(new Set(rawMaterialIn.filter(r => r.consumed).map(r => (r.gsm || '').trim()).filter(Boolean)))
-    .sort((a, b) => {
-      const na = parseFloat(a), nb = parseFloat(b);
-      if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
-      return a.localeCompare(b, undefined, { numeric: true });
-    });
-  const consumedMaterialGroupsFiltered = consumedMaterialBySize
-    .filter(g => !cmSizeFilter || g.size === cmSizeFilter)
-    .map(g => ({ ...g, rows: cmGsmFilter ? g.rows.filter(r => (r.gsm || '').trim() === cmGsmFilter) : g.rows }))
-    .filter(g => g.rows.length > 0);
+  // Manual match: for a consumption row the automatic matcher couldn't resolve, lets a person pick
+  // which unconsumed Raw Material In reel it's actually about — same effect as if the automatic match
+  // had found it (dates that reel's `consumed`, creates a leftover row if leftover_weight is set), just
+  // triggered by hand instead of by an exact size/gsm/weight match. Candidate dropdown, keyed by the
+  // consumption row's id, is separate per-row state since several rows can be mid-pick at once.
+  const [manualMatchPicks, setManualMatchPicks] = useState({});
+  const manuallyMatchConsumptionRow = (consumptionRowId, rawMaterialRowId) => {
+    const cRow = consumption.find(r => r.id === consumptionRowId);
+    const rRow = rawMaterialIn.find(r => r.id === rawMaterialRowId);
+    if (!cRow || !rRow) return;
+    const nextConsumption = consumption.map(r => r.id === consumptionRowId ? { ...r, matchStatus: 'matched', matchedRawMaterialId: rawMaterialRowId } : r);
+    setConsumption(nextConsumption);
+    persist('consumption', nextConsumption);
+    const leftover = num(cRow.leftover_weight);
+    const leftoverRows = leftover > 0 ? [{
+      id: genId(), date: cRow.date, mill: rRow.mill, reel_no: rRow.reel_no, size: rRow.size,
+      unit: rRow.unit, gsm: rRow.gsm, bf: rRow.bf, shade: rRow.shade, weight_kg: leftover, consumed: '',
+    }] : [];
+    const nextRawMaterial = [
+      ...rawMaterialIn.map(r => r.id === rawMaterialRowId ? { ...r, consumed: cRow.date } : r),
+      ...leftoverRows,
+    ];
+    setRawMaterialIn(nextRawMaterial);
+    persist('rawMaterialIn', nextRawMaterial);
+    setManualMatchPicks(prev => { const next = { ...prev }; delete next[consumptionRowId]; return next; });
+  };
   /* -------- dabur PO pending calc -------- */
   const PO_TOLERANCE = 0.10; // ±10% — a PO counts as fulfilled once dispatched qty reaches 90% of ordered qty
   const daburPOWithPending = daburPO.map(po => {
@@ -3777,47 +3829,82 @@ function FIMSApp() {
             <div>
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Consumption</h2>
-                <p className="subtitle">Daily Consumption Reports and what they matched against in the Raw Material Register. Matching runs automatically by Size + GSM + Weight — see Consumed Material below for the result.</p>
+                <p className="subtitle">Every row extracted from a Daily Consumption Report. Matching against the Raw Material Register runs automatically by Size + GSM + Weight — that fills in "Consumed" on the matching reel in Inward Entries, nothing is deleted from there. A row the automatic matcher can't resolve shows "Unmatched" with a dropdown here to pick the reel by hand.</p>
               </div>
               <div className="panel">
                 <div className="panel-header">
-                  <div><h2>Consumed Material</h2><p className="subtitle">Raw Material In entries matched against a Daily Consumption Report — matched by Size + GSM + Weight, since that combination identifies one specific reel. These rows are the same underlying entries as the Raw Material Register's Inward Entries (nothing is duplicated or removed from there — "Consumed" just gets filled in), shown here separately so what's left in stock is easy to tell apart from what's already used.</p></div>
-                  <button className="btn btn-ghost" onClick={() => exportSheet('Consumed_Material', rawMaterialIn.filter(r => r.consumed), COLUMNS.rawMaterialIn)}><Download size={15} /> Export</button>
+                  <div><h2>Consumption Entries (from daily reports)</h2></div>
+                  <button className="btn btn-ghost" onClick={() => exportSheet('Consumption', consumption, COLUMNS.consumption)}><Download size={15} /> Export</button>
                 </div>
-                {!!unmatchedConsumptionRows.length && (
-                  <div style={{ marginBottom: 20 }}>
-                    <div className="section-label" style={{ color: 'var(--ledger-red)' }}>{unmatchedConsumptionRows.length} consumption row{unmatchedConsumptionRows.length === 1 ? '' : 's'} not matched to any reel</div>
-                    <p className="subtitle" style={{ marginBottom: 8 }}>No unconsumed row in the Raw Material Register shares this row's exact size, GSM, and weight. Fix a typo here (or on the matching reel in Inward Entries) and it'll match automatically — no re-check needed.</p>
-                    <EditableTable columns={COLUMNS.consumption} rows={unmatchedConsumptionRows}
-                      onUpdate={updateRow('consumption')} onDelete={deleteRow('consumption')} sortByDate={false} />
+                {!consumption.length && <div className="empty-state">No entries yet.</div>}
+                {!!consumption.length && (
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          {COLUMNS.consumption.map(c => <th key={c.key}>{c.label}</th>)}
+                          <th>Match</th>
+                          <th className="col-action"></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[...consumption].sort((a, b) => {
+                          const dateCmp = dateSortKey(a.date).localeCompare(dateSortKey(b.date));
+                          if (dateCmp !== 0) return dateCmp;
+                          const na = parseFloat(a.sl_no), nb = parseFloat(b.sl_no);
+                          if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+                          return String(a.sl_no ?? '').localeCompare(String(b.sl_no ?? ''), undefined, { numeric: true });
+                        }).map(row => {
+                          const matched = row.matchStatus === 'matched';
+                          const matchedReel = matched ? rawMaterialIn.find(r => r.id === row.matchedRawMaterialId) : null;
+                          // Candidate reels for a manual pick: unconsumed, same numeric size as this consumption
+                          // row — narrows the dropdown to plausible reels instead of listing all of stock.
+                          const candidates = matched ? [] : rawMaterialIn
+                            .filter(r => !r.consumed && num(r.size) === num(row.size))
+                            .sort((a, b) => num(a.gsm) - num(b.gsm) || num(a.weight_kg) - num(b.weight_kg));
+                          return (
+                            <tr key={row.id}>
+                              {COLUMNS.consumption.map(c => (
+                                <td key={c.key}>
+                                  <input className="cell-input" type={c.type === 'number' ? 'number' : 'text'}
+                                    value={row[c.key] ?? ''}
+                                    onChange={(e) => updateRow('consumption')(row.id, c.key, e.target.value)} />
+                                </td>
+                              ))}
+                              <td>
+                                {matched ? (
+                                  <span className="pill pill-ok" title={matchedReel ? `Matched to ${matchedReel.mill || 'reel'} dated ${matchedReel.date}` : 'Matched'}>
+                                    Matched{matchedReel ? ` — ${matchedReel.mill}` : ''}
+                                  </span>
+                                ) : (
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                    <span className="pill pill-warn">Unmatched</span>
+                                    <select className="doc-select" style={{ width: 210, marginBottom: 0 }}
+                                      value={manualMatchPicks[row.id] || ''}
+                                      onChange={(e) => setManualMatchPicks(prev => ({ ...prev, [row.id]: e.target.value }))}>
+                                      <option value="">Pick a reel...</option>
+                                      {candidates.map(c => (
+                                        <option value={c.id} key={c.id}>{c.mill || 'Mill?'} · {c.size}/{c.gsm}gsm · {c.weight_kg}kg · {c.date}</option>
+                                      ))}
+                                    </select>
+                                    <button className="btn btn-ghost" disabled={!manualMatchPicks[row.id]}
+                                      onClick={() => manuallyMatchConsumptionRow(row.id, manualMatchPicks[row.id])}>Match</button>
+                                  </div>
+                                )}
+                              </td>
+                              <td className="col-action">
+                                <button className="icon-btn danger" title="Delete row" onClick={() => deleteRow('consumption')(row.id)}>
+                                  <Trash2 size={15} />
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
                   </div>
                 )}
-                {!rawMaterialIn.some(r => r.consumed) && <div className="empty-state">Nothing consumed yet — matches appear here automatically once a Daily Consumption Report is confirmed.</div>}
-                {rawMaterialIn.some(r => r.consumed) && (
-                  <div className="field-row" style={{ marginBottom: 14 }}>
-                    <select className="doc-select" style={{ width: 160, marginBottom: 0 }} value={cmSizeFilter} onChange={e => setCmSizeFilter(e.target.value)}>
-                      <option value="">All sizes</option>
-                      {consumedMaterialBySize.map(g => <option value={g.size} key={g.size}>Size {g.size}</option>)}
-                    </select>
-                    <select className="doc-select" style={{ width: 160, marginBottom: 0 }} value={cmGsmFilter} onChange={e => setCmGsmFilter(e.target.value)}>
-                      <option value="">All GSM</option>
-                      {consumedMaterialGsmOptions.map(g => <option value={g} key={g}>GSM {g}</option>)}
-                    </select>
-                    {(cmSizeFilter || cmGsmFilter) && (
-                      <button className="btn btn-ghost" onClick={() => { setCmSizeFilter(''); setCmGsmFilter(''); }}>Clear filters</button>
-                    )}
-                  </div>
-                )}
-                {consumedMaterialGroupsFiltered.map(group => (
-                  <div key={group.size} style={{ marginBottom: 20 }}>
-                    <div style={{ marginBottom: 6 }}><strong>Size {group.size}</strong></div>
-                    <EditableTable columns={RAW_MATERIAL_SIZE_COLUMNS} rows={group.rows}
-                      onUpdate={updateRow('rawMaterialIn')} onDelete={deleteRow('rawMaterialIn')} />
-                  </div>
-                ))}
               </div>
-              <RegisterPanel title="Consumption Entries (from daily reports)" columns={COLUMNS.consumption} rows={consumption}
-                onUpdate={updateRow('consumption')} onDelete={deleteRow('consumption')} onExport={() => exportSheet('Consumption', consumption, COLUMNS.consumption)} />
             </div>
           )}
           {loaded && activeTab === 'production' && (
@@ -4507,12 +4594,8 @@ function FIMSApp() {
               </div>
               <div className="panel">
                 <div className="panel-header">
-                  <div><h2>Date Formatting</h2><p className="subtitle">Every date should read D.M.YY (e.g. "16.7.26") throughout — a bug let some rows through with a leading zero and/or a 4-digit year instead (e.g. "23.07.2026"), which is now fixed for anything freshly extracted. This is a one-time sweep for rows that entered the ledger before that fix, or were typed/edited by hand — it rewrites the date field(s) in place across every register, nothing else. Safe to run more than once; it only touches rows that still need it.</p></div>
-                  <button className="btn btn-primary" disabled={dateFixBusy} onClick={normalizeAllDates}>
-                    {dateFixBusy ? <Loader2 size={15} className="spin" /> : <RefreshCw size={15} />} Fix date formatting
-                  </button>
+                  <div><h2>Date & Number Formatting</h2><p className="subtitle">Every date reads D.M.YY (e.g. "16.7.26"), and every size/GSM/BF is stored without extra trailing zeros (e.g. "59.5", not "59.50"), throughout every register — kept that way automatically. A row that's typed/edited by hand, or that entered a register before a normalizer bug was fixed, gets corrected in place the moment it's loaded; nothing to run manually.</p></div>
                 </div>
-                {dateFixMessage && <div className="doc-hint">{dateFixMessage}</div>}
               </div>
               <div className="panel">
                 <div className="panel-header">
