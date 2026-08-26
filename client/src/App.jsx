@@ -764,12 +764,14 @@ const COLUMNS = {
 // FIMSApp), matching how the physical mill-slip register book itself is organized — a size's own
 // page. "Size" itself is dropped from these per-row columns since it's now the group heading, not a
 // repeated cell; "Reel No" and "Unit" are dropped too since they're not part of what was asked for
-// here. "Consumed" is a real, persisted field on the row (see mill_slip's shape() and COLUMNS.rawMaterialIn
-// above) — deliberately blank for now, to be filled in once a future feature matches this entry
-// against consumption reports.
+// here. No "Consumed" column here — this view (rawMaterialGroupsFiltered, fed from rawMaterialBySize)
+// already filters OUT every consumed row, so that column would only ever show blank on anything
+// visible in this table. "Consumed" is still a real, persisted field on the row (see mill_slip's
+// shape() and COLUMNS.rawMaterialIn above) and still gets written to the Sheet tab — just not shown
+// as a column here, where it can never carry information.
 const RAW_MATERIAL_SIZE_COLUMNS = [
   { key: 'date', label: 'Date' }, { key: 'mill', label: 'Mill' }, { key: 'weight_kg', label: 'Weight (kg)', type: 'number' },
-  { key: 'gsm', label: 'GSM' }, { key: 'bf', label: 'BF' }, { key: 'shade', label: 'Shade' }, { key: 'consumed', label: 'Consumed (date)' },
+  { key: 'gsm', label: 'GSM' }, { key: 'bf', label: 'BF' }, { key: 'shade', label: 'Shade' },
 ];
 const NAV = [
   { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
@@ -2160,7 +2162,17 @@ function FIMSApp() {
     const cRow = consumption.find(r => r.id === consumptionRowId);
     const rRow = rawMaterialIn.find(r => r.id === rawMaterialRowId);
     if (!cRow || !rRow) return;
-    const nextConsumption = consumption.map(r => r.id === consumptionRowId ? { ...r, matchStatus: 'matched', matchedRawMaterialId: rawMaterialRowId } : r);
+    // A manual match almost always exists BECAUSE the consumption row's own shade/size/GSM/weight was
+    // slightly off (a typo or OCR misread) — that's exactly what made the automatic exact-match miss
+    // it. Once a person has confirmed by eye which real reel this row is about, the reel's own values
+    // are the source of truth, so the consumption row gets corrected to match it instead of keeping
+    // whatever was originally (mis)read. weight_consumed specifically means the reel's own total
+    // weight (see the "WEIGHT vs. LEFTOVER" extraction rule above), i.e. exactly rRow.weight_kg — not
+    // an amount used up. leftover_weight is left untouched: it's this consumption row's own reading of
+    // how much was left over, independent of which reel it turned out to be.
+    const nextConsumption = consumption.map(r => r.id === consumptionRowId
+      ? { ...r, matchStatus: 'matched', matchedRawMaterialId: rawMaterialRowId, shade: rRow.shade, size: rRow.size, gsm: rRow.gsm, weight_consumed: rRow.weight_kg }
+      : r);
     setConsumption(nextConsumption);
     persist('consumption', nextConsumption);
     const leftover = num(cRow.leftover_weight);
