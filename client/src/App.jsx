@@ -1683,11 +1683,22 @@ function FIMSApp() {
   const [fileResults, setFileResults] = useState([]); // [{id, label, status: pending|extracting|done|error, rows, originalRows, error}]
   const [activeResultIndex, setActiveResultIndex] = useState(0);
   const activeConfig = DOCUMENT_TYPES.find(d => d.key === docType);
+  const docTypeLabel = (key) => (DOCUMENT_TYPES.find(d => d.key === key) || {}).label || key;
   const isDispatchDocType = docType === 'dispatch_bill' || docType === 'dabur_dispatch';
+  // ADDS to whatever's already queued/reviewed instead of wiping it — uploading a second batch (same
+  // type or a different one picked from the dropdown first) no longer discards files already extracted
+  // and possibly hand-corrected in review but not yet confirmed. Each newly queued page is tagged with
+  // the CURRENTLY selected docType at the moment it's added (docTypeKey) — extraction, review columns,
+  // and confirming all resolve a page's document-type config from ITS OWN tag from here on, never from
+  // whatever happens to be selected in the dropdown by the time extraction/confirm actually runs. See
+  // resetUploadState for the explicit "start over" action (the button the person can reach for
+  // instead), used only when they actually want to clear everything.
   const handleFiles = async (fileList) => {
-    setErrorMsg(''); setFileResults([]); setActiveResultIndex(0); setQueuedPages([]); setSkippedPages([]); setQueuedIndex(0);
+    setErrorMsg('');
     const files = Array.from(fileList || []);
     if (!files.length) return;
+    const uploadDocTypeKey = docType;
+    const startIndex = queuedPages.length;
     setPdfLoading(true);
     try {
       const allPages = [];
@@ -1699,12 +1710,12 @@ function FIMSApp() {
             const pages = await pdfFileToPages(file);
             if (!pages.length) throw new Error('NO_PAGES');
             pages.forEach((p, idx) => allPages.push({
-              id: genId(), dataUrl: p.dataUrl, base64: p.base64, copyLabel: p.copyLabel,
+              id: genId(), dataUrl: p.dataUrl, base64: p.base64, copyLabel: p.copyLabel, docTypeKey: uploadDocTypeKey,
               label: pages.length > 1 ? `${file.name} — page ${idx + 1}` : file.name,
             }));
           } else {
             const { dataUrl, base64 } = await resizeImageToBase64(file);
-            allPages.push({ id: genId(), dataUrl, base64, copyLabel: 'unknown', label: file.name });
+            allPages.push({ id: genId(), dataUrl, base64, copyLabel: 'unknown', docTypeKey: uploadDocTypeKey, label: file.name });
           }
         } catch (e) {
           failedFiles.push(file.name);
@@ -1728,9 +1739,9 @@ function FIMSApp() {
         // extraction run on every page (as before) than to risk silently discarding the real bill
         if (original.length > 0) { toQueue = [...original, ...undetermined]; toSkip = nonOriginal; }
       }
-      setQueuedPages(toQueue);
-      setSkippedPages(toSkip);
-      setQueuedIndex(0);
+      setQueuedPages(prev => [...prev, ...toQueue]);
+      setSkippedPages(prev => [...prev, ...toSkip]);
+      setQueuedIndex(startIndex);
       setPreview(toQueue[0].dataUrl);
       setBase64Img(toQueue[0].base64);
       const notes = [];
@@ -1739,10 +1750,15 @@ function FIMSApp() {
       if (notes.length) setErrorMsg(notes.join(' '));
     } catch (e) {
       setErrorMsg('Could not read any of these files. If they’re HEIC photos from an iPhone, re-save as JPG/PNG first (Settings → Camera → Formats → Most Compatible), or take a screenshot and upload that instead.');
-      setPreview(null); setBase64Img(null);
     } finally {
       setPdfLoading(false);
     }
+  };
+  // Explicit "start over" — clears every queued/skipped/reviewed file and the preview, for when the
+  // person genuinely wants a clean slate instead of continuing to add to what's already there.
+  const resetUploadState = () => {
+    setFileResults([]); setActiveResultIndex(0); setPreview(null); setBase64Img(null);
+    setQueuedPages([]); setSkippedPages([]); setQueuedIndex(0); setErrorMsg('');
   };
   const restoreSkippedPage = (id) => {
     setSkippedPages(prev => {
@@ -1818,17 +1834,22 @@ function FIMSApp() {
     setCancelRequested(true);
     if (abortControllerRef.current) abortControllerRef.current.abort();
   };
-  const removeQueuedPage = (id) => {
+  // Shared by the × on a queued thumbnail (one id) and confirming a page/batch (possibly several ids
+  // at once) — removes from both the queue and any review results, and re-points the single-file
+  // preview at whatever's left so it never shows a page that's already gone.
+  const removeQueuedPages = (ids) => {
+    const idSet = new Set(ids);
     setQueuedPages(prev => {
-      const next = prev.filter(p => p.id !== id);
+      const next = prev.filter(p => !idSet.has(p.id));
       const clampedIdx = Math.max(0, Math.min(queuedIndex, next.length - 1));
       if (next.length) { setPreview(next[clampedIdx].dataUrl); setBase64Img(next[clampedIdx].base64); }
       else { setPreview(null); setBase64Img(null); }
       setQueuedIndex(clampedIdx);
       return next;
     });
-    setFileResults(prev => prev.filter(r => r.id !== id));
+    setFileResults(prev => prev.filter(r => !idSet.has(r.id)));
   };
+  const removeQueuedPage = (id) => removeQueuedPages([id]);
   // The friendly explanation appends the raw server response (what e.message actually contains, e.g.
   // "EXTRACT_HTTP_429: {...}") so the real diagnostic text is right there to copy over if needed,
   // instead of requiring browser DevTools.
@@ -1845,25 +1866,29 @@ function FIMSApp() {
     // AbortController and fire their own API request for what was visually a single click.
     if (extracting || !base64Img || !queuedPages.length) return;
     const current = queuedPages[queuedIndex];
+    // Resolved from the page's OWN tag, not the dropdown's current value — the dropdown may have moved
+    // on to a different type since this page was queued (that's the whole point of allowing a mixed
+    // queue), and this page must still extract/shape as whatever it actually is.
+    const pageConfig = DOCUMENT_TYPES.find(d => d.key === current.docTypeKey) || activeConfig;
     setExtracting(true); setErrorMsg(''); setCancelRequested(false);
     abortControllerRef.current = new AbortController();
     setFileResults(prev => {
       const existing = prev.find(r => r.id === current.id);
-      const base = existing || { id: current.id, label: current.label, status: 'pending', rows: [], originalRows: [], error: '' };
+      const base = existing || { id: current.id, label: current.label, docTypeKey: current.docTypeKey, status: 'pending', rows: [], originalRows: [], error: '' };
       const next = prev.some(r => r.id === current.id) ? prev.map(r => r.id === current.id ? { ...base, status: 'extracting' } : r) : [...prev, { ...base, status: 'extracting' }];
       return next;
     });
     setActiveResultIndex(queuedIndex);
     try {
-      const basePrompt = activeConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog)).replace('{{ABBREVIATIONS}}', buildAbbreviationsText(abbreviations));
-      const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[docType]);
+      const basePrompt = pageConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog)).replace('{{ABBREVIATIONS}}', buildAbbreviationsText(abbreviations));
+      const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[current.docTypeKey]);
       const { raw, truncated } = await extractWithRateLimitBackoff(promptWithTraining, base64Img, abortControllerRef.current.signal, (waitMs, attempt, total, kind) => {
         const label = kind === 'server_error' ? 'Server temporarily unreachable' : 'Rate limit hit';
         setErrorMsg(`${label} — waiting ${Math.round(waitMs / 1000)}s and retrying automatically (attempt ${attempt} of ${total})… Click Cancel below if you'd rather stop.`);
       }, (secondsLeft) => {
         setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
       });
-      const rows = activeConfig.shape(raw);
+      const rows = pageConfig.shape(raw);
       if (!rows.length) setErrorMsg('No line items found on this page. If this is a duplicate copy or an e-Way Bill page, that’s expected — just move to the next one. Otherwise, try a clearer photo or crop closer to the table.');
       else if (truncated) setErrorMsg(`Claude's response was cut off before it finished this page — it may have more rows than the ${rows.length} shown below. Check against the original, and use "Re-extract this file" if anything's missing.`);
       else setErrorMsg('');
@@ -1890,8 +1915,6 @@ function FIMSApp() {
     setExtracting(true); setErrorMsg(''); setCancelRequested(false);
     abortControllerRef.current = new AbortController();
     const signal = abortControllerRef.current.signal;
-    const basePrompt = activeConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog)).replace('{{ABBREVIATIONS}}', buildAbbreviationsText(abbreviations));
-    const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[docType]);
     const gapMs = BATCH_REQUEST_GAP_MS;
     let anySucceeded = false;
     let anyTruncated = false;
@@ -1902,6 +1925,12 @@ function FIMSApp() {
       const p = targets[t];
       // skip files that were removed from the queue mid-batch (e.g. via the × on a thumbnail)
       if (!queuedPages.some(q => q.id === p.id)) continue;
+      // Resolved PER TARGET, not once for the whole batch — a mixed queue (say, mill slips queued
+      // alongside consumption reports) needs each page extracted with its own prompt/shape, not
+      // whichever type happened to be selected when this batch was kicked off.
+      const pageConfig = DOCUMENT_TYPES.find(d => d.key === p.docTypeKey) || activeConfig;
+      const basePrompt = pageConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog)).replace('{{ABBREVIATIONS}}', buildAbbreviationsText(abbreviations));
+      const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[p.docTypeKey]);
       try {
         // small pacing gap between requests (skip before the very first one) so a big multi-copy
         // dispatch-bill upload doesn't fire a literal burst of requests in the same instant.
@@ -1915,7 +1944,7 @@ function FIMSApp() {
         }, (secondsLeft) => {
           setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
         });
-        const rows = activeConfig.shape(raw);
+        const rows = pageConfig.shape(raw);
         anySucceeded = true;
         if (truncated) anyTruncated = true;
         setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })), truncated } : r));
@@ -1949,22 +1978,37 @@ function FIMSApp() {
     setExtracting(false);
     abortControllerRef.current = null;
   };
+  // Every queued page that still needs extracting: no result yet at all (just appended to a batch
+  // that's already partway through review), or a previous attempt left it pending/error. Deliberately
+  // never includes an already-'done' page — shared by "Extract all"/"Retry remaining" so either one
+  // can be used to keep going after adding more files without re-running (and re-billing) anything
+  // already extracted, and without wiping rows a person may have already hand-corrected in review.
+  const pagesNeedingExtraction = () => queuedPages.filter(p => {
+    const r = fileResults.find(fr => fr.id === p.id);
+    return !r || r.status === 'pending' || r.status === 'error';
+  });
+  // extractQueue only ever UPDATES an existing fileResults entry (see its setFileResults(prev =>
+  // prev.map(...)) calls) — it can't create one for a page that's never had a result at all, which is
+  // exactly the state a freshly-appended page is in. This creates that starting entry first, without
+  // touching any page that already has one (done, pending, or error).
+  const ensureResultEntries = (targets) => {
+    setFileResults(prev => {
+      const existingIds = new Set(prev.map(r => r.id));
+      const missing = targets.filter(p => !existingIds.has(p.id))
+        .map(p => ({ id: p.id, label: p.label, docTypeKey: p.docTypeKey, status: 'pending', rows: [], originalRows: [], error: '' }));
+      return missing.length ? [...prev, ...missing] : prev;
+    });
+  };
+  // Backs both "Extract all N" (upload panel) and "Retry remaining" (review panel) — same operation,
+  // just reachable from two different points in the flow.
   const runExtractionAllQueued = async () => {
     if (extracting || !queuedPages.length) return;
-    const initial = queuedPages.map(p => ({ id: p.id, label: p.label, status: 'pending', rows: [], originalRows: [], error: '' }));
-    setFileResults(initial);
-    setActiveResultIndex(0);
-    await extractQueue(queuedPages);
-  };
-  const runExtractionRemaining = async () => {
-    if (extracting) return;
-    const targets = queuedPages.filter(p => {
-      const r = fileResults.find(fr => fr.id === p.id);
-      return r && (r.status === 'pending' || r.status === 'error');
-    });
+    const targets = pagesNeedingExtraction();
     if (!targets.length) return;
+    ensureResultEntries(targets);
     await extractQueue(targets);
   };
+  const runExtractionRemaining = runExtractionAllQueued;
   // Re-runs extraction for ONE already-"done" file — the response to being told a page's response was
   // cut off (page.truncated) is to just try again, since a fresh request isn't guaranteed to hit the
   // same wall a second time. Resets that file back to 'pending' first (clearing its old rows/truncated
@@ -1982,7 +2026,10 @@ function FIMSApp() {
   // (recorded as {after: null}, see buildPromptWithTraining), not just rows that survived with an
   // edited field. Previously only field-level edits were recorded, so "delete the junk rows and
   // confirm" taught the model nothing and the same blank rows kept coming back on the next upload.
-  const recordCorrections = (originalRows, finalRows) => {
+  // docTypeKey is the CONFIRMED page's own tag, not necessarily the currently-selected dropdown value
+  // — a correction made while reviewing a mill-slip page must be recorded as a mill-slip lesson even
+  // if the dropdown has since moved on to a different document type.
+  const recordCorrections = (docTypeKey, originalRows, finalRows) => {
     if (!originalRows || !originalRows.length) return;
     const corrections = [];
     const finalById = new Map(finalRows.map(r => [r.id, r]));
@@ -1998,8 +2045,8 @@ function FIMSApp() {
     });
     if (!corrections.length) return;
     setTrainingExamples(prev => {
-      const list = [...(prev[docType] || []), ...corrections].slice(-MAX_EXAMPLES_STORED);
-      const next = { ...prev, [docType]: list };
+      const list = [...(prev[docTypeKey] || []), ...corrections].slice(-MAX_EXAMPLES_STORED);
+      const next = { ...prev, [docTypeKey]: list };
       saveTraining(next);
       return next;
     });
@@ -2015,19 +2062,35 @@ function FIMSApp() {
   const confirmPage = (idx) => {
     const page = fileResults[idx];
     if (!page || !page.rows.length) return;
-    recordCorrections(page.originalRows, page.rows);
-    const skipped = addRows(activeConfig.register, page.rows);
-    setFileResults(prev => prev.filter((_, i) => i !== idx));
-    setActiveResultIndex(prev => Math.max(0, Math.min(prev, fileResults.length - 2)));
+    const pageConfig = DOCUMENT_TYPES.find(d => d.key === page.docTypeKey) || activeConfig;
+    recordCorrections(page.docTypeKey, page.originalRows, page.rows);
+    const skipped = addRows(pageConfig.register, page.rows);
+    // Clears the queued page too, not just the review result — otherwise a confirmed page's thumbnail
+    // stays in the queue with no result attached, and a later "Extract all"/"Retry remaining" would
+    // pointlessly re-extract (and re-attempt adding, though dedup would catch it) a page that's
+    // already safely in the register.
+    removeQueuedPages([page.id]);
     if (skipped) window.alert(`${skipped} row${skipped === 1 ? '' : 's'} exactly matched one already in the register and ${skipped === 1 ? "wasn't" : "weren't"} added again — looks like this page (or part of it) was uploaded before.`);
   };
   const confirmAllPages = () => {
     const donePages = fileResults.filter(r => r.status === 'done' && r.rows.length);
-    donePages.forEach(page => recordCorrections(page.originalRows, page.rows));
-    const allRows = donePages.flatMap(p => p.rows);
-    const skipped = allRows.length ? addRows(activeConfig.register, allRows) : 0;
-    setFileResults([]); setActiveResultIndex(0); setPreview(null); setBase64Img(null); setQueuedPages([]);
-    if (skipped) window.alert(`${skipped} row${skipped === 1 ? '' : 's'} exactly matched one already in the register and ${skipped === 1 ? "wasn't" : "weren't"} added again — looks like a page (or part of it) was uploaded before.`);
+    if (!donePages.length) return;
+    donePages.forEach(page => recordCorrections(page.docTypeKey, page.originalRows, page.rows));
+    // Grouped by register, not lumped under one type — a batch can now legitimately mix document
+    // types (e.g. mill slips queued alongside consumption reports), and each register's rows need to
+    // land under its own key rather than all under whichever type happens to be selected right now.
+    const rowsByRegister = {};
+    donePages.forEach(page => {
+      const pageConfig = DOCUMENT_TYPES.find(d => d.key === page.docTypeKey) || activeConfig;
+      (rowsByRegister[pageConfig.register] = rowsByRegister[pageConfig.register] || []).push(...page.rows);
+    });
+    let totalSkipped = 0;
+    Object.entries(rowsByRegister).forEach(([register, rows]) => { totalSkipped += addRows(register, rows); });
+    // Only the pages just confirmed drop out of the queue/results — anything still pending, mid-
+    // extraction, or errored stays put, since "confirm all completed" was never meant to also discard
+    // whatever hadn't finished yet.
+    removeQueuedPages(donePages.map(p => p.id));
+    if (totalSkipped) window.alert(`${totalSkipped} row${totalSkipped === 1 ? '' : 's'} exactly matched one already in the register and ${totalSkipped === 1 ? "wasn't" : "weren't"} added again — looks like a page (or part of it) was uploaded before.`);
   };
   const discardPage = (idx) => {
     setFileResults(prev => prev.filter((_, i) => i !== idx));
@@ -3703,8 +3766,18 @@ function FIMSApp() {
           {loaded && activeTab === 'upload' && (
             <div className="upload-grid">
               <div className="panel" style={{ paddingLeft: 30 }}>
-                <h2 style={{ marginBottom: 14 }}>1. Choose document &amp; upload</h2>
-                <select className="doc-select" value={docType} onChange={(e) => { setDocType(e.target.value); setFileResults([]); setActiveResultIndex(0); setPreview(null); setBase64Img(null); setQueuedPages([]); setSkippedPages([]); }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10 }}>
+                  <h2 style={{ marginBottom: 14 }}>1. Choose document &amp; upload</h2>
+                  {(queuedPages.length > 0 || fileResults.length > 0 || skippedPages.length > 0) && (
+                    <button className="icon-btn" style={{ fontSize: 11.5, textDecoration: 'underline', whiteSpace: 'nowrap' }} disabled={extracting} onClick={resetUploadState}>
+                      Start fresh (clear everything queued)
+                    </button>
+                  )}
+                </div>
+                {/* Switching this only changes what the NEXT upload gets tagged as — anything already
+                    queued or under review keeps its own original type (see docTypeKey), so switching
+                    types mid-flow to upload a different kind of document never discards what's there. */}
+                <select className="doc-select" value={docType} onChange={(e) => setDocType(e.target.value)}>
                   {DOCUMENT_TYPES.map(d => <option key={d.key} value={d.key}>{d.label}</option>)}
                 </select>
                 <div className="doc-hint">{activeConfig.hint}</div>
@@ -3726,11 +3799,14 @@ function FIMSApp() {
                 {preview && <img src={preview} alt="preview" className="preview-img" title="Click to enlarge" onClick={() => setZoomedImage(preview)} />}
                 {queuedPages.length > 1 && (
                   <div style={{ marginTop: 10 }}>
-                    <div className="doc-hint">{queuedIndex + 1} of {queuedPages.length}: {queuedPages[queuedIndex]?.label} — click a thumbnail to preview it, click × to drop it from the queue (works anytime, even mid-extraction), or extract everything at once.</div>
+                    <div className="doc-hint">{queuedIndex + 1} of {queuedPages.length}: {queuedPages[queuedIndex]?.label} ({docTypeLabel(queuedPages[queuedIndex]?.docTypeKey)}) — click a thumbnail to preview it, click × to drop it from the queue (works anytime, even mid-extraction), or extract everything at once.</div>
+                    {new Set(queuedPages.map(p => p.docTypeKey)).size > 1 && (
+                      <div className="doc-hint" style={{ marginBottom: 4 }}>This queue has more than one document type in it — each page still extracts and confirms as its own type, hover a thumbnail to check which.</div>
+                    )}
                     <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
                       {queuedPages.map((p, idx) => (
                         <div key={p.id} style={{ position: 'relative' }}>
-                          <img src={p.dataUrl} alt={p.label} title={p.label}
+                          <img src={p.dataUrl} alt={p.label} title={`${p.label} (${docTypeLabel(p.docTypeKey)})`}
                             onClick={() => selectQueuedPage(idx)}
                             style={{ width: 54, height: 54, objectFit: 'cover', borderRadius: 4, cursor: 'pointer', border: idx === queuedIndex ? '2px solid var(--accent)' : '1px solid var(--rule)' }} />
                           <button
@@ -3787,6 +3863,10 @@ function FIMSApp() {
                 {fileResults.length > 0 && (() => {
                   const idx = Math.min(activeResultIndex, fileResults.length - 1);
                   const page = fileResults[idx];
+                  // Resolved from THIS page's own tag, not the dropdown's current value — a batch can
+                  // now mix document types, and each page's label/columns must reflect what IT actually
+                  // is, regardless of what's selected in the dropdown by the time it's being reviewed.
+                  const pageConfig = DOCUMENT_TYPES.find(d => d.key === page.docTypeKey) || activeConfig;
                   const doneCount = fileResults.filter(r => r.status === 'done').length;
                   const remainingCount = fileResults.filter(r => r.status === 'pending' || r.status === 'error').length;
                   return (
@@ -3798,7 +3878,7 @@ function FIMSApp() {
                           <button className="icon-btn" disabled={idx === fileResults.length - 1} onClick={() => setActiveResultIndex(idx + 1)}>▶</button>
                           <div style={{ display: 'flex', gap: 5, marginLeft: 6, flexWrap: 'wrap' }}>
                             {fileResults.map((r, i) => (
-                              <span key={r.id} onClick={() => setActiveResultIndex(i)} title={r.label}
+                              <span key={r.id} onClick={() => setActiveResultIndex(i)} title={`${r.label} (${docTypeLabel(r.docTypeKey)})`}
                                 style={{
                                   width: 22, height: 22, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
                                   fontSize: 10, cursor: 'pointer', border: i === idx ? '2px solid var(--accent)' : '1px solid var(--rule)',
@@ -3833,8 +3913,8 @@ function FIMSApp() {
                               <span>{page.rows.filter(r => r.flagged).length} row(s) below are flagged (highlighted, with a warning icon on the first cell) — the model wasn't confident about a value, usually because a column looked cut off/missing or a crossed-out number was ambiguous. Check those against the original document and fix by hand; nothing was guessed for them.</span>
                             </div>
                           )}
-                          <p className="subtitle" style={{ marginBottom: 10 }}>{page.rows.length} row(s) found for <strong>{activeConfig.label}</strong>. Fix anything that looks wrong, then confirm.</p>
-                          <EditableTable columns={REVIEW_COLUMNS[activeConfig.register] || COLUMNS[activeConfig.register]} rows={page.rows}
+                          <p className="subtitle" style={{ marginBottom: 10 }}>{page.rows.length} row(s) found for <strong>{pageConfig.label}</strong>. Fix anything that looks wrong, then confirm.</p>
+                          <EditableTable columns={REVIEW_COLUMNS[pageConfig.register] || COLUMNS[pageConfig.register]} rows={page.rows}
                             onUpdate={(rowId, field, value) => updateReviewCell(idx, rowId, field, value)}
                             onDelete={(rowId) => deleteReviewRow(idx, rowId)}
                             emptyLabel="All rows removed — nothing to add."
