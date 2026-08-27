@@ -776,6 +776,15 @@ const COLUMNS = {
     { key: 'quantity', label: 'Quantity', type: 'number' }, { key: 'rate', label: 'Rate', type: 'number' }, { key: 'amount', label: 'Amount', type: 'number' },
   ],
 };
+// Per-register overrides for the pre-confirm EXTRACTION REVIEW table only (see its EditableTable
+// below) — falls back to COLUMNS[register] for anything not listed here. "Consumed" is always blank
+// at extraction time (mill_slip's shape() never sets it — that only gets filled in later, once the
+// row is matched against a consumption report), so showing it as an editable column during review
+// just invites confusion over a field that can't mean anything yet. Export and the Sheet itself still
+// use the full COLUMNS.rawMaterialIn — this only trims what's shown during review.
+const REVIEW_COLUMNS = {
+  rawMaterialIn: COLUMNS.rawMaterialIn.filter(c => c.key !== 'consumed'),
+};
 // The Raw Material Register view is grouped into one table per size (see rawMaterialBySize in
 // FIMSApp), matching how the physical mill-slip register book itself is organized — a size's own
 // page. "Size" itself is dropped from these per-row columns since it's now the group heading, not a
@@ -1059,7 +1068,12 @@ function BatchFillRow({ columns, rows, onUpdate, selectedIds, onClearSelection }
                 type={c.type === 'number' ? 'number' : 'text'}
                 value={batchValues[c.key] || ''}
                 onChange={e => setBatchValues(prev => ({ ...prev, [c.key]: e.target.value }))}
-                onKeyDown={e => { if (e.key === 'Enter') fillBlanks(c.key); }}
+                // Enter goes to whichever action is actually in play: with rows selected, apply to just
+                // those (matches the obvious intent of selecting rows then typing a value — and avoids
+                // the trap where Fill-blanks silently does nothing because the selected rows already
+                // have a value in this column, which looked exactly like "multi-select isn't working").
+                // With nothing selected, Enter falls back to filling blanks, same as before.
+                onKeyDown={e => { if (e.key === 'Enter') { if (selectedIds.size) applyToSelected(c.key); else fillBlanks(c.key); } }}
               />
               <button type="button" className="icon-btn" title={hasBlank ? `Fill every blank ${c.label} cell with this value` : `No blank ${c.label} cells — nothing to fill`} disabled={!hasBlank || !(batchValues[c.key] || '').trim()} onClick={() => fillBlanks(c.key)}>
                 <Check size={13} />
@@ -1608,7 +1622,15 @@ function FIMSApp() {
   // two copies of the same page queued together in one "Confirm all" don't both land either. Returns how
   // many were skipped so the caller can tell the user.
   const DEDUP_REGISTERS = new Set(['rawMaterialIn', 'consumption', 'production', 'customerDispatch', 'daburSpecs', 'daburPO', 'daburDispatch']);
-  const addRows = (registerKey, rows) => {
+  const addRows = (registerKey, rawRows) => {
+    // Strip pre-confirm review metadata (flagged/flagReason) before a row ever reaches the actual
+    // register — once a row is confirmed there is no flag anymore, the person just reviewed and
+    // accepted it as-is. Carrying these fields forward leaked them into the Sheet itself as permanent
+    // extra columns (confirmed directly: an otherwise-empty rawMaterialIn tab already showing
+    // "flagged"/"flagReason" as real columns before a single row had even been added). rowDedupKey
+    // already ignores both fields when comparing for duplicates, so this doesn't change dedup
+    // behavior — it only affects what actually gets persisted.
+    const rows = rawRows.map(({ flagged, flagReason, ...rest }) => rest);
     let toAdd = rows;
     let skipped = 0;
     if (DEDUP_REGISTERS.has(registerKey)) {
@@ -3812,7 +3834,7 @@ function FIMSApp() {
                             </div>
                           )}
                           <p className="subtitle" style={{ marginBottom: 10 }}>{page.rows.length} row(s) found for <strong>{activeConfig.label}</strong>. Fix anything that looks wrong, then confirm.</p>
-                          <EditableTable columns={COLUMNS[activeConfig.register]} rows={page.rows}
+                          <EditableTable columns={REVIEW_COLUMNS[activeConfig.register] || COLUMNS[activeConfig.register]} rows={page.rows}
                             onUpdate={(rowId, field, value) => updateReviewCell(idx, rowId, field, value)}
                             onDelete={(rowId) => deleteReviewRow(idx, rowId)}
                             emptyLabel="All rows removed — nothing to add."
