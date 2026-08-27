@@ -586,7 +586,16 @@ IMPORTANT — column format varies between mills, read carefully:
       // consumed starts empty on purpose — it's a placeholder for a future feature that matches this
       // reel/slip against consumption reports and records the date it actually got used up; nothing
       // populates it yet, so every fresh row just carries the field so it exists to edit/fill by hand.
-      return raw.items.map(it => ({ id: genId(), date: normalizeDateToDots(raw.date || ''), mill: raw.mill || '', reel_no: it.reel_no || '', size: normalizeNumericStr(it.size), unit: it.unit || '', gsm: normalizeNumericStr(it.gsm), bf: normalizeNumericStr(it.bf), shade: it.shade || '', weight_kg: num(it.weight_kg), consumed: '' }));
+      const date = normalizeDateToDots(raw.date || '');
+      // A reel entered with no date is exactly how an untraceable row (unclear which day it actually
+      // arrived, unmatchable against "what came in this week") ends up sitting in the register —
+      // flagged here (pre-confirm review only; the confirmed register itself suppresses flags, see
+      // RAW_MATERIAL_SIZE_COLUMNS's EditableTable) instead of silently letting a blank date through.
+      const dateFlag = date ? null : 'No date found anywhere on this slip — check the original document and fill in the date before confirming.';
+      return raw.items.map(it => ({
+        id: genId(), date, mill: raw.mill || '', reel_no: it.reel_no || '', size: normalizeNumericStr(it.size), unit: it.unit || '', gsm: normalizeNumericStr(it.gsm), bf: normalizeNumericStr(it.bf), shade: it.shade || '', weight_kg: num(it.weight_kg), consumed: '',
+        flagged: !!dateFlag, flagReason: dateFlag || '',
+      }));
     },
   },
   {
@@ -598,7 +607,8 @@ IMPORTANT — column format varies between mills, read carefully:
 {"date":"as written at the top, DD/MM/YYYY","items":[{"sl_no":"this row's own SL.NO./serial number exactly as printed in that column, as a string — see rules below","shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number — this is the reel's own TOTAL weight (matches what was recorded when it came in), not an amount used up — see rules below","leftover_weight":"the टुकड़ा / Tukda column value, as a number, ONLY if that row actually has one written — omit entirely if the row has nothing there, do not default it to 0","date_override":"only include this if a specific row has a different date than the header, else omit","flag":"only if you couldn't reliably read this row's weight — e.g. a column looks cut off/missing, or there's a crossed-out number and you're unsure which replacement is correct — a short reason why, else omit"}]}
 IMPORTANT:
 - SKIP TRULY BLANK LINES. This sheet is pre-ruled with a fixed number of numbered SL.NO. slots/columns, and it is completely normal for a real day's report to only fill in the first several and leave the rest of the printed grid blank. A line that has ONLY a pre-printed SL.NO. with no shade, no GSM, no size, and no weight actually written on it is not a row of data — do not output an item for it. Only extract a line that has genuine handwritten content in it.
-- SL.NO IS YOUR ROW-ALIGNMENT ANCHOR. This sheet's rows are frequently laid out as narrow vertical strips (SL.NO increasing left-to-right or in whatever direction the page actually runs) with every strip looking nearly identical (same date, same shade, similar GSM) — the kind of layout where it's extremely easy for a value to silently slide into the wrong row. To prevent that: for EACH row, first locate its SL.NO in the image, then read every other field (shade, GSM, size, weight, leftover) from that exact same physical strip/line — never from a neighboring one — before moving to the next SL.NO. After you've extracted every row, check your own output: the sl_no values you produced should appear once each, in the same order they run on the page, with no duplicates and no unexplained gaps. If you notice a duplicate or out-of-sequence SL.NO in what you were about to return, that is a sign a value drifted between rows — go back and re-read those specific rows from the image before finalizing, rather than submitting a duplicated or skipped row.
+- SL.NO IS YOUR ROW-ALIGNMENT ANCHOR. This sheet's rows are frequently laid out as narrow vertical strips (SL.NO increasing left-to-right or in whatever direction the page actually runs, sometimes numbered right-to-left, e.g. strip "20" on the far left and strip "1" on the far right) with every strip looking nearly identical (same date, same shade, similar GSM) — the kind of layout where it's extremely easy for a value to silently slide into the wrong row, or for an entire strip to get skipped without you noticing. To prevent that: for EACH row, first locate its SL.NO in the image, then read every other field (shade, GSM, size, weight, leftover) from that exact same physical strip/line — never from a neighboring one — before moving to the next SL.NO.
+- FINAL COUNT CHECK — MANDATORY BEFORE YOU FINALIZE: count the actual number of physical strips/lines visible in the image that have genuine handwritten content (not the pre-printed grid — the ones you're actually meant to extract per the "skip truly blank lines" rule above). Your "items" array must contain EXACTLY that many entries, no more and no fewer. The sl_no values you produced should appear once each, in the same order they run on the page, with no duplicates and no unexplained gaps. If your count is off, that means a real row got skipped somewhere in the middle — go find it and insert it in the right place; do NOT compensate by inventing an extra row at the end, and do NOT pad the count by duplicating a row you already extracted. Every single item in your output must correspond to one real, physically-located strip you can point to in the image — never a row assembled by guessing at a plausible-looking combination of values.
 - WEIGHT vs. LEFTOVER — these are two DIFFERENT numbers with two different meanings, never the same value: "weight_consumed" (वजन) is the reel's own original total weight, exactly as it was recorded when that reel first arrived — it identifies WHICH reel this row is about, it is not how much was used today. "leftover_weight" (टुकड़ा) is how much of that reel is left over/remaining after this — genuinely optional, only present when the row actually has a value written in that column (a reel that got fully used up has nothing written there).
 - LEFTOVER/TUKDA IS THE COLUMN MOST LIKELY TO DRIFT BETWEEN ROWS — it's usually blank for most rows and only has a handwritten value here and there, which makes it easy to accidentally attach the one value you DO see to the wrong nearby row instead of leaving the blank ones blank. Before including a leftover_weight for a row, re-confirm it is physically written on THAT row's own strip/line, at THAT row's SL.NO, not just "somewhere near it" or "the closest number below it." If you are not fully certain which row a leftover figure belongs to, omit leftover_weight for that row entirely rather than guessing — an omitted value is far less harmful than one attached to the wrong reel, which would misidentify which physical reel gets marked as used up.
 - The column that looks like it's labeled "S/K" is actually the SHADE column, not a party name or code. Decode its handwritten values: "S.K" or "SK" means shade NS (Sada Kraft / natural shade). "G.Y" or "GY" means shade GY (Golden Yellow). If you see a different value you don't recognize, copy it as written rather than forcing it into NS or GY.
@@ -614,7 +624,13 @@ IMPORTANT:
         leftover_weight: it.leftover_weight === '' || it.leftover_weight == null ? '' : num(it.leftover_weight),
         flagged: !!(it.flag && String(it.flag).trim()), flagReason: (it.flag || '').trim(),
       }));
-      return fillDittoDates(rows);
+      const filled = fillDittoDates(rows);
+      // A row with no date — the header date never resolved AND no ditto mark tied it to a row above
+      // that did — is exactly how an untraceable, unmatchable entry gets into the register (which day
+      // was this actually consumed on?). Flagged here rather than silently let through with a blank
+      // date; doesn't overwrite an existing flag reason, just adds this one where there isn't one yet.
+      filled.forEach(r => { if (!r.date) { r.flagged = true; r.flagReason = r.flagReason || 'No date found for this row — check the original report and fill in the date before confirming.'; } });
+      return filled;
     },
   },
   {
@@ -1065,17 +1081,25 @@ function BatchFillRow({ columns, rows, onUpdate, selectedIds, onClearSelection }
   );
 }
 function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow, sortByDate = true, showBatchFill = false }) {
-  // Row selection (also showBatchFill-only, see BatchFillRow's "Apply to selected"): shift-click for a
-  // range, ctrl/cmd-click to toggle one row without disturbing the rest, and click-drag across the
-  // gutter for an OS-style rubber-band select — mirrors how selection already works everywhere else on
-  // the person's own machine. Declared before the `!rows.length` early return below (rules of hooks:
-  // must run in the same order every render) even though selection is meaningless on an empty table.
-  // Kept local to this table instance rather than lifted to the caller — intersected against the
-  // CURRENT rows on every read rather than reset via an effect keyed on page identity, so switching to
-  // a different file's review table silently drops ids that no longer exist, no extra plumbing needed.
+  // Row selection (also showBatchFill-only, see BatchFillRow's "Apply to selected"): a plain click
+  // TOGGLES just that row's checkbox without touching any other row's selection — matches the literal
+  // checkbox rendered in the gutter (Gmail-style: click one, click another, both end up checked),
+  // rather than resetting the whole selection down to one row the way a file-explorer single-click
+  // does (that was the earlier behavior here, and it's exactly why clicking several checkboxes one at
+  // a time silently ended up with only the last one selected — "multi-select isn't working"). A drag
+  // starting from that click paints every row it crosses to that SAME new state (checks them if the
+  // first row just got checked, unchecks them if it just got unchecked), so dragging down a column of
+  // checkboxes still works as a fast way to select/deselect a whole block. Shift-click is kept
+  // separately for setting a contiguous range from the last row touched, spreadsheet-style. Declared
+  // before the `!rows.length` early return below (rules of hooks: must run in the same order every
+  // render) even though selection is meaningless on an empty table. Kept local to this table instance
+  // rather than lifted to the caller — intersected against the CURRENT rows on every read rather than
+  // reset via an effect keyed on page identity, so switching to a different file's review table
+  // silently drops ids that no longer exist, no extra plumbing needed.
   const [rawSelectedIds, setRawSelectedIds] = useState(() => new Set());
   const [dragAnchorId, setDragAnchorId] = useState(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [dragPaintValue, setDragPaintValue] = useState(true);
   useEffect(() => {
     if (!isDragging) return;
     const stop = () => setIsDragging(false);
@@ -1119,22 +1143,25 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
     e.preventDefault(); // stop the browser's own text-selection drag from fighting the row-drag below
     if (e.shiftKey && dragAnchorId) {
       setRawSelectedIds(new Set(rangeBetween(dragAnchorId, rowId)));
-    } else if (e.ctrlKey || e.metaKey) {
-      setRawSelectedIds(prev => {
-        const next = new Set(prev);
-        if (next.has(rowId)) next.delete(rowId); else next.add(rowId);
-        return next;
-      });
-      setDragAnchorId(rowId);
-    } else {
-      setRawSelectedIds(new Set([rowId]));
-      setDragAnchorId(rowId);
-      setIsDragging(true);
+      return;
     }
+    const willSelect = !rawSelectedIds.has(rowId);
+    setDragPaintValue(willSelect);
+    setRawSelectedIds(prev => {
+      const next = new Set(prev);
+      if (willSelect) next.add(rowId); else next.delete(rowId);
+      return next;
+    });
+    setDragAnchorId(rowId);
+    setIsDragging(true);
   };
   const handleGutterMouseEnter = (rowId) => {
-    if (!isDragging || !dragAnchorId) return;
-    setRawSelectedIds(new Set(rangeBetween(dragAnchorId, rowId)));
+    if (!isDragging) return;
+    setRawSelectedIds(prev => {
+      const next = new Set(prev);
+      if (dragPaintValue) next.add(rowId); else next.delete(rowId);
+      return next;
+    });
   };
   return (
     <div className="table-wrap">
@@ -2188,6 +2215,16 @@ function FIMSApp() {
     persist('rawMaterialIn', nextRawMaterial);
     setManualMatchPicks(prev => { const next = { ...prev }; delete next[consumptionRowId]; return next; });
   };
+  // Net consumption for a set of rows: weight_consumed identifies the reel and its total weight, not
+  // an amount used up (see the "WEIGHT vs. LEFTOVER" extraction rule) — what actually got consumed out
+  // of stock is that total MINUS whatever was left over (Tukda) from it, summed across every row.
+  const netConsumption = (rows) => rows.reduce((sum, r) => sum + num(r.weight_consumed) - num(r.leftover_weight), 0);
+  const todayKey = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  })();
+  const todaysConsumption = netConsumption(consumption.filter(r => dateSortKey(r.date) === todayKey));
+  const thisMonthsConsumption = netConsumption(consumption.filter(r => dateSortKey(r.date).startsWith(todayKey.slice(0, 7))));
   /* -------- dabur PO pending calc -------- */
   const PO_TOLERANCE = 0.10; // ±10% — a PO counts as fulfilled once dispatched qty reaches 90% of ordered qty
   const daburPOWithPending = daburPO.map(po => {
@@ -3831,7 +3868,7 @@ function FIMSApp() {
                   <div key={group.size} style={{ marginBottom: 20 }}>
                     <div style={{ marginBottom: 6 }}><strong>Size {group.size}</strong></div>
                     <EditableTable columns={RAW_MATERIAL_SIZE_COLUMNS} rows={group.rows}
-                      onUpdate={updateRow('rawMaterialIn')} onDelete={deleteRow('rawMaterialIn')} />
+                      onUpdate={updateRow('rawMaterialIn')} onDelete={deleteRow('rawMaterialIn')} suppressFlags />
                   </div>
                 ))}
               </div>
@@ -3842,6 +3879,16 @@ function FIMSApp() {
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Consumption</h2>
                 <p className="subtitle">Every row extracted from a Daily Consumption Report. Matching against the Raw Material Register runs automatically by Size + GSM + Weight — that fills in "Consumed" on the matching reel in Inward Entries, nothing is deleted from there. A row the automatic matcher can't resolve shows "Unmatched" with a dropdown here to pick the reel by hand.</p>
+                <div className="dash-grid" style={{ marginTop: 14, marginBottom: 4 }}>
+                  <div className="dash-card" style={{ cursor: 'default' }}>
+                    <div className="num">{todaysConsumption.toLocaleString('en-IN')}</div>
+                    <div className="lbl">Today's Consumption (kg) — Weight Consumed minus Leftover</div>
+                  </div>
+                  <div className="dash-card" style={{ cursor: 'default' }}>
+                    <div className="num">{thisMonthsConsumption.toLocaleString('en-IN')}</div>
+                    <div className="lbl">This Month's Consumption (kg) — Weight Consumed minus Leftover</div>
+                  </div>
+                </div>
               </div>
               <div className="panel">
                 <div className="panel-header">

@@ -249,7 +249,21 @@ async function writeTab(tabKey, rows) {
   const tabName = sanitizeTabName(tabKey);
   const gridSize = await ensureTabExists(sheets, spreadsheetId, tabName);
   if (!Array.isArray(rows) || !rows.length) {
-    await writeValuesClearingStale(sheets, spreadsheetId, tabName, [], gridSize);
+    // Clearing a register (Settings → Clear App Data) should wipe the DATA, not the column names —
+    // losing "Date | Mill | Reel No | ..." along with the rows it labeled made a freshly-cleared tab
+    // look like a blank, structureless sheet instead of an empty register ready for the next entry.
+    // Reads the tab's own current row 1 back and keeps writing exactly that as the one surviving row;
+    // every row below it still gets blanked by writeValuesClearingStale's usual padding. A tab with no
+    // header yet (brand new, or already empty) just stays fully blank, same as before.
+    let existingHeader = [];
+    try {
+      const resp = await sheets.spreadsheets.values.get({ spreadsheetId, range: `${tabName}!1:1` });
+      existingHeader = (resp.data.values && resp.data.values[0]) || [];
+    } catch (e) {
+      if (e.code !== 400 && !(e.errors && e.errors[0] && /Unable to parse range/i.test(e.errors[0].message || ''))) throw e;
+    }
+    await writeValuesClearingStale(sheets, spreadsheetId, tabName, existingHeader.length ? [existingHeader] : [], gridSize);
+    await syncTableRanges(sheets, spreadsheetId, gridSize, existingHeader.length ? 1 : 0, existingHeader.length);
     return;
   }
   // Header = union of keys across all rows, 'id' pinned first if present, rest in first-seen order.
