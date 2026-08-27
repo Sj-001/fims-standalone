@@ -262,7 +262,13 @@ async function callClaudeExtract(systemPrompt, base64Image, signal) {
 }
 /* ============================== storage ============================== */
 const STORAGE_KEYS = {
-  rawMaterialIn: 'fims_raw_material_in',
+  // ALL CAPS on purpose, unlike every other tab here — a person-facing choice (this is the tab that
+  // gets opened/searched by hand most often in the raw Google Sheet, so it's meant to stand out at a
+  // glance in the tab strip against the lowercase fims_* tabs). IMPORTANT: this must exactly match the
+  // real tab's name in the Sheet — if you rename the tab in Sheets, update this string to match (and
+  // vice versa: changing this string alone, without renaming the actual tab, makes the app start a
+  // brand-new empty tab under the new name instead of finding the existing one with its data).
+  rawMaterialIn: 'RAW_MATERIAL_IN',
   consumption: 'fims_consumption',
   production: 'fims_production',
   customerDispatch: 'fims_customer_dispatch',
