@@ -272,8 +272,13 @@ const STORAGE_KEYS = {
   consumption: 'fims_consumption',
   production: 'fims_production',
   customerDispatch: 'fims_customer_dispatch',
+  // Both the free-form reference notes (dabur_spec) AND the structured cutting-spec extraction
+  // (dabur_pm_spec_cutting) land in this SAME tab — no separate tab for the cutting-spec rows; they're
+  // just rows with a different set of fields populated (item_code/box_length_mm/... vs product_name/
+  // box_size/...) sharing the one array/tab. Split apart only for DISPLAY, by which fields are
+  // populated — see the daburSpecCuttingRows/daburSpecReferenceRows filters in the Dabur — Spec Master
+  // tab's render.
   daburSpecs: 'fims_dabur_specs',
-  daburSpecCutting: 'fims_dabur_spec_cutting',
   daburPO: 'fims_dabur_po',
   daburDispatch: 'fims_dabur_dispatch',
   // ONE row holding the linked external cutting-spec Google Sheet's ID — see the "Cutting-Spec Sheet"
@@ -728,8 +733,8 @@ Return ONLY one JSON object: {"invoice_no":"","date":"","party":"","buyer_order_
   {
     key: 'dabur_pm_spec_cutting',
     label: 'Dabur PM Spec (cutting sheet)',
-    hint: 'Printed Dabur PM Specification sheet — extracts the cutting dimensions and paper combinations needed for the box/partition/plate sheet sizes, and computes the derived inch/sheet-size fields. Confirmed rows push straight to the external cutting-spec Google Sheet linked below (and save locally too).',
-    register: 'daburSpecCutting',
+    hint: 'Printed Dabur PM Specification sheet — extracts the cutting dimensions and paper combinations needed for the box/partition/plate sheet sizes, and computes the derived inch/sheet-size fields. Confirmed rows push straight to the external cutting-spec Google Sheet linked below (and save locally too, in the same Dabur — Spec Master tab as the reference-notes type).',
+    register: 'daburSpecs',
     systemPrompt: `You read a printed "Dabur India Limited — PM Specification" sheet for a corrugated box. It has a header info block (Product, Shelf Life, Creation/Revision/Valid dates) followed by a numbered spec table (S.No / TEST / SPECIFICATION / STANDARD TEST PROCEDURE). Extract ONLY the specific fields listed below — ignore Shelf Life, the three dates, Visual Check defect-criteria text, Total GSM (Box), Bursting factor, Flutes type, Flute Direction, Thickness (board), Compression Strength, Moisture Content, and Packing configuration — none of those are used here.
 Return ONLY one JSON object:
 {"item_code":"the leading numeric code from the Product field, e.g. '1223069359' from '1223069359 CFB Ghrit Common- New specs'","item_name":"the rest of the Product field after that code, e.g. 'CFB Ghrit Common- New specs'","no_of_ply":number (from Number of Plies),"box_length_min":number,"box_length_max":number,"box_width_min":number,"box_width_max":number,"box_height_min":number,"box_height_max":number,"paper_comb":"the Paper Combination and GSM text exactly as printed, e.g. '140(VK)/120(SK)/120(SK)/120(SK)/150(SK) ±10%'","partition_tier_count":number,"partition_longer_length_mm":number,"partition_longer_height_mm":number,"partition_longer_qty_total":number,"partition_shorter_width_mm":number,"partition_shorter_height_mm":number,"partition_shorter_qty_total":number,"paper_comb_partitions":"the Paper combination (Partition) text exactly as printed","no_of_plate":number,"paper_comb_plate":"the Paper combination (Plate) text exactly as printed","plate_length_mm":number,"plate_width_mm":number}
@@ -1453,7 +1458,6 @@ function FIMSApp() {
   const [production, setProduction] = useState([]);
   const [customerDispatch, setCustomerDispatch] = useState([]);
   const [daburSpecs, setDaburSpecs] = useState([]);
-  const [daburSpecCutting, setDaburSpecCutting] = useState([]);
   // The linked external cutting-spec Google Sheet — daburSpecSheetId is what's actually saved/used;
   // daburSpecSheetUrlInput is just the text box's own live value (starts equal to the saved ID/URL,
   // diverges as the person types, until they hit Save).
@@ -1482,8 +1486,15 @@ function FIMSApp() {
   // happens straight from Pending Review, see pushPendingRows) — kept only because applyReviewEdits/
   // getEditedPayload still read it as a harmless no-op rather than reworking that whole call chain.
   const [reviewEdits, setReviewEdits] = useState({}); // { [customer]: { [variantTitle]: { tabNameOverride, rowEdits: { [rowIndex]: {date,production,dispatch} }, deletedRows: { [rowIndex]: true } } } }
-  const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburSpecCutting, daburPO, daburDispatch };
-  const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburSpecCutting: setDaburSpecCutting, daburPO: setDaburPO, daburDispatch: setDaburDispatch, customerSheetsMirror: setCustomerSheetsMirror };
+  const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
+  const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch, customerSheetsMirror: setCustomerSheetsMirror };
+  // The cutting-spec (dabur_pm_spec_cutting) and reference-notes (dabur_spec) upload types share this
+  // ONE daburSpecs register/tab — no separate tab for either. Split apart here purely for display, by
+  // which fields are actually populated (item_code only ever comes from the cutting-sheet shape(),
+  // product_name only ever comes from the reference-notes shape()), reused by the tab's two panels,
+  // global search, and "Export all".
+  const daburSpecCuttingRows = daburSpecs.filter(r => r.item_code);
+  const daburSpecReferenceRows = daburSpecs.filter(r => r.product_name);
   useEffect(() => {
     (async () => {
       const entries = await Promise.all(Object.entries(STORAGE_KEYS).map(async ([k, storageKey]) => [k, await loadRegister(storageKey)]));
@@ -1737,7 +1748,7 @@ function FIMSApp() {
   // staleness that pattern would otherwise need guarding against) plus within the new batch itself, so
   // two copies of the same page queued together in one "Confirm all" don't both land either. Returns how
   // many were skipped so the caller can tell the user.
-  const DEDUP_REGISTERS = new Set(['rawMaterialIn', 'consumption', 'production', 'customerDispatch', 'daburSpecs', 'daburSpecCutting', 'daburPO', 'daburDispatch']);
+  const DEDUP_REGISTERS = new Set(['rawMaterialIn', 'consumption', 'production', 'customerDispatch', 'daburSpecs', 'daburPO', 'daburDispatch']);
   const addRows = (registerKey, rawRows) => {
     // Strip pre-confirm review metadata (flagged/flagReason) before a row ever reaches the actual
     // register — once a row is confirmed there is no flag anymore, the person just reviewed and
@@ -2188,7 +2199,8 @@ function FIMSApp() {
   // Appends confirmed cutting-spec rows straight to the linked external sheet — happens automatically
   // as part of confirming (no separate push step/button), per how this feature was asked for. A row
   // whose Item Code already exists in that sheet is skipped there (server-side dedup, separate from
-  // the LOCAL dedup addRows already did against daburSpecCutting) — reported back so it's not silent.
+  // the LOCAL exact-duplicate dedup addRows already did against the shared daburSpecs register) —
+  // reported back so it's not silent.
   const pushDaburSpecRowsExternally = async (rows) => {
     if (!daburSpecSheetId || !rows.length) return;
     setDaburSpecPushMsg('Pushing to the linked sheet…');
@@ -2218,7 +2230,10 @@ function FIMSApp() {
     // pointlessly re-extract (and re-attempt adding, though dedup would catch it) a page that's
     // already safely in the register.
     removeQueuedPages([page.id]);
-    if (pageConfig.register === 'daburSpecCutting') pushDaburSpecRowsExternally(page.rows);
+    // Keyed off the DOCUMENT TYPE, not the register — the cutting-sheet and reference-notes types now
+    // share the same daburSpecs register, so register alone can't distinguish which rows should also
+    // go to the external sheet.
+    if (page.docTypeKey === 'dabur_pm_spec_cutting') pushDaburSpecRowsExternally(page.rows);
     if (skipped) window.alert(`${skipped} row${skipped === 1 ? '' : 's'} exactly matched one already in the register and ${skipped === 1 ? "wasn't" : "weren't"} added again — looks like this page (or part of it) was uploaded before.`);
   };
   const confirmAllPages = () => {
@@ -2235,7 +2250,9 @@ function FIMSApp() {
     });
     let totalSkipped = 0;
     Object.entries(rowsByRegister).forEach(([register, rows]) => { totalSkipped += addRows(register, rows); });
-    if (rowsByRegister.daburSpecCutting) pushDaburSpecRowsExternally(rowsByRegister.daburSpecCutting);
+    // Keyed off the DOCUMENT TYPE, not the register — see confirmPage's identical note.
+    const cuttingSheetRows = donePages.filter(p => p.docTypeKey === 'dabur_pm_spec_cutting').flatMap(p => p.rows);
+    if (cuttingSheetRows.length) pushDaburSpecRowsExternally(cuttingSheetRows);
     // Only the pages just confirmed drop out of the queue/results — anything still pending, mid-
     // extraction, or errored stays put, since "confirm all completed" was never meant to also discard
     // whatever hadn't finished yet.
@@ -2890,8 +2907,11 @@ function FIMSApp() {
     { key: 'consumption', label: 'Consumption', rows: consumption, columns: COLUMNS.consumption },
     { key: 'production', label: 'Production Register', rows: production, columns: COLUMNS.production },
     { key: 'customerDispatch', label: 'Customer Dispatch Bills', rows: customerDispatch, columns: COLUMNS.customerDispatch },
-    { key: 'daburSpecs', label: 'Dabur — Spec Master', rows: daburSpecs, columns: COLUMNS.daburSpecs },
-    { key: 'daburSpecCutting', label: 'Dabur — Cutting Specs', rows: daburSpecCutting, columns: COLUMNS.daburSpecCutting },
+    { key: 'daburSpecs', label: 'Dabur — Spec Master', rows: daburSpecReferenceRows, columns: COLUMNS.daburSpecs },
+    // registerKey points update/delete at the REAL underlying register (daburSpecs — cutting-spec rows
+    // don't have a register of their own, see daburSpecCuttingRows above) — key stays distinct just so
+    // this renders as its own section, separate from the plain "daburSpecs" entry right above it.
+    { key: 'daburSpecCutting', registerKey: 'daburSpecs', label: 'Dabur — Cutting Specs', rows: daburSpecCuttingRows, columns: COLUMNS.daburSpecCutting },
     { key: 'daburPO', label: 'Dabur — Pending PO', rows: daburPO, columns: COLUMNS.daburPO },
     { key: 'daburDispatch', label: 'Dabur — Dispatch Log', rows: daburDispatch, columns: COLUMNS.daburDispatch },
   ];
@@ -3619,8 +3639,8 @@ function FIMSApp() {
     });
     sheets.push({ name: 'Production Register', rows: production, columns: COLUMNS.production, kind: 'table' });
     sheets.push({ name: 'Customer Dispatch Bills', rows: customerDispatch, columns: COLUMNS.customerDispatch, kind: 'table' });
-    sheets.push({ name: 'Dabur Spec Master', rows: daburSpecs, columns: COLUMNS.daburSpecs, kind: 'table' });
-    sheets.push({ name: 'Dabur Cutting Specs', rows: daburSpecCutting, columns: COLUMNS.daburSpecCutting, kind: 'table' });
+    sheets.push({ name: 'Dabur Spec Master', rows: daburSpecReferenceRows, columns: COLUMNS.daburSpecs, kind: 'table' });
+    sheets.push({ name: 'Dabur Cutting Specs', rows: daburSpecCuttingRows, columns: COLUMNS.daburSpecCutting, kind: 'table' });
     sheets.push({
       name: 'Dabur Pending PO', kind: 'table', rows: daburPOWithPending.map(r => ({ ...r, status: r.fulfilled ? 'Fulfilled' : 'Pending' })), columns: [
         ...COLUMNS.daburPO, { key: 'dispatched_qty', label: 'Dispatched Qty' }, { key: 'pending_qty', label: 'Pending Qty' }, { key: 'status', label: 'Status' },
@@ -4282,7 +4302,7 @@ function FIMSApp() {
               {globalSearchResults && globalSearchResults.registerMatches.map(reg => (
                 <div className="panel" key={reg.key}>
                   <div className="section-label">{reg.label} ({reg.rows.length})</div>
-                  <EditableTable columns={reg.columns} rows={reg.rows} onUpdate={updateRow(reg.key)} onDelete={deleteRow(reg.key)} emptyLabel="No matches." />
+                  <EditableTable columns={reg.columns} rows={reg.rows} onUpdate={updateRow(reg.registerKey || reg.key)} onDelete={deleteRow(reg.registerKey || reg.key)} emptyLabel="No matches." />
                 </div>
               ))}
             </div>
@@ -4301,10 +4321,10 @@ function FIMSApp() {
                 {daburSpecPushMsg && <div className="doc-hint" style={{ marginTop: 6 }}>{daburSpecPushMsg}</div>}
                 {!daburSpecSheetId && <div className="doc-hint" style={{ marginTop: 6 }}>Not linked yet — extractions still save locally below, but won't push anywhere until a sheet is linked here.</div>}
               </div>
-              <RegisterPanel title="Cutting Specs (confirmed)" subtitle="Every confirmed row from the 'Dabur PM Spec (cutting sheet)' upload type — kept here locally as well as pushed to the linked sheet above." columns={COLUMNS.daburSpecCutting} rows={daburSpecCutting}
-                onUpdate={updateRow('daburSpecCutting')} onDelete={deleteRow('daburSpecCutting')} onExport={() => exportSheet('Dabur_Spec_Cutting', daburSpecCutting, COLUMNS.daburSpecCutting)} />
-              <RegisterPanel title="Dabur — Spec Master (reference notes)" subtitle="Replaces the manual diary — one row per box item, from printed PM Specification sheets. Free-form reference notes; use the cutting-spec sheet above for structured dimensions." columns={COLUMNS.daburSpecs} rows={daburSpecs}
-                onUpdate={updateRow('daburSpecs')} onDelete={deleteRow('daburSpecs')} onExport={() => exportSheet('Dabur_Spec_Master', daburSpecs, COLUMNS.daburSpecs)} />
+              <RegisterPanel title="Cutting Specs (confirmed)" subtitle="Every confirmed row from the 'Dabur PM Spec (cutting sheet)' upload type — stored in this SAME Dabur — Spec Master tab as the reference notes below (no separate tab), shown here as its own view, and also pushed to the linked sheet above." columns={COLUMNS.daburSpecCutting} rows={daburSpecCuttingRows}
+                onUpdate={updateRow('daburSpecs')} onDelete={deleteRow('daburSpecs')} onExport={() => exportSheet('Dabur_Spec_Cutting', daburSpecCuttingRows, COLUMNS.daburSpecCutting)} />
+              <RegisterPanel title="Dabur — Spec Master (reference notes)" subtitle="Replaces the manual diary — one row per box item, from printed PM Specification sheets. Free-form reference notes; use the cutting-spec sheet above for structured dimensions." columns={COLUMNS.daburSpecs} rows={daburSpecReferenceRows}
+                onUpdate={updateRow('daburSpecs')} onDelete={deleteRow('daburSpecs')} onExport={() => exportSheet('Dabur_Spec_Master', daburSpecReferenceRows, COLUMNS.daburSpecs)} />
             </div>
           )}
           {loaded && activeTab === 'daburPO' && (
