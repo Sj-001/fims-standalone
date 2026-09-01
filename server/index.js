@@ -4,7 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const { requireEnv, login, logout, requireAuth } = require('./lib/auth');
 const { extract } = require('./lib/anthropic');
-const { getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler, listTabsHandler, deleteTabsHandler } = require('./lib/sheets');
+const { getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler, listTabsHandler, deleteTabsHandler, pushDaburSpecRowsHandler } = require('./lib/sheets');
 
 // Fail fast and loud if required secrets are missing, instead of the app half-working with
 // confusing downstream errors — matches the "no guesses" standard this project was built to.
@@ -76,6 +76,10 @@ app.get('/api/service-account-email', getServiceAccountEmailHandler);
 // accounts have no Drive storage of their own), but writing into an already-shared blank sheet needs
 // nothing beyond the existing Sheets permission. See generateCustomerSheetStructure in lib/sheets.js.
 app.post('/api/customer-sheets/generate-structure', generateCustomerSheetStructureHandler);
+// Dabur PM Spec "cutting sheet" push: appends confirmed rows to a person's own external tracking
+// spreadsheet (spreadsheetId from the request body, not GOOGLE_SHEET_ID) — never overwrites, skips
+// rows whose Item Code already exists there. See appendDaburSpecRows in lib/sheets.js.
+app.post('/api/dabur-spec-sheet/push', pushDaburSpecRowsHandler);
 // Main-sheet maintenance: list every tab (labeled known/internal/unrecognized, see lib/sheets.js) and
 // delete a person-confirmed list of them — surfaced in the app's Settings screen.
 app.get('/api/maintenance/tabs', listTabsHandler);

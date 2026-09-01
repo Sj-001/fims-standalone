@@ -273,8 +273,14 @@ const STORAGE_KEYS = {
   production: 'fims_production',
   customerDispatch: 'fims_customer_dispatch',
   daburSpecs: 'fims_dabur_specs',
+  daburSpecCutting: 'fims_dabur_spec_cutting',
   daburPO: 'fims_dabur_po',
   daburDispatch: 'fims_dabur_dispatch',
+  // ONE row holding the linked external cutting-spec Google Sheet's ID — see the "Cutting-Spec Sheet"
+  // panel on the Dabur — Spec Master tab. Stored as just another tiny flat register (same generic
+  // tab-bridge, zero new backend storage code) rather than browser localStorage, so which sheet is
+  // linked survives across devices/browsers the same way every other piece of app data does.
+  daburSpecSheetConfig: 'fims_dabur_spec_sheet_config',
   // A local mirror of every customer's real Sheet content (every ledger row across every block/tab),
   // refreshed whenever a Sheet ID is imported or pushed to — see confirmSheetImport/pushCustomerSheetNow.
   // Stored as just another flat register (same generic tab-bridge everything else here uses), so global
@@ -527,6 +533,15 @@ function normalizeNumericStr(raw) {
   if (Number.isNaN(n)) return s;
   return String(n);
 }
+// Pulls the spreadsheet ID out of a pasted Google Sheets URL (the long id/d/<THIS>/edit segment), or
+// accepts the bare ID itself if that's what was pasted instead of a full URL.
+function parseSheetIdFromUrl(input) {
+  const s = String(input || '').trim();
+  const m = s.match(/\/d\/([a-zA-Z0-9_-]+)/);
+  if (m) return m[1];
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(s)) return s;
+  return '';
+}
 // Real chronological ordering for D.M.YY / D.M.YYYY dot-formatted dates. A plain string compare
 // (what the ledger sort used before) sorts "11.8.26" before "3.8.26" because '1' < '3' character by
 // character, even though August 3rd is chronologically first — confirmed live in the Customer Sheets
@@ -711,6 +726,71 @@ Return ONLY one JSON object: {"invoice_no":"","date":"","party":"","buyer_order_
     shape: (raw) => (Array.isArray(raw) ? raw : []).map(r => ({ id: genId(), product_name: r.product_name || '', box_size: r.box_size || '', gsm_combo: r.gsm_combo || '', partition_size: r.partition_size || '', plate_size: r.plate_size || '', compression: r.compression || '', notes: r.notes || '' })),
   },
   {
+    key: 'dabur_pm_spec_cutting',
+    label: 'Dabur PM Spec (cutting sheet)',
+    hint: 'Printed Dabur PM Specification sheet — extracts the cutting dimensions and paper combinations needed for the box/partition/plate sheet sizes, and computes the derived inch/sheet-size fields. Confirmed rows push straight to the external cutting-spec Google Sheet linked below (and save locally too).',
+    register: 'daburSpecCutting',
+    systemPrompt: `You read a printed "Dabur India Limited — PM Specification" sheet for a corrugated box. It has a header info block (Product, Shelf Life, Creation/Revision/Valid dates) followed by a numbered spec table (S.No / TEST / SPECIFICATION / STANDARD TEST PROCEDURE). Extract ONLY the specific fields listed below — ignore Shelf Life, the three dates, Visual Check defect-criteria text, Total GSM (Box), Bursting factor, Flutes type, Flute Direction, Thickness (board), Compression Strength, Moisture Content, and Packing configuration — none of those are used here.
+Return ONLY one JSON object:
+{"item_code":"the leading numeric code from the Product field, e.g. '1223069359' from '1223069359 CFB Ghrit Common- New specs'","item_name":"the rest of the Product field after that code, e.g. 'CFB Ghrit Common- New specs'","no_of_ply":number (from Number of Plies),"box_length_min":number,"box_length_max":number,"box_width_min":number,"box_width_max":number,"box_height_min":number,"box_height_max":number,"paper_comb":"the Paper Combination and GSM text exactly as printed, e.g. '140(VK)/120(SK)/120(SK)/120(SK)/150(SK) ±10%'","partition_tier_count":number,"partition_longer_length_mm":number,"partition_longer_height_mm":number,"partition_longer_qty_total":number,"partition_shorter_width_mm":number,"partition_shorter_height_mm":number,"partition_shorter_qty_total":number,"paper_comb_partitions":"the Paper combination (Partition) text exactly as printed","no_of_plate":number,"paper_comb_plate":"the Paper combination (Plate) text exactly as printed","plate_length_mm":number,"plate_width_mm":number}
+FIELD NOTES:
+- box_length_min/max, box_width_min/max, box_height_min/max: from the Length/Width/Height rows' tolerance ranges, e.g. "338.00 - 344.00mm" -> box_length_min=338, box_length_max=344. Strip the "mm" unit; keep the two numbers exactly as printed, do not average them yourself.
+- The Partition Size row typically reads like "337(L)X95(H)±2mm-Longer side-5 nos for 1st tier and 5 for 2nd tier" plus a second line like "330(W)X95(H)-short side-5 nos for 1st tier and 5 for 2nd tier": partition_longer_length_mm/partition_longer_height_mm come from the "Longer side" line's two dimensions (337 and 95 here) — drop the ± tolerance. partition_shorter_width_mm/partition_shorter_height_mm come from the "short side" line the same way (330 and 95 here).
+- partition_tier_count: count the DISTINCT tiers mentioned in the Partition Size row (e.g. "1st tier" and "2nd tier" mentioned -> 2). If the row gives just one plain count with no tier language at all, use 1.
+- partition_longer_qty_total / partition_shorter_qty_total: the TOTAL piece count for that side, summed across every tier mentioned (e.g. "5 nos for 1st tier and 5 for 2nd tier" -> 5+5=10 for that side). Do not just copy the per-tier number if more than one tier is mentioned — add them up.
+- If the sheet has no Partition Size row at all (some box specs genuinely have no internal partitions), set partition_tier_count to 0, all four partition dimension fields and both partition qty fields to 0, and paper_comb_partitions to an empty string — do not invent partition data that isn't printed on this specific sheet. Same rule for plate fields (no_of_plate=0, plate_length_mm/plate_width_mm=0, paper_comb_plate="") if there's no Central Plate row.
+- Never do any arithmetic yourself — no averaging, no unit conversion, no multiplying tier counts. Extract every number exactly as printed; all calculation happens after this, outside your response.`,
+    shape: (raw) => {
+      if (!raw) return [];
+      // All rounding happens ONLY at the point a field is stored/displayed — every intermediate step
+      // (box inches feeding into Sheet_len/Sheet_wid) is computed at full floating-point precision, so
+      // rounding box_length_inch to 2dp for display never compounds into a slightly-off Sheet_size_inch.
+      const round2 = (n) => Math.round(n * 100) / 100;
+      const mmToInRaw = (mm) => num(mm) / 25.4;
+      const boxL = (num(raw.box_length_min) + num(raw.box_length_max)) / 2;
+      const boxW = (num(raw.box_width_min) + num(raw.box_width_max)) / 2;
+      const boxH = (num(raw.box_height_min) + num(raw.box_height_max)) / 2;
+      const boxLInRaw = mmToInRaw(boxL), boxWInRaw = mmToInRaw(boxW), boxHInRaw = mmToInRaw(boxH);
+      // Sheet_len = (len + wid) x 2 + 1.5 — a fixed 1.5" trim allowance added to twice the box's own
+      // length+width. Sheet_wid = (wid + height) x FLOOR(|46 / (wid + height)|) — 46" is the roll/sheet
+      // width this factory cuts from; the floor of how many (wid+height) units fit across that 46"
+      // multiplied back gives the actual usable sheet width (never the raw, unrounded division).
+      const sheetLen = round2((boxLInRaw + boxWInRaw) * 2 + 1.5);
+      const widHeightSumRaw = boxWInRaw + boxHInRaw;
+      const widthDivisor = widHeightSumRaw > 0 ? Math.floor(Math.abs(46 / widHeightSumRaw)) : 0;
+      const sheetWid = round2(widHeightSumRaw * widthDivisor);
+      const tierCount = num(raw.partition_tier_count);
+      const hasPartitions = tierCount > 0;
+      const plateCount = num(raw.no_of_plate);
+      const hasPlate = plateCount > 0;
+      const partLongerLIn = round2(mmToInRaw(raw.partition_longer_length_mm)), partLongerHIn = round2(mmToInRaw(raw.partition_longer_height_mm));
+      const partShorterWIn = round2(mmToInRaw(raw.partition_shorter_width_mm)), partShorterHIn = round2(mmToInRaw(raw.partition_shorter_height_mm));
+      const plateLIn = round2(mmToInRaw(raw.plate_length_mm)), plateWIn = round2(mmToInRaw(raw.plate_width_mm));
+      return [{
+        id: genId(),
+        item_code: String(raw.item_code || '').trim(),
+        item_name: String(raw.item_name || '').trim(),
+        no_of_ply: num(raw.no_of_ply),
+        box_length_mm: boxL, box_width_mm: boxW, box_height_mm: boxH,
+        paper_comb: raw.paper_comb || '',
+        box_length_inch: round2(boxLInRaw), box_width_inch: round2(boxWInRaw), box_height_inch: round2(boxHInRaw),
+        sheet_size_inch: `${sheetLen} x ${sheetWid}`,
+        no_of_partitions: tierCount,
+        paper_comb_partitions: hasPartitions ? (raw.paper_comb_partitions || '') : '',
+        partition_longer_piece: hasPartitions ? `${num(raw.partition_longer_length_mm)}x${num(raw.partition_longer_height_mm)}` : '',
+        partition_shorter_piece: hasPartitions ? `${num(raw.partition_shorter_width_mm)}x${num(raw.partition_shorter_height_mm)}` : '',
+        partition_longer_piece_inch: hasPartitions ? `${partLongerLIn} x ${partLongerHIn}` : '',
+        partition_shorter_piece_inch: hasPartitions ? `${partShorterWIn} x ${partShorterHIn}` : '',
+        partition_longer_qty: hasPartitions ? num(raw.partition_longer_qty_total) : 0,
+        partition_shorter_qty: hasPartitions ? num(raw.partition_shorter_qty_total) : 0,
+        no_of_plate: plateCount,
+        paper_comb_plate: hasPlate ? (raw.paper_comb_plate || '') : '',
+        plate_size_mm: hasPlate ? `${num(raw.plate_length_mm)}x${num(raw.plate_width_mm)}` : '',
+        plate_size_inch: hasPlate ? `${plateLIn} x ${plateWIn}` : '',
+      }];
+    },
+  },
+  {
     key: 'dabur_po',
     label: 'Dabur Purchase Order (printed)',
     hint: 'Printed purchase order from Dabur — creates entries on the Pending PO list.',
@@ -771,6 +851,23 @@ const COLUMNS = {
     { key: 'product_name', label: 'Product' }, { key: 'box_size', label: 'Box Size (L x W x H)' },
     { key: 'gsm_combo', label: 'Paper Combination / GSM' }, { key: 'partition_size', label: 'Partition' },
     { key: 'plate_size', label: 'Plate' }, { key: 'compression', label: 'Compression' }, { key: 'notes', label: 'Notes' },
+  ],
+  // Mirrors the exact 23-column layout of the external cutting-spec Google Sheet this pushes to (see
+  // DABUR_SPEC_COLUMN_ORDER in server/lib/sheets.js) — column order here doesn't need to match that
+  // list exactly (this is just for on-screen review/local display), but the field KEYS must, since
+  // that's what actually gets sent to the sheet.
+  daburSpecCutting: [
+    { key: 'item_code', label: 'Item Code' }, { key: 'item_name', label: 'Item Name' }, { key: 'no_of_ply', label: 'No. of Ply', type: 'number' },
+    { key: 'box_length_mm', label: 'Box Length (mm)', type: 'number' }, { key: 'box_width_mm', label: 'Box Width (mm)', type: 'number' }, { key: 'box_height_mm', label: 'Box Height (mm)', type: 'number' },
+    { key: 'paper_comb', label: 'Paper Combination' },
+    { key: 'box_length_inch', label: 'Box Length (in)', type: 'number' }, { key: 'box_width_inch', label: 'Box Width (in)', type: 'number' }, { key: 'box_height_inch', label: 'Box Height (in)', type: 'number' },
+    { key: 'sheet_size_inch', label: 'Sheet Size (in)' },
+    { key: 'no_of_partitions', label: 'No. of Partitions (tiers)', type: 'number' }, { key: 'paper_comb_partitions', label: 'Paper Comb (Partitions)' },
+    { key: 'partition_longer_piece', label: 'Partition Longer (mm)' }, { key: 'partition_shorter_piece', label: 'Partition Shorter (mm)' },
+    { key: 'partition_longer_piece_inch', label: 'Partition Longer (in)' }, { key: 'partition_shorter_piece_inch', label: 'Partition Shorter (in)' },
+    { key: 'partition_longer_qty', label: 'Partition Longer Qty', type: 'number' }, { key: 'partition_shorter_qty', label: 'Partition Shorter Qty', type: 'number' },
+    { key: 'no_of_plate', label: 'No. of Plate', type: 'number' }, { key: 'paper_comb_plate', label: 'Paper Comb (Plate)' },
+    { key: 'plate_size_mm', label: 'Plate Size (mm)' }, { key: 'plate_size_inch', label: 'Plate Size (in)' },
   ],
   daburPO: [
     { key: 'po_number', label: 'PO Number' }, { key: 'date', label: 'Date' }, { key: 'material_desc', label: 'Material' },
@@ -1356,6 +1453,14 @@ function FIMSApp() {
   const [production, setProduction] = useState([]);
   const [customerDispatch, setCustomerDispatch] = useState([]);
   const [daburSpecs, setDaburSpecs] = useState([]);
+  const [daburSpecCutting, setDaburSpecCutting] = useState([]);
+  // The linked external cutting-spec Google Sheet — daburSpecSheetId is what's actually saved/used;
+  // daburSpecSheetUrlInput is just the text box's own live value (starts equal to the saved ID/URL,
+  // diverges as the person types, until they hit Save).
+  const [daburSpecSheetId, setDaburSpecSheetId] = useState('');
+  const [daburSpecSheetUrlInput, setDaburSpecSheetUrlInput] = useState('');
+  const [daburSpecSheetSaveMsg, setDaburSpecSheetSaveMsg] = useState('');
+  const [daburSpecPushMsg, setDaburSpecPushMsg] = useState('');
   const [daburPO, setDaburPO] = useState([]);
   const [daburDispatch, setDaburDispatch] = useState([]);
   const [customerSheetsMirror, setCustomerSheetsMirror] = useState([]); // [{id, customer, sheetTab, block, date, opening, production, dispatch, closing}]
@@ -1377,13 +1482,18 @@ function FIMSApp() {
   // happens straight from Pending Review, see pushPendingRows) — kept only because applyReviewEdits/
   // getEditedPayload still read it as a harmless no-op rather than reworking that whole call chain.
   const [reviewEdits, setReviewEdits] = useState({}); // { [customer]: { [variantTitle]: { tabNameOverride, rowEdits: { [rowIndex]: {date,production,dispatch} }, deletedRows: { [rowIndex]: true } } } }
-  const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
-  const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch, customerSheetsMirror: setCustomerSheetsMirror };
+  const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburSpecCutting, daburPO, daburDispatch };
+  const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburSpecCutting: setDaburSpecCutting, daburPO: setDaburPO, daburDispatch: setDaburDispatch, customerSheetsMirror: setCustomerSheetsMirror };
   useEffect(() => {
     (async () => {
       const entries = await Promise.all(Object.entries(STORAGE_KEYS).map(async ([k, storageKey]) => [k, await loadRegister(storageKey)]));
       const loadedMap = Object.fromEntries(entries);
       Object.entries(loadedMap).forEach(([k, rows]) => registerSetters[k] && registerSetters[k](rows));
+      const specSheetCfg = (loadedMap.daburSpecSheetConfig || [])[0];
+      if (specSheetCfg && specSheetCfg.spreadsheetId) {
+        setDaburSpecSheetId(specSheetCfg.spreadsheetId);
+        setDaburSpecSheetUrlInput(specSheetCfg.spreadsheetId);
+      }
       setTrainingExamples(await loadTraining());
       try {
         const r = await window.storage.get(CUSTOMER_MAPPING_KEY, false);
@@ -1627,7 +1737,7 @@ function FIMSApp() {
   // staleness that pattern would otherwise need guarding against) plus within the new batch itself, so
   // two copies of the same page queued together in one "Confirm all" don't both land either. Returns how
   // many were skipped so the caller can tell the user.
-  const DEDUP_REGISTERS = new Set(['rawMaterialIn', 'consumption', 'production', 'customerDispatch', 'daburSpecs', 'daburPO', 'daburDispatch']);
+  const DEDUP_REGISTERS = new Set(['rawMaterialIn', 'consumption', 'production', 'customerDispatch', 'daburSpecs', 'daburSpecCutting', 'daburPO', 'daburDispatch']);
   const addRows = (registerKey, rawRows) => {
     // Strip pre-confirm review metadata (flagged/flagReason) before a row ever reaches the actual
     // register — once a row is confirmed there is no flag anymore, the person just reviewed and
@@ -2065,6 +2175,38 @@ function FIMSApp() {
       return next;
     });
   };
+  // Saves the linked external cutting-spec sheet — parses whatever was pasted (a full URL or a bare
+  // ID) down to just the ID, which is all the backend actually needs.
+  const saveDaburSpecSheetUrl = async () => {
+    const id = parseSheetIdFromUrl(daburSpecSheetUrlInput);
+    if (!id) { setDaburSpecSheetSaveMsg('That doesn\'t look like a Google Sheet URL or ID — paste the link from the address bar (or Share → Copy link).'); return; }
+    setDaburSpecSheetId(id);
+    setDaburSpecSheetUrlInput(id);
+    await saveRegister(STORAGE_KEYS.daburSpecSheetConfig, [{ spreadsheetId: id }]);
+    setDaburSpecSheetSaveMsg('Saved — confirmed "Dabur PM Spec (cutting sheet)" extractions will push here automatically from now on.');
+  };
+  // Appends confirmed cutting-spec rows straight to the linked external sheet — happens automatically
+  // as part of confirming (no separate push step/button), per how this feature was asked for. A row
+  // whose Item Code already exists in that sheet is skipped there (server-side dedup, separate from
+  // the LOCAL dedup addRows already did against daburSpecCutting) — reported back so it's not silent.
+  const pushDaburSpecRowsExternally = async (rows) => {
+    if (!daburSpecSheetId || !rows.length) return;
+    setDaburSpecPushMsg('Pushing to the linked sheet…');
+    try {
+      const res = await fetch('/api/dabur-spec-sheet/push', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+        body: JSON.stringify({ spreadsheetId: daburSpecSheetId, rows }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { setDaburSpecPushMsg(`Saved locally, but couldn't push to the linked sheet: ${data.error || `HTTP ${res.status}`}`); return; }
+      const parts = [];
+      if (data.added) parts.push(`${data.added} row${data.added === 1 ? '' : 's'} added`);
+      if (data.skipped) parts.push(`${data.skipped} skipped — Item Code already there`);
+      setDaburSpecPushMsg(parts.length ? `Pushed to the linked sheet: ${parts.join(', ')}.` : 'Nothing new to push — every row was already in the linked sheet.');
+    } catch (e) {
+      setDaburSpecPushMsg(`Saved locally, but couldn't reach the linked sheet: ${e.message || 'unknown error'}`);
+    }
+  };
   const confirmPage = (idx) => {
     const page = fileResults[idx];
     if (!page || !page.rows.length) return;
@@ -2076,6 +2218,7 @@ function FIMSApp() {
     // pointlessly re-extract (and re-attempt adding, though dedup would catch it) a page that's
     // already safely in the register.
     removeQueuedPages([page.id]);
+    if (pageConfig.register === 'daburSpecCutting') pushDaburSpecRowsExternally(page.rows);
     if (skipped) window.alert(`${skipped} row${skipped === 1 ? '' : 's'} exactly matched one already in the register and ${skipped === 1 ? "wasn't" : "weren't"} added again — looks like this page (or part of it) was uploaded before.`);
   };
   const confirmAllPages = () => {
@@ -2092,6 +2235,7 @@ function FIMSApp() {
     });
     let totalSkipped = 0;
     Object.entries(rowsByRegister).forEach(([register, rows]) => { totalSkipped += addRows(register, rows); });
+    if (rowsByRegister.daburSpecCutting) pushDaburSpecRowsExternally(rowsByRegister.daburSpecCutting);
     // Only the pages just confirmed drop out of the queue/results — anything still pending, mid-
     // extraction, or errored stays put, since "confirm all completed" was never meant to also discard
     // whatever hadn't finished yet.
@@ -2747,6 +2891,7 @@ function FIMSApp() {
     { key: 'production', label: 'Production Register', rows: production, columns: COLUMNS.production },
     { key: 'customerDispatch', label: 'Customer Dispatch Bills', rows: customerDispatch, columns: COLUMNS.customerDispatch },
     { key: 'daburSpecs', label: 'Dabur — Spec Master', rows: daburSpecs, columns: COLUMNS.daburSpecs },
+    { key: 'daburSpecCutting', label: 'Dabur — Cutting Specs', rows: daburSpecCutting, columns: COLUMNS.daburSpecCutting },
     { key: 'daburPO', label: 'Dabur — Pending PO', rows: daburPO, columns: COLUMNS.daburPO },
     { key: 'daburDispatch', label: 'Dabur — Dispatch Log', rows: daburDispatch, columns: COLUMNS.daburDispatch },
   ];
@@ -3475,6 +3620,7 @@ function FIMSApp() {
     sheets.push({ name: 'Production Register', rows: production, columns: COLUMNS.production, kind: 'table' });
     sheets.push({ name: 'Customer Dispatch Bills', rows: customerDispatch, columns: COLUMNS.customerDispatch, kind: 'table' });
     sheets.push({ name: 'Dabur Spec Master', rows: daburSpecs, columns: COLUMNS.daburSpecs, kind: 'table' });
+    sheets.push({ name: 'Dabur Cutting Specs', rows: daburSpecCutting, columns: COLUMNS.daburSpecCutting, kind: 'table' });
     sheets.push({
       name: 'Dabur Pending PO', kind: 'table', rows: daburPOWithPending.map(r => ({ ...r, status: r.fulfilled ? 'Fulfilled' : 'Pending' })), columns: [
         ...COLUMNS.daburPO, { key: 'dispatched_qty', label: 'Dispatched Qty' }, { key: 'pending_qty', label: 'Pending Qty' }, { key: 'status', label: 'Status' },
@@ -4142,8 +4288,24 @@ function FIMSApp() {
             </div>
           )}
           {loaded && activeTab === 'daburSpecs' && (
-            <RegisterPanel title="Dabur — Spec Master" subtitle="Replaces the manual diary — one row per box item, from printed PM Specification sheets." columns={COLUMNS.daburSpecs} rows={daburSpecs}
-              onUpdate={updateRow('daburSpecs')} onDelete={deleteRow('daburSpecs')} onExport={() => exportSheet('Dabur_Spec_Master', daburSpecs, COLUMNS.daburSpecs)} />
+            <div>
+              <div className="panel">
+                <h2 style={{ marginBottom: 6 }}>Cutting-Spec Sheet (external)</h2>
+                <p className="subtitle" style={{ marginBottom: 10 }}>Paste the Google Sheet URL where confirmed "Dabur PM Spec (cutting sheet)" extractions (box/partition/plate dimensions, paper combinations, and the derived inch/sheet-size formulas) get pushed automatically the moment you confirm — separate from the reference notes register below. Rows are only ever appended to that sheet, never overwritten, and a row whose Item Code already exists there is skipped rather than duplicated.</p>
+                <div className="field-row">
+                  <input className="cell-input" style={{ flex: 1, minWidth: 260 }} placeholder="Paste the Google Sheet URL (or its ID)…"
+                    value={daburSpecSheetUrlInput} onChange={e => setDaburSpecSheetUrlInput(e.target.value)} />
+                  <button className="btn btn-primary" onClick={saveDaburSpecSheetUrl}>Save</button>
+                </div>
+                {daburSpecSheetSaveMsg && <div className="doc-hint" style={{ marginTop: 6 }}>{daburSpecSheetSaveMsg}</div>}
+                {daburSpecPushMsg && <div className="doc-hint" style={{ marginTop: 6 }}>{daburSpecPushMsg}</div>}
+                {!daburSpecSheetId && <div className="doc-hint" style={{ marginTop: 6 }}>Not linked yet — extractions still save locally below, but won't push anywhere until a sheet is linked here.</div>}
+              </div>
+              <RegisterPanel title="Cutting Specs (confirmed)" subtitle="Every confirmed row from the 'Dabur PM Spec (cutting sheet)' upload type — kept here locally as well as pushed to the linked sheet above." columns={COLUMNS.daburSpecCutting} rows={daburSpecCutting}
+                onUpdate={updateRow('daburSpecCutting')} onDelete={deleteRow('daburSpecCutting')} onExport={() => exportSheet('Dabur_Spec_Cutting', daburSpecCutting, COLUMNS.daburSpecCutting)} />
+              <RegisterPanel title="Dabur — Spec Master (reference notes)" subtitle="Replaces the manual diary — one row per box item, from printed PM Specification sheets. Free-form reference notes; use the cutting-spec sheet above for structured dimensions." columns={COLUMNS.daburSpecs} rows={daburSpecs}
+                onUpdate={updateRow('daburSpecs')} onDelete={deleteRow('daburSpecs')} onExport={() => exportSheet('Dabur_Spec_Master', daburSpecs, COLUMNS.daburSpecs)} />
+            </div>
           )}
           {loaded && activeTab === 'daburPO' && (
             <div className="panel">

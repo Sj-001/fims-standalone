@@ -1721,4 +1721,72 @@ async function deleteTabsHandler(req, res) {
   }
 }
 
-module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler, listTabsHandler, deleteTabsHandler };
+// Fixed column order for the Dabur PM Spec "cutting sheet" push (see appendDaburSpecRows) — this is a
+// bespoke, single-purpose integration with ONE specific person-owned spreadsheet layout (the exact
+// columns worked out by hand against a real Dabur PM Specification PDF), not a generic system, so the
+// order is hardcoded here rather than derived from the target sheet's own header row.
+const DABUR_SPEC_COLUMN_ORDER = [
+  'item_code', 'item_name', 'no_of_ply',
+  'box_length_mm', 'box_width_mm', 'box_height_mm',
+  'paper_comb',
+  'box_length_inch', 'box_width_inch', 'box_height_inch',
+  'sheet_size_inch',
+  'no_of_partitions', 'paper_comb_partitions',
+  'partition_longer_piece', 'partition_shorter_piece',
+  'partition_longer_piece_inch', 'partition_shorter_piece_inch',
+  'partition_longer_qty', 'partition_shorter_qty',
+  'no_of_plate', 'paper_comb_plate',
+  'plate_size_mm', 'plate_size_inch',
+];
+
+// Appends confirmed Dabur PM Spec rows to a PERSON'S OWN external spreadsheet (not GOOGLE_SHEET_ID) —
+// distinct from writeTab, which always overwrites a tab's ENTIRE contents. This only ever ADDS rows,
+// via the Sheets API's own values.append (it finds the next empty row itself, so this can never
+// clobber anything already in the sheet), and skips any row whose Item Code already exists there —
+// the sheet has a 2-row header (a grouped header row, then a per-column sub-header row), so existing
+// data starts at row 3. Always targets the spreadsheet's FIRST tab, matching how this feature is used
+// (one person's own single-tab tracking sheet, not a multi-tab structure).
+async function appendDaburSpecRows(spreadsheetId, rows) {
+  const sheets = getSheetsClient();
+  const meta = await sheets.spreadsheets.get({ spreadsheetId, fields: 'sheets.properties(sheetId,title)' });
+  const firstSheet = (meta.data.sheets || [])[0];
+  if (!firstSheet) throw new Error('That spreadsheet has no tabs.');
+  const tabName = firstSheet.properties.title;
+  const safeTabName = tabName.replace(/'/g, "''");
+  const existingResp = await sheets.spreadsheets.values.get({ spreadsheetId, range: `'${safeTabName}'!A3:A` });
+  const existingCodes = new Set((existingResp.data.values || []).flat().map(v => String(v).trim()).filter(Boolean));
+  const seenInBatch = new Set();
+  const toAppend = rows.filter(r => {
+    const code = String(r.item_code || '').trim();
+    if (!code || existingCodes.has(code) || seenInBatch.has(code)) return false;
+    seenInBatch.add(code);
+    return true;
+  });
+  const skipped = rows.length - toAppend.length;
+  if (!toAppend.length) return { added: 0, skipped };
+  const values = toAppend.map(r => DABUR_SPEC_COLUMN_ORDER.map(k => (r[k] === undefined || r[k] === null) ? '' : String(r[k])));
+  await sheets.spreadsheets.values.append({
+    spreadsheetId,
+    range: `'${safeTabName}'!A1`,
+    valueInputOption: 'RAW',
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values },
+  });
+  return { added: toAppend.length, skipped };
+}
+
+async function pushDaburSpecRowsHandler(req, res) {
+  try {
+    const { spreadsheetId, rows } = req.body || {};
+    if (!spreadsheetId || !Array.isArray(rows) || !rows.length) {
+      return res.status(400).json({ error: 'spreadsheetId and a non-empty rows array are required.' });
+    }
+    const result = await appendDaburSpecRows(spreadsheetId, rows);
+    res.json(result);
+  } catch (e) {
+    console.error('Dabur spec sheet push error:', e);
+    res.status(502).json({ error: friendlyGoogleError(e) });
+  }
+}
+
+module.exports = { readTab, writeTab, writeBlocksTab, getTab, putTab, putBlocksTab, pushCustomerSheetHandler, previewCustomerSheetHandler, importCustomerSheetHandler, getServiceAccountEmailHandler, generateCustomerSheetStructureHandler, listTabsHandler, deleteTabsHandler, pushDaburSpecRowsHandler };
