@@ -272,12 +272,6 @@ const STORAGE_KEYS = {
   consumption: 'fims_consumption',
   production: 'fims_production',
   customerDispatch: 'fims_customer_dispatch',
-  // Both the free-form reference notes (dabur_spec) AND the structured cutting-spec extraction
-  // (dabur_pm_spec_cutting) land in this SAME tab — no separate tab for the cutting-spec rows; they're
-  // just rows with a different set of fields populated (item_code/box_length_mm/... vs product_name/
-  // box_size/...) sharing the one array/tab. Split apart only for DISPLAY, by which fields are
-  // populated — see the daburSpecCuttingRows/daburSpecReferenceRows filters in the Dabur — Spec Master
-  // tab's render.
   daburSpecs: 'fims_dabur_specs',
   daburPO: 'fims_dabur_po',
   daburDispatch: 'fims_dabur_dispatch',
@@ -722,15 +716,6 @@ Return ONLY one JSON object: {"invoice_no":"","date":"","party":"","buyer_order_
     },
   },
   {
-    key: 'dabur_spec',
-    label: 'Dabur Spec Sheet (reference)',
-    hint: 'Printed Dabur PM Specification sheet for a box item — replaces the manual diary.',
-    register: 'daburSpecs',
-    systemPrompt: `You read a printed "Dabur India Limited — PM Specification" sheet for a corrugated box. Return ONLY a JSON array with ONE object:
-[{"product_name":"product/item name","box_size":"Length x Width x Height with units, from the Length/Width/Height rows","gsm_combo":"the paper combination and GSM text, e.g. 140(VK)/120(SK)/120(SK)/120(SK)/150(SK)","partition_size":"partition size/count if listed","plate_size":"plate/central-plate size if listed","compression":"compression strength / bursting factor spec","notes":"any other short important spec worth keeping, 1 sentence max"}]`,
-    shape: (raw) => (Array.isArray(raw) ? raw : []).map(r => ({ id: genId(), product_name: r.product_name || '', box_size: r.box_size || '', gsm_combo: r.gsm_combo || '', partition_size: r.partition_size || '', plate_size: r.plate_size || '', compression: r.compression || '', notes: r.notes || '' })),
-  },
-  {
     key: 'dabur_pm_spec_cutting',
     label: 'Dabur PM Spec (cutting sheet)',
     hint: 'Printed Dabur PM Specification sheet — extracts the cutting dimensions and paper combinations needed for the box/partition/plate sheet sizes, and computes the derived inch/sheet-size fields. Confirmed rows push straight to the external cutting-spec Google Sheet linked below (and save locally too, in the same Dabur — Spec Master tab as the reference-notes type).',
@@ -851,11 +836,6 @@ const COLUMNS = {
     { key: 'date', label: 'Date' }, { key: 'invoice_no', label: 'Invoice No' }, { key: 'party', label: 'Party' },
     { key: 'buyer_order_no', label: 'Buyer Order No' }, { key: 'description', label: 'Description' },
     { key: 'quantity', label: 'Quantity Dispatched', type: 'number' }, { key: 'rate', label: 'Rate', type: 'number' }, { key: 'amount', label: 'Amount', type: 'number' },
-  ],
-  daburSpecs: [
-    { key: 'product_name', label: 'Product' }, { key: 'box_size', label: 'Box Size (L x W x H)' },
-    { key: 'gsm_combo', label: 'Paper Combination / GSM' }, { key: 'partition_size', label: 'Partition' },
-    { key: 'plate_size', label: 'Plate' }, { key: 'compression', label: 'Compression' }, { key: 'notes', label: 'Notes' },
   ],
   // Mirrors the exact 23-column layout of the external cutting-spec Google Sheet this pushes to (see
   // DABUR_SPEC_COLUMN_ORDER in server/lib/sheets.js) — column order here doesn't need to match that
@@ -1488,13 +1468,6 @@ function FIMSApp() {
   const [reviewEdits, setReviewEdits] = useState({}); // { [customer]: { [variantTitle]: { tabNameOverride, rowEdits: { [rowIndex]: {date,production,dispatch} }, deletedRows: { [rowIndex]: true } } } }
   const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
   const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch, customerSheetsMirror: setCustomerSheetsMirror };
-  // The cutting-spec (dabur_pm_spec_cutting) and reference-notes (dabur_spec) upload types share this
-  // ONE daburSpecs register/tab — no separate tab for either. Split apart here purely for display, by
-  // which fields are actually populated (item_code only ever comes from the cutting-sheet shape(),
-  // product_name only ever comes from the reference-notes shape()), reused by the tab's two panels,
-  // global search, and "Export all".
-  const daburSpecCuttingRows = daburSpecs.filter(r => r.item_code);
-  const daburSpecReferenceRows = daburSpecs.filter(r => r.product_name);
   useEffect(() => {
     (async () => {
       const entries = await Promise.all(Object.entries(STORAGE_KEYS).map(async ([k, storageKey]) => [k, await loadRegister(storageKey)]));
@@ -2907,11 +2880,7 @@ function FIMSApp() {
     { key: 'consumption', label: 'Consumption', rows: consumption, columns: COLUMNS.consumption },
     { key: 'production', label: 'Production Register', rows: production, columns: COLUMNS.production },
     { key: 'customerDispatch', label: 'Customer Dispatch Bills', rows: customerDispatch, columns: COLUMNS.customerDispatch },
-    { key: 'daburSpecs', label: 'Dabur — Spec Master', rows: daburSpecReferenceRows, columns: COLUMNS.daburSpecs },
-    // registerKey points update/delete at the REAL underlying register (daburSpecs — cutting-spec rows
-    // don't have a register of their own, see daburSpecCuttingRows above) — key stays distinct just so
-    // this renders as its own section, separate from the plain "daburSpecs" entry right above it.
-    { key: 'daburSpecCutting', registerKey: 'daburSpecs', label: 'Dabur — Cutting Specs', rows: daburSpecCuttingRows, columns: COLUMNS.daburSpecCutting },
+    { key: 'daburSpecs', label: 'Dabur — Cutting Specs', rows: daburSpecs, columns: COLUMNS.daburSpecCutting },
     { key: 'daburPO', label: 'Dabur — Pending PO', rows: daburPO, columns: COLUMNS.daburPO },
     { key: 'daburDispatch', label: 'Dabur — Dispatch Log', rows: daburDispatch, columns: COLUMNS.daburDispatch },
   ];
@@ -3639,8 +3608,7 @@ function FIMSApp() {
     });
     sheets.push({ name: 'Production Register', rows: production, columns: COLUMNS.production, kind: 'table' });
     sheets.push({ name: 'Customer Dispatch Bills', rows: customerDispatch, columns: COLUMNS.customerDispatch, kind: 'table' });
-    sheets.push({ name: 'Dabur Spec Master', rows: daburSpecReferenceRows, columns: COLUMNS.daburSpecs, kind: 'table' });
-    sheets.push({ name: 'Dabur Cutting Specs', rows: daburSpecCuttingRows, columns: COLUMNS.daburSpecCutting, kind: 'table' });
+    sheets.push({ name: 'Dabur Cutting Specs', rows: daburSpecs, columns: COLUMNS.daburSpecCutting, kind: 'table' });
     sheets.push({
       name: 'Dabur Pending PO', kind: 'table', rows: daburPOWithPending.map(r => ({ ...r, status: r.fulfilled ? 'Fulfilled' : 'Pending' })), columns: [
         ...COLUMNS.daburPO, { key: 'dispatched_qty', label: 'Dispatched Qty' }, { key: 'pending_qty', label: 'Pending Qty' }, { key: 'status', label: 'Status' },
@@ -4311,7 +4279,17 @@ function FIMSApp() {
             <div>
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Cutting-Spec Sheet (external)</h2>
-                <p className="subtitle" style={{ marginBottom: 10 }}>Paste the Google Sheet URL where confirmed "Dabur PM Spec (cutting sheet)" extractions (box/partition/plate dimensions, paper combinations, and the derived inch/sheet-size formulas) get pushed automatically the moment you confirm — separate from the reference notes register below. Rows are only ever appended to that sheet, never overwritten, and a row whose Item Code already exists there is skipped rather than duplicated.</p>
+                <p className="subtitle" style={{ marginBottom: 4 }}>Paste the Google Sheet URL where confirmed "Dabur PM Spec (cutting sheet)" extractions (box/partition/plate dimensions, paper combinations, and the derived inch/sheet-size formulas) get pushed automatically the moment you confirm. Rows are only ever appended to that sheet's first tab, never overwritten, and a row whose Item Code already exists there is skipped rather than duplicated.</p>
+                <p className="subtitle" style={{ marginBottom: 10 }}>Setup, once: share that Google Sheet with the service account email below as an Editor, then paste its link below. Skipping the share step is the #1 cause of a push failing with "the caller does not have permission."</p>
+                <div className="field-row" style={{ marginBottom: 4 }}>
+                  <span style={{ fontSize: 13, fontWeight: 600 }}>Share that Sheet with:</span>
+                  {serviceAccountEmail
+                    ? <code style={{ background: 'var(--accent-soft)', padding: '4px 8px', borderRadius: 4, fontSize: 12.5 }}>{serviceAccountEmail}</code>
+                    : <span className="doc-hint">(couldn't read it — check GOOGLE_SERVICE_ACCOUNT_JSON on the server)</span>}
+                  {serviceAccountEmail && (
+                    <button className="btn btn-ghost" onClick={() => navigator.clipboard?.writeText(serviceAccountEmail)}><FileSpreadsheet size={14} /> Copy</button>
+                  )}
+                </div>
                 <div className="field-row">
                   <input className="cell-input" style={{ flex: 1, minWidth: 260 }} placeholder="Paste the Google Sheet URL (or its ID)…"
                     value={daburSpecSheetUrlInput} onChange={e => setDaburSpecSheetUrlInput(e.target.value)} />
@@ -4321,10 +4299,8 @@ function FIMSApp() {
                 {daburSpecPushMsg && <div className="doc-hint" style={{ marginTop: 6 }}>{daburSpecPushMsg}</div>}
                 {!daburSpecSheetId && <div className="doc-hint" style={{ marginTop: 6 }}>Not linked yet — extractions still save locally below, but won't push anywhere until a sheet is linked here.</div>}
               </div>
-              <RegisterPanel title="Cutting Specs (confirmed)" subtitle="Every confirmed row from the 'Dabur PM Spec (cutting sheet)' upload type — stored in this SAME Dabur — Spec Master tab as the reference notes below (no separate tab), shown here as its own view, and also pushed to the linked sheet above." columns={COLUMNS.daburSpecCutting} rows={daburSpecCuttingRows}
-                onUpdate={updateRow('daburSpecs')} onDelete={deleteRow('daburSpecs')} onExport={() => exportSheet('Dabur_Spec_Cutting', daburSpecCuttingRows, COLUMNS.daburSpecCutting)} />
-              <RegisterPanel title="Dabur — Spec Master (reference notes)" subtitle="Replaces the manual diary — one row per box item, from printed PM Specification sheets. Free-form reference notes; use the cutting-spec sheet above for structured dimensions." columns={COLUMNS.daburSpecs} rows={daburSpecReferenceRows}
-                onUpdate={updateRow('daburSpecs')} onDelete={deleteRow('daburSpecs')} onExport={() => exportSheet('Dabur_Spec_Master', daburSpecReferenceRows, COLUMNS.daburSpecs)} />
+              <RegisterPanel title="Dabur — Spec Master (cutting specs)" subtitle="Every confirmed row from the 'Dabur PM Spec (cutting sheet)' upload — box/partition/plate dimensions, paper combinations, and the derived inch/sheet-size fields. Also pushed to the linked sheet above." columns={COLUMNS.daburSpecCutting} rows={daburSpecs}
+                onUpdate={updateRow('daburSpecs')} onDelete={deleteRow('daburSpecs')} onExport={() => exportSheet('Dabur_Spec_Master', daburSpecs, COLUMNS.daburSpecCutting)} />
             </div>
           )}
           {loaded && activeTab === 'daburPO' && (
