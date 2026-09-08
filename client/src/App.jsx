@@ -4116,8 +4116,25 @@ function FIMSApp() {
                 <h2 style={{ marginBottom: 14 }}>2. Review &amp; confirm</h2>
                 {!fileResults.length && <div className="empty-state">Extracted rows will show up here for you to check and correct before they're added to the register. Nothing is saved automatically.</div>}
                 {fileResults.length > 0 && (() => {
-                  const idx = Math.min(activeResultIndex, fileResults.length - 1);
+                  // A page whose extraction genuinely found nothing (a non-spec page — blank, wrong
+                  // layout, unrelated) needs no review at all: nothing to fix, nothing to confirm. It
+                  // stays in fileResults (still counts toward doneCount, still excluded from
+                  // confirmAllPages the same way it always was), but is skipped entirely in the browser
+                  // below — never its own tab to click past, never something to land on.
+                  const isEmptyResolvedPage = (r) => r && r.status === 'done' && !r.rows.length;
+                  const visibleIndices = fileResults.map((_, i) => i).filter(i => !isEmptyResolvedPage(fileResults[i]));
+                  const skippedCount = fileResults.length - visibleIndices.length;
+                  const rawIdx = Math.min(activeResultIndex, fileResults.length - 1);
+                  // If the page actually pointed at has nothing to review, show the nearest one after
+                  // it that does instead (falling back to the last visible one, or — only when EVERY
+                  // page in the whole batch turned out empty — the raw index itself, so `page` is still
+                  // defined and the existing "nothing found" empty-state UI still renders).
+                  const posRaw = visibleIndices.indexOf(rawIdx);
+                  const idx = posRaw !== -1 ? rawIdx : (visibleIndices.find(i => i > rawIdx) ?? visibleIndices[visibleIndices.length - 1] ?? rawIdx);
                   const page = fileResults[idx];
+                  const posInVisible = visibleIndices.indexOf(idx);
+                  const prevVisibleIdx = posInVisible > 0 ? visibleIndices[posInVisible - 1] : null;
+                  const nextVisibleIdx = (posInVisible !== -1 && posInVisible < visibleIndices.length - 1) ? visibleIndices[posInVisible + 1] : null;
                   // Resolved from THIS page's own tag, not the dropdown's current value — a batch can
                   // now mix document types, and each page's label/columns must reflect what IT actually
                   // is, regardless of what's selected in the dropdown by the time it's being reviewed.
@@ -4128,20 +4145,26 @@ function FIMSApp() {
                     <div>
                       {fileResults.length > 1 && (
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
-                          <button className="icon-btn" disabled={idx === 0} onClick={() => setActiveResultIndex(idx - 1)}>◀</button>
-                          <span style={{ fontSize: 12.5 }}>File {idx + 1} of {fileResults.length} — {doneCount} done so far</span>
-                          <button className="icon-btn" disabled={idx === fileResults.length - 1} onClick={() => setActiveResultIndex(idx + 1)}>▶</button>
+                          <button className="icon-btn" disabled={prevVisibleIdx === null} onClick={() => setActiveResultIndex(prevVisibleIdx)}>◀</button>
+                          <span style={{ fontSize: 12.5 }}>
+                            File {posInVisible === -1 ? 0 : posInVisible + 1} of {visibleIndices.length}
+                            {skippedCount > 0 ? ` (${skippedCount} skipped — nothing to review)` : ''} — {doneCount} done so far
+                          </span>
+                          <button className="icon-btn" disabled={nextVisibleIdx === null} onClick={() => setActiveResultIndex(nextVisibleIdx)}>▶</button>
                           <div style={{ display: 'flex', gap: 5, marginLeft: 6, flexWrap: 'wrap' }}>
-                            {fileResults.map((r, i) => (
-                              <span key={r.id} onClick={() => setActiveResultIndex(i)} title={`${r.label} (${docTypeLabel(r.docTypeKey)})`}
-                                style={{
-                                  width: 22, height: 22, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                                  fontSize: 10, cursor: 'pointer', border: i === idx ? '2px solid var(--accent)' : '1px solid var(--rule)',
-                                  background: r.status === 'done' ? 'var(--ok-soft)' : r.status === 'error' ? 'var(--warn-soft)' : r.status === 'extracting' ? 'var(--accent-soft)' : '#fff',
-                                }}>
-                                {r.status === 'extracting' ? <Loader2 size={11} className="spin" /> : i + 1}
-                              </span>
-                            ))}
+                            {visibleIndices.map(i => {
+                              const r = fileResults[i];
+                              return (
+                                <span key={r.id} onClick={() => setActiveResultIndex(i)} title={`${r.label} (${docTypeLabel(r.docTypeKey)})`}
+                                  style={{
+                                    width: 22, height: 22, borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                    fontSize: 10, cursor: 'pointer', border: i === idx ? '2px solid var(--accent)' : '1px solid var(--rule)',
+                                    background: r.status === 'done' ? 'var(--ok-soft)' : r.status === 'error' ? 'var(--warn-soft)' : r.status === 'extracting' ? 'var(--accent-soft)' : '#fff',
+                                  }}>
+                                  {r.status === 'extracting' ? <Loader2 size={11} className="spin" /> : i + 1}
+                                </span>
+                              );
+                            })}
                           </div>
                         </div>
                       )}
