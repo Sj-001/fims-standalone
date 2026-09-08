@@ -392,8 +392,15 @@ async function loadRegister(key) {
     return [];
   } catch (e) { return []; }
 }
+// Deliberately does NOT swallow its own errors — a confirmed row already shows in the app's local
+// state the instant it's confirmed, completely independent of whether this save actually reaches the
+// Sheet. If this throws and nothing catches it, that row LOOKS saved forever (right there in the
+// register, editable, exportable) while the Sheet itself never received it — with zero indication
+// anything went wrong. Confirmed directly as a real, reproducible failure mode: a Customer Dispatch
+// row visible in the app, permanently absent from the actual Sheet, no error shown anywhere. The
+// caller (scheduleSave, below) is what actually surfaces a failure to the person and offers a retry.
 async function saveRegister(key, rows) {
-  try { await window.storage.set(key, JSON.stringify(rows), false); } catch (e) { /* noop */ }
+  await window.storage.set(key, JSON.stringify(rows), false);
 }
 const TRAINING_KEY = 'fims_training_examples';
 const MAX_EXAMPLES_STORED = 15;
@@ -902,6 +909,12 @@ const NAV = [
   { key: 'customerSheets', label: 'Customer Sheets', icon: FileSpreadsheet },
   { key: 'settings', label: 'Settings', icon: Trash2 },
 ];
+// Friendly name for a register key in the save-failure banner — reuses NAV's own labels where a tab
+// exists for it, falls back to the raw key for the handful of internal-only registers that don't have
+// their own tab (customerSheetsMirror).
+function registerDisplayName(key) {
+  return (NAV.find(n => n.key === key) || {}).label || key;
+}
 const GUIDE_STEPS = [
   {
     title: 'Upload a document',
@@ -1520,23 +1533,53 @@ function FIMSApp() {
   const SAVE_DEBOUNCE_MS = 1500;
   const saveTimerRef = useRef({});
   const pendingSaveRef = useRef({});
+  const retryTimeoutRef = useRef({});
+  // A confirmed row shows in the app's local state the instant it's confirmed — completely
+  // independent of whether the actual write to the Sheet succeeds. Without this, a save that failed
+  // (a network blip, the session briefly expiring, the server waking up from idle, a Sheets API
+  // hiccup) used to just vanish: the row LOOKED saved forever, right there in the register, while the
+  // Sheet itself never received it, with nothing anywhere to say a save had failed. Confirmed directly
+  // as a real, reproducible failure mode — a Customer Dispatch row visible in the app, permanently
+  // absent from the actual Sheet. attemptSave retries automatically a couple of times first (most
+  // failures here are transient and clear within seconds); only after those also fail does it surface
+  // a persistent, named banner with a manual Retry button — see saveFailures below.
+  const [saveFailures, setSaveFailures] = useState({}); // { [key]: { message } }
+  const attemptSave = useCallback(async (key, fn, attempt = 0) => {
+    try {
+      await fn();
+      setSaveFailures(prev => { if (!(key in prev)) return prev; const next = { ...prev }; delete next[key]; return next; });
+    } catch (e) {
+      console.error(`Save failed for ${key} (attempt ${attempt + 1}):`, e);
+      if (attempt < 2) {
+        retryTimeoutRef.current[key] = setTimeout(() => attemptSave(key, fn, attempt + 1), 3000 * (attempt + 1));
+        return;
+      }
+      setSaveFailures(prev => ({ ...prev, [key]: { message: e.message || 'Unknown error', retry: () => attemptSave(key, fn, 0) } }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const scheduleSave = useCallback((key, fn) => {
     pendingSaveRef.current[key] = fn;
     if (saveTimerRef.current[key]) clearTimeout(saveTimerRef.current[key]);
+    if (retryTimeoutRef.current[key]) { clearTimeout(retryTimeoutRef.current[key]); delete retryTimeoutRef.current[key]; }
+    // A fresh edit supersedes any old failure banner for this key — the upcoming save already carries
+    // whatever was in the failed one (persist always writes the FULL current array, never a partial
+    // diff), so there's nothing left for that stale banner to warn about once this one lands.
+    setSaveFailures(prev => { if (!(key in prev)) return prev; const next = { ...prev }; delete next[key]; return next; });
     saveTimerRef.current[key] = setTimeout(() => {
       delete saveTimerRef.current[key];
       const run = pendingSaveRef.current[key];
       delete pendingSaveRef.current[key];
-      if (run) run();
+      if (run) attemptSave(key, run);
     }, SAVE_DEBOUNCE_MS);
-  }, []);
+  }, [attemptSave]);
   const flushPendingSaves = useCallback(() => {
     Object.values(saveTimerRef.current).forEach(t => clearTimeout(t));
     saveTimerRef.current = {};
     const pending = pendingSaveRef.current;
     pendingSaveRef.current = {};
-    Object.values(pending).forEach(run => run());
-  }, []);
+    Object.entries(pending).forEach(([key, run]) => attemptSave(key, run));
+  }, [attemptSave]);
   useEffect(() => {
     const onVisibility = () => { if (document.visibilityState === 'hidden') flushPendingSaves(); };
     document.addEventListener('visibilitychange', onVisibility);
@@ -3914,6 +3957,23 @@ function FIMSApp() {
           </div>
         </div>
         <div className="content">
+          {Object.keys(saveFailures).length > 0 && (
+            <div className="panel" style={{ borderColor: 'var(--ledger-red)', marginBottom: 16 }}>
+              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                <AlertCircle size={18} color="var(--ledger-red)" style={{ flexShrink: 0, marginTop: 2 }} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: 600, marginBottom: 4 }}>Some changes haven't saved to your Google Sheet</div>
+                  <p className="subtitle" style={{ marginBottom: 8 }}>These are still safe in this browser tab, but the write to the Sheet itself failed and gave up retrying automatically. Don't close this tab until these are saved, or that data won't reach the Sheet.</p>
+                  {Object.entries(saveFailures).map(([key, f]) => (
+                    <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
+                      <span style={{ fontSize: 13 }}><strong>{registerDisplayName(key)}</strong> — {f.message}</span>
+                      <button className="btn btn-ghost" onClick={f.retry}><RefreshCw size={13} /> Retry now</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
           {!loaded && <div className="empty-state">Loading your registers…</div>}
           {loaded && activeTab === 'dashboard' && (
             <div>
