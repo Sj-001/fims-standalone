@@ -879,6 +879,13 @@ const COLUMNS = {
 // use the full COLUMNS.rawMaterialIn — this only trims what's shown during review.
 const REVIEW_COLUMNS = {
   rawMaterialIn: COLUMNS.rawMaterialIn.filter(c => c.key !== 'consumed'),
+  // COLUMNS.daburSpecs no longer exists (the old free-text reference-notes type was removed) — every
+  // row landing in the daburSpecs register now comes from the cutting-sheet extraction, so review uses
+  // its column list. Without this override, the review table fell through to COLUMNS.daburSpecs
+  // (undefined) and crashed the whole app the instant someone reviewed a Dabur PM Spec upload —
+  // confirmed directly as a real, reproducible crash (EditableTable calling .some() on undefined
+  // columns, no error boundary to contain it, so the entire page went blank).
+  daburSpecs: COLUMNS.daburSpecCutting,
 };
 // The Raw Material Register view is grouped into one table per size (see rawMaterialBySize in
 // FIMSApp), matching how the physical mill-slip register book itself is organized — a size's own
