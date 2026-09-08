@@ -1661,10 +1661,18 @@ function FIMSApp() {
   // --- Date & numeric-format self-healing sweep: normalizeDateToDots/normalizeNumericStr (above) run
   // on every FRESH extraction, but a row that entered a register before a normalizer bug was fixed, or
   // was typed/edited by hand, can still be sitting there in the wrong shape (e.g. "23.07.2026" next to
-  // "12.4.26", or "59.50" next to "59.5", in the same register). Runs automatically on every load and
-  // on every register change — no manual button — same self-healing pattern as the consumption↔raw
-  // material matching effect below: a row already in canonical form is never rewritten again, so this
-  // can never loop or fight a person's own in-progress edit.
+  // "12.4.26", or "59.50" next to "59.5", in the same register). Runs automatically ONCE, right after
+  // this tab's own initial load finishes (dependency is [loaded], not the registers themselves) — NOT
+  // on every subsequent register change. This used to depend on every register directly, so it re-ran
+  // (and re-persisted, a FULL overwrite of that register's whole tab) after every single edit anywhere
+  // in the app — including in a tab that's been sitting open a while with a now-stale, incomplete local
+  // copy of a register. If a fresher row had been added to that register from a DIFFERENT tab/session
+  // in the meantime, this stale tab's very next edit-triggered normalize pass would silently overwrite
+  // the Sheet with its own outdated snapshot, erasing that newer row — confirmed as the likely cause of
+  // real data loss (a Production row and a Customer Dispatch row both went missing from the Sheet while
+  // still showing in a different tab's local state). Running once at load — using whatever this tab
+  // freshly read moments ago, then never again on its own — closes that off; a genuine formatting bug
+  // still gets caught the next time ANY tab loads, same as before.
   const NORMALIZE_FIELD_REGISTERS = {
     rawMaterialIn: { date: normalizeDateToDots, size: normalizeNumericStr, gsm: normalizeNumericStr, bf: normalizeNumericStr },
     consumption: { date: normalizeDateToDots, size: normalizeNumericStr, gsm: normalizeNumericStr },
@@ -1674,6 +1682,7 @@ function FIMSApp() {
     daburDispatch: { date: normalizeDateToDots },
   };
   useEffect(() => {
+    if (!loaded) return;
     Object.entries(NORMALIZE_FIELD_REGISTERS).forEach(([registerKey, fieldNormalizers]) => {
       const rows = registerState[registerKey] || [];
       if (!rows.length) return;
@@ -1694,7 +1703,7 @@ function FIMSApp() {
       }
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rawMaterialIn, consumption, production, customerDispatch, daburPO, daburDispatch]);
+  }, [loaded]);
   // --- Raw Material Register view: filter dropdowns narrow the per-size tables down to one size
   // and/or one GSM at a time, without summing anything.
   const [rmSizeFilter, setRmSizeFilter] = useState('');
