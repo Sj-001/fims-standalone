@@ -1549,6 +1549,44 @@ function FIMSApp() {
   const persist = useCallback((registerKey, rows) => {
     scheduleSave(`register:${registerKey}`, () => saveRegister(STORAGE_KEYS[registerKey], rows));
   }, [scheduleSave]);
+  // Extra safety for AUTOMATIC background writes specifically — effects that recompute and save
+  // without the person having clicked or typed anything (the date/number normalize sweep, the raw-
+  // material duplicate-reel merge, the consumption↔raw-material matcher). Those all depend on a
+  // register's state and re-fire whenever it changes, in every open tab. A tab that's been sitting
+  // open a while can end up with a stale, incomplete local copy of a register if something was added
+  // to it from a DIFFERENT tab/session in the meantime — and since a save always overwrites that
+  // register's ENTIRE Sheet tab (never a partial diff), a stale tab's next automatic write would
+  // silently erase that newer row. Confirmed as the actual cause of real data loss (a Production row
+  // and a Customer Dispatch row both vanished from the Sheet while still showing in a different tab's
+  // local state).
+  //
+  // Re-reads the server's CURRENT row count immediately before writing and compares it against
+  // `rowsBeforeChange` — the array this computation actually STARTED from, e.g. rawMaterialIn as it
+  // was when the merge/match effect ran — NOT `rowsToWrite`, the (possibly intentionally smaller,
+  // for a duplicate merge, or intentionally larger, for a new leftover row) result. Comparing against
+  // the result would block every legitimate merge too, since consolidating duplicates is SUPPOSED to
+  // write fewer rows than are currently on the server. Comparing against the starting point instead
+  // asks the right question: "has the server grown since this tab last saw it?" — if the server
+  // already has MORE rows than this computation even started from, this tab is behind, so its own
+  // local copy is refreshed from the server instead of writing over it (the effect that called this
+  // will naturally recompute against the fresher data on its own).
+  //
+  // Never used for a person's own direct edit (updateRow/deleteRow/addRows/confirm buttons) — those
+  // are always intentional, on data the person is looking at right now; this guard is only for writes
+  // that happen without anyone having done anything.
+  const persistIfNotStale = useCallback(async (registerKey, rowsBeforeChange, rowsToWrite) => {
+    try {
+      const serverRows = await loadRegister(STORAGE_KEYS[registerKey]);
+      if (serverRows.length > rowsBeforeChange.length) {
+        registerSetters[registerKey](serverRows);
+        return false;
+      }
+    } catch (e) { /* if the check itself fails, fall through — don't block a well-intentioned save */ }
+    registerSetters[registerKey](rowsToWrite);
+    persist(registerKey, rowsToWrite);
+    return true;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [persist]);
   // Full-resync semantics for ONE customer's slice of the Customer Sheets Mirror: replaces every row
   // this customer already had with the fresh set just read from their real Sheet (at import or push
   // time — see confirmSheetImport/pushCustomerSheetNow), so a block/row renamed or removed for real
@@ -1697,10 +1735,7 @@ function FIMSApp() {
         if (patched) changed = true;
         return patched || r;
       });
-      if (changed) {
-        registerSetters[registerKey](next);
-        persist(registerKey, next);
-      }
+      if (changed) persistIfNotStale(registerKey, rows, next);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded]);
@@ -2340,10 +2375,7 @@ function FIMSApp() {
       mergedAny = true;
       next.push(rowsInGroup.find(r => r.consumed) || rowsInGroup[0]);
     });
-    if (mergedAny) {
-      setRawMaterialIn(next);
-      persist('rawMaterialIn', next);
-    }
+    if (mergedAny) persistIfNotStale('rawMaterialIn', rawMaterialIn, next);
   }, [rawMaterialIn]);
   // Matches each Consumption row against the ONE Raw Material In reel it's about — size + GSM + the
   // "wajan" weight together, since "wajan" is that reel's own original total weight (a lookup key, not
@@ -2400,16 +2432,14 @@ function FIMSApp() {
     });
     if (Object.keys(consumptionUpdateById).length) {
       const nextConsumption = consumption.map(r => consumptionUpdateById[r.id] ? { ...r, ...consumptionUpdateById[r.id] } : r);
-      setConsumption(nextConsumption);
-      persist('consumption', nextConsumption);
+      persistIfNotStale('consumption', consumption, nextConsumption);
     }
     if (Object.keys(rawMaterialConsumedDateById).length || leftoverRowsToAdd.length) {
       const nextRawMaterial = [
         ...rawMaterialIn.map(r => rawMaterialConsumedDateById[r.id] ? { ...r, consumed: rawMaterialConsumedDateById[r.id] } : r),
         ...leftoverRowsToAdd,
       ];
-      setRawMaterialIn(nextRawMaterial);
-      persist('rawMaterialIn', nextRawMaterial);
+      persistIfNotStale('rawMaterialIn', rawMaterialIn, nextRawMaterial);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [consumption, rawMaterialIn]);
