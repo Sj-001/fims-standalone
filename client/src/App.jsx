@@ -2092,10 +2092,19 @@ function FIMSApp() {
         setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
       });
       const rows = pageConfig.shape(raw);
-      if (!rows.length) setErrorMsg('No line items found on this page. If this is a duplicate copy or an e-Way Bill page, that’s expected — just move to the next one. Otherwise, try a clearer photo or crop closer to the table.');
-      else if (truncated) setErrorMsg(`Claude's response was cut off before it finished this page — it may have more rows than the ${rows.length} shown below. Check against the original, and use "Re-extract this file" if anything's missing.`);
-      else setErrorMsg('');
-      setFileResults(prev => prev.map(r => r.id === current.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })), truncated } : r));
+      if (!rows.length && !truncated) {
+        // A clean, confident "nothing here" result (a duplicate copy, an e-Way Bill page, a non-spec
+        // page) needs zero decisions from anyone — it's removed from the queue right away instead of
+        // sitting there as a result someone has to notice and manually discard. A TRUNCATED empty
+        // result is different — the response may have been cut off before it could produce anything,
+        // so that one still needs a person's attention (falls through to the normal 'done' path below).
+        setErrorMsg('No data found on this page — it was automatically skipped.');
+        removeQueuedPages([current.id]);
+      } else {
+        if (truncated) setErrorMsg(`Claude's response was cut off before it finished this page — it may have more rows than the ${rows.length} shown below. Check against the original, and use "Re-extract this file" if anything's missing.`);
+        else setErrorMsg('');
+        setFileResults(prev => prev.map(r => r.id === current.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })), truncated } : r));
+      }
     } catch (e) {
       console.error('Extraction error:', e);
       if (isCancelled(e)) {
@@ -2149,8 +2158,17 @@ function FIMSApp() {
         });
         const rows = pageConfig.shape(raw);
         anySucceeded = true;
-        if (truncated) anyTruncated = true;
-        setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })), truncated } : r));
+        if (!rows.length && !truncated) {
+          // Same reasoning as the single-file path (runExtraction): a clean, confident "nothing here"
+          // result needs zero decisions from anyone, so it's removed from the queue immediately rather
+          // than left sitting there as a result to notice and manually discard. A truncated empty
+          // result is kept — the response may have been cut off before producing anything, which does
+          // need a person's attention.
+          removeQueuedPages([p.id]);
+        } else {
+          if (truncated) anyTruncated = true;
+          setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })), truncated } : r));
+        }
       } catch (e) {
         console.error('Extraction error:', e);
         if (isCancelled(e)) {
