@@ -337,6 +337,28 @@ function buildCatalogText(catalog) {
   catalog.forEach(c => { (byCustomer[c.customer] = byCustomer[c.customer] || []).push(c.item); });
   return Object.entries(byCustomer).map(([customer, items]) => `  ${customer}: ${items.join(', ')}`).join('\n');
 }
+// Recent CONFIRMED register rows, given to the model as a cross-check reference for the {{RECENT_
+// ENTRIES}} placeholder — a SELF-CHECK AID, not a skip-instruction (see the prompt text around that
+// placeholder): the same physical page can get re-uploaded once new rows are added below earlier ones,
+// so a row on THIS page might be one already recorded correctly last time. Giving the model something
+// concrete to compare its OWN reading against lets a misread digit get caught before it's finalized,
+// rather than only after (see flagLikelyReReadDuplicates, the deterministic client-side backup check
+// for the exact same failure — this is the same protection, applied earlier, before a bad number is
+// even written down, instead of only catching it once it's already sitting in the review queue).
+// Capped to a recent window so this can't grow unbounded as the register accumulates months/years of
+// history — 30 days comfortably covers how long a single physical page realistically stays in use
+// before it's full and a new one is started.
+const RECENT_ENTRIES_WINDOW_DAYS = 30;
+function buildRecentEntriesText(rows) {
+  if (!rows || !rows.length) return '  (none yet)';
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - RECENT_ENTRIES_WINDOW_DAYS);
+  const cutoffKey = `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, '0')}-${String(cutoff.getDate()).padStart(2, '0')}`;
+  const recent = rows.filter(r => (r.description || '').trim() && dateSortKey(r.date) >= cutoffKey);
+  if (!recent.length) return `  (none in the last ${RECENT_ENTRIES_WINDOW_DAYS} days)`;
+  const sorted = [...recent].sort((a, b) => dateSortKey(a.date).localeCompare(dateSortKey(b.date)));
+  return sorted.map(r => `  ${r.date} | ${r.description} | ${r.pieces || 0} pieces`).join('\n');
+}
 // A row coming back from Google Sheets is always made of strings — every cell, no matter what was
 // written into it. That's fine for most fields (the `num()` helper already tolerates numeric
 // strings), but `stockConfirmed` is checked as a real boolean (`!row.stockConfirmed`), and the
@@ -676,6 +698,8 @@ STYLE B — product ledger style: each line has a DATE and a product DESCRIPTION
   (This list isn't exhaustive — other legitimate products exist too. Only use it to correct obvious misreads of these specific items, never to force an unrelated line into matching one of them.)
 - Word abbreviations this factory uses that a person has taught the app — expand these to their full form wherever they appear inside "description" (e.g. write "IT 500 Jumbo Container", not "IT 500 J Cont"), so the same item is always written the same way no matter which shorthand a given page happened to use:
 {{ABBREVIATIONS}}
+- RECENT ENTRIES ALREADY RECORDED (Style B, cross-check reference ONLY — NOT a list of rows to skip; every row on this page still needs its own item in your output, see the mandatory count check near the end): the same physical page sometimes gets re-uploaded once new rows are added below earlier ones, so a row you're reading here might be the SAME real entry as one already recorded from a previous upload. If a row's date and item look like they match one already in this list, but your reading of its quantity DISAGREES with the number already recorded there, take a second, careful look at that specific digit before finalizing — a handwritten "1" read as "4", or "2" as "9", is exactly the kind of mistake this is meant to catch. If you're still not confident which number is right after that careful re-check, set "flag" for that row to something like "reading disagrees with an existing recorded entry for what looks like the same item — verify." Never silently copy the reference list's number just because it's sitting there — only use it as a prompt to look more carefully at what's actually written on the page, and never skip or omit a row just because it resembles one already in this list:
+{{RECENT_ENTRIES}}
 - IMPORTANT: a customer name is sometimes written in brackets right next to the item name, either before or after it — e.g. "(Diamond) Cream Burst 30g x140" or "Cream Burst 30g x140 (Diamond)". Pull that bracketed name OUT into its own "customer_hint" field and do NOT leave it inside "description" — "description" should be just the clean item name with no bracket in it.
 - Dates are VERY often written once then repeated below with a ditto mark for every following row that shares that same date — this could be a tick, a quote mark ("), the digits 11, two short slashes (//), the word "do", a dash, or any other short repeat-symbol instead of an actual date. Whenever a row's date cell is anything other than a clearly legible date, treat it as a ditto mark and resolve it to the SAME date as the row directly above it — copy that exact date into "date_override" for the row. Never leave a row's date blank or output the ditto symbol itself just because it wasn't written out in full.
 - Some pages have a single "Quantity" column — put that value into "pieces". Other pages have TWO numeric columns side by side for the same row (regardless of what they're headed with, e.g. small letters like S/D, two batch tallies, etc.) — both of these are PRODUCTION quantities, never a dispatch quantity. If a row has a number in only one of the two columns, put that number in "pieces". If a row genuinely has a number in BOTH columns, add them together into "pieces" — do not put the second column's number into "dispatch". The "dispatch" field on this register is rare — only use it if the page has an explicit, separately-written note that some of that day's production was sent out immediately (e.g. an actual word like "dispatch"/"bheja" next to a number), never just because a second quantity column exists.
@@ -2100,7 +2124,7 @@ function FIMSApp() {
     });
     setActiveResultIndex(queuedIndex);
     try {
-      const basePrompt = pageConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog)).replace('{{ABBREVIATIONS}}', buildAbbreviationsText(abbreviations));
+      const basePrompt = pageConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog)).replace('{{ABBREVIATIONS}}', buildAbbreviationsText(abbreviations)).replace('{{RECENT_ENTRIES}}', pageConfig.register === 'production' ? buildRecentEntriesText(registerState.production) : '');
       const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[current.docTypeKey]);
       const { raw, truncated } = await extractWithRateLimitBackoff(promptWithTraining, base64Img, abortControllerRef.current.signal, (waitMs, attempt, total, kind) => {
         const label = kind === 'server_error' ? 'Server temporarily unreachable' : 'Rate limit hit';
@@ -2158,7 +2182,7 @@ function FIMSApp() {
       // alongside consumption reports) needs each page extracted with its own prompt/shape, not
       // whichever type happened to be selected when this batch was kicked off.
       const pageConfig = DOCUMENT_TYPES.find(d => d.key === p.docTypeKey) || activeConfig;
-      const basePrompt = pageConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog)).replace('{{ABBREVIATIONS}}', buildAbbreviationsText(abbreviations));
+      const basePrompt = pageConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog)).replace('{{ABBREVIATIONS}}', buildAbbreviationsText(abbreviations)).replace('{{RECENT_ENTRIES}}', pageConfig.register === 'production' ? buildRecentEntriesText(registerState.production) : '');
       const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[p.docTypeKey]);
       try {
         // small pacing gap between requests (skip before the very first one) so a big multi-copy
