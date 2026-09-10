@@ -2108,7 +2108,7 @@ function FIMSApp() {
       }, (secondsLeft) => {
         setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
       });
-      const rows = pageConfig.shape(raw);
+      const rows = flagLikelyReReadDuplicates(pageConfig.register, pageConfig.shape(raw));
       if (!rows.length && !truncated) {
         // A clean, confident "nothing here" result (a duplicate copy, an e-Way Bill page, a non-spec
         // page) needs zero decisions from anyone — it's removed from the queue right away instead of
@@ -2173,7 +2173,7 @@ function FIMSApp() {
         }, (secondsLeft) => {
           setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
         });
-        const rows = pageConfig.shape(raw);
+        const rows = flagLikelyReReadDuplicates(pageConfig.register, pageConfig.shape(raw));
         anySucceeded = true;
         if (!rows.length && !truncated) {
           // Same reasoning as the single-file path (runExtraction): a clean, confident "nothing here"
@@ -2700,6 +2700,34 @@ function FIMSApp() {
   // dropping a real one. Only touches `description`; every other field still goes through rowDedupKey
   // completely unmodified.
   const dedupKeyForRow = (row) => (row && row.description) ? rowDedupKey({ ...row, description: applyAbbreviations(String(row.description)) }) : rowDedupKey(row);
+  // date + normalized description ONLY — deliberately ignores every numeric field, unlike
+  // dedupKeyForRow. This is what lets flagLikelyReReadDuplicates (below) recognize "same real row" even
+  // when a number was misread, which an exact/near-exact dedup key never can (the numbers genuinely
+  // differ, so no dedup key built from them will ever match).
+  const looseDateDescKey = (row) => `${String(row.date || '').trim().toLowerCase()}||${applyAbbreviations(String(row.description || '')).trim().toLowerCase()}`;
+  // Catches the failure dedupKeyForRow structurally cannot: a freshly-extracted row that's clearly the
+  // SAME real entry as one already confirmed (same date, same item once abbreviations are expanded) but
+  // whose NUMBERS disagree — exactly what a misread digit on a re-extraction produces (an already-
+  // correct "10080" re-read as "40080" is a real, confirmed case this session). Exact dedup can't catch
+  // this at all, since the numbers genuinely differ, so nothing stops it from silently becoming a
+  // second, wrong row sitting next to the correct one. This flags it instead — visible in the normal
+  // pre-confirm review UI (the same red-highlight/warning-icon flag every other extraction uncertainty
+  // already uses) — so a person decides which number is actually right, rather than either one just
+  // winning by default. Scoped to production/customerDispatch specifically: they're the two registers
+  // with a free-text `description` field this kind of loose "same real item" matching makes sense for;
+  // registers like Raw Material or Consumption identify a row by structured fields (size/GSM/reel),
+  // where this looser matching wouldn't mean the same thing.
+  const flagLikelyReReadDuplicates = (registerKey, rows) => {
+    if (registerKey !== 'production' && registerKey !== 'customerDispatch') return rows;
+    const existing = registerState[registerKey] || [];
+    return rows.map(r => {
+      if (!r.description || r.flagged) return r;
+      const loose = looseDateDescKey(r);
+      const match = existing.find(e => e.description && looseDateDescKey(e) === loose);
+      if (!match || dedupKeyForRow(match) === dedupKeyForRow(r)) return r;
+      return { ...r, flagged: true, flagReason: `Looks like the same entry as an existing confirmed row from ${match.date} ("${match.description}") — but the numbers on this reading don't match that entry. Check the original document before confirming; this may be a misread re-extraction of a row already in the register.` };
+    });
+  };
   /* -------- product catalog (editable; populated via Customer Sheets tab's Sheet-ID import) -------- */
   const persistCatalog = (next) => {
     setProductCatalog(next);
