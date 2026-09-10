@@ -2372,8 +2372,21 @@ function FIMSApp() {
     if (skipped) window.alert(`${skipped} row${skipped === 1 ? '' : 's'} exactly matched one already in the register and ${skipped === 1 ? "wasn't" : "weren't"} added again — looks like this page (or part of it) was uploaded before.`);
   };
   const confirmAllPages = () => {
-    const donePages = fileResults.filter(r => r.status === 'done' && r.rows.length);
-    if (!donePages.length) return;
+    const allDonePages = fileResults.filter(r => r.status === 'done' && r.rows.length);
+    if (!allDonePages.length) return;
+    // A page carrying a flag — the disagreeing-numbers likely-duplicate warning, or any other
+    // extraction-uncertainty flag — is EXCLUDED from the bulk path entirely, not just visually
+    // highlighted. Flagging alone doesn't stop anything from reaching the register if the only thing
+    // standing between it and "Confirm all" is a color a person might not have actually looked at —
+    // confirmed directly as a real gap: this used to bulk-confirm every done page regardless of flags.
+    // A held-back page stays in the queue, visible and selectable, so it still needs its own individual
+    // "Confirm this page" click — the same moment the flag's warning banner is right there to see.
+    const donePages = allDonePages.filter(p => !p.rows.some(r => r.flagged));
+    const heldBackPages = allDonePages.filter(p => p.rows.some(r => r.flagged));
+    if (!donePages.length) {
+      if (heldBackPages.length) window.alert(`${heldBackPages.length} page${heldBackPages.length === 1 ? '' : 's'} still need${heldBackPages.length === 1 ? 's' : ''} individual review — every completed page has a flagged row on it. Open each one and confirm it separately once you've checked the flag.`);
+      return;
+    }
     donePages.forEach(page => recordCorrections(page.docTypeKey, page.originalRows, page.rows));
     // Grouped by register, not lumped under one type — a batch can now legitimately mix document
     // types (e.g. mill slips queued alongside consumption reports), and each register's rows need to
@@ -2389,10 +2402,13 @@ function FIMSApp() {
     const cuttingSheetRows = donePages.filter(p => p.docTypeKey === 'dabur_pm_spec_cutting').flatMap(p => p.rows);
     if (cuttingSheetRows.length) pushDaburSpecRowsExternally(cuttingSheetRows);
     // Only the pages just confirmed drop out of the queue/results — anything still pending, mid-
-    // extraction, or errored stays put, since "confirm all completed" was never meant to also discard
-    // whatever hadn't finished yet.
+    // extraction, errored, or held back for a flag stays put, since "confirm all completed" was never
+    // meant to also discard or silently push through whatever hadn't finished or hadn't been checked.
     removeQueuedPages(donePages.map(p => p.id));
-    if (totalSkipped) window.alert(`${totalSkipped} row${totalSkipped === 1 ? '' : 's'} exactly matched one already in the register and ${totalSkipped === 1 ? "wasn't" : "weren't"} added again — looks like a page (or part of it) was uploaded before.`);
+    const notes = [];
+    if (totalSkipped) notes.push(`${totalSkipped} row${totalSkipped === 1 ? '' : 's'} exactly matched one already in the register and ${totalSkipped === 1 ? "wasn't" : "weren't"} added again — looks like a page (or part of it) was uploaded before.`);
+    if (heldBackPages.length) notes.push(`${heldBackPages.length} page${heldBackPages.length === 1 ? '' : 's'} skipped here — flagged for a possible issue, still waiting in the queue for you to check and confirm individually.`);
+    if (notes.length) window.alert(notes.join(' '));
   };
   const discardPage = (idx) => {
     setFileResults(prev => prev.filter((_, i) => i !== idx));
@@ -4241,6 +4257,15 @@ function FIMSApp() {
                   const pageConfig = DOCUMENT_TYPES.find(d => d.key === page.docTypeKey) || activeConfig;
                   const doneCount = fileResults.filter(r => r.status === 'done').length;
                   const remainingCount = fileResults.filter(r => r.status === 'pending' || r.status === 'error').length;
+                  // "Confirm all" only ever bulk-confirms pages with NO flagged row on them (see
+                  // confirmAllPages) — a page carrying a flag needs its own individual confirm, the
+                  // same moment the flag's warning banner is actually visible. Split out here, against
+                  // the SAME base set confirmAllPages itself uses (done AND has rows — a truncated-
+                  // empty page is neither "clean" nor "flagged," it's just empty), so the button's own
+                  // count is never misleading about how many it's actually about to touch.
+                  const donePagesWithRows = fileResults.filter(r => r.status === 'done' && r.rows.length);
+                  const cleanDoneCount = donePagesWithRows.filter(p => !p.rows.some(x => x.flagged)).length;
+                  const flaggedDoneCount = donePagesWithRows.length - cleanDoneCount;
                   return (
                     <div>
                       {fileResults.length > 1 && (
@@ -4308,7 +4333,8 @@ function FIMSApp() {
                       )}
                       {fileResults.length > 1 && (doneCount > 0 || remainingCount > 0) && (
                         <div className="review-actions" style={{ borderTop: '1px solid var(--rule)', paddingTop: 14, marginTop: 14, flexWrap: 'wrap' }}>
-                          {doneCount > 0 && <button className="btn btn-primary" onClick={confirmAllPages}><CheckCircle2 size={15} /> Confirm all {doneCount} completed file(s) at once</button>}
+                          {cleanDoneCount > 0 && <button className="btn btn-primary" onClick={confirmAllPages}><CheckCircle2 size={15} /> Confirm all {cleanDoneCount} completed file(s) at once</button>}
+                          {flaggedDoneCount > 0 && <span className="doc-hint" style={{ alignSelf: 'center' }}>{flaggedDoneCount} completed file{flaggedDoneCount === 1 ? '' : 's'} flagged — review {flaggedDoneCount === 1 ? 'it' : 'them'} individually before confirming</span>}
                           {extracting && <button className="btn btn-danger" onClick={cancelExtraction}><XCircle size={15} /> Cancel</button>}
                           {!extracting && remainingCount > 0 && <button className="btn btn-ghost" onClick={runExtractionRemaining}><Upload size={15} /> Retry remaining {remainingCount}</button>}
                           <button className="btn btn-ghost" disabled={extracting} onClick={discardAllPages}><XCircle size={15} /> Discard everything</button>
