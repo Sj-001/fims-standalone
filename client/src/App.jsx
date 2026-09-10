@@ -1816,6 +1816,17 @@ function FIMSApp() {
       return next;
     });
   };
+  // Bulk version of deleteRow — one state update/one save for the whole set instead of calling
+  // deleteRow in a loop (which would fire N separate persists back to back). Used by "Discard all
+  // pending" on the Pending Production/Dispatch Review panels.
+  const deleteRows = (registerKey) => (ids) => {
+    const idSet = new Set(ids);
+    registerSetters[registerKey](prev => {
+      const next = prev.filter(r => !idSet.has(r.id));
+      persist(registerKey, next);
+      return next;
+    });
+  };
   // Every extraction-driven register gets de-duplicated on add — any of them can suffer the same
   // re-photographed-page or overlapping-scan mistake, not just Production/Dispatch. Checked against the
   // CURRENT register via registerState (read from the outer render closure, not a functional-updater
@@ -4521,7 +4532,10 @@ function FIMSApp() {
                 <div className="panel" style={{ borderColor: 'var(--accent)' }}>
                   <div className="panel-header">
                     <div><h2>Pending Production Review ({pendingProductionRows.length})</h2><p className="subtitle">New Production Register entries not yet pushed to any customer's Sheet. Check or fix the suggested customer, then push — nothing here counts toward balances or reaches the real Sheet until you do.</p></div>
-                    <button className="btn btn-primary" onClick={() => pushPendingRows('production', pendingProductionRows)}><FileSpreadsheet size={15} /> Push to Sheet</button>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button className="btn btn-danger" onClick={() => { if (window.confirm(`Discard all ${pendingProductionRows.length} pending row(s)? This deletes them from the Production Register entirely — not just from this pending list.`)) deleteRows('production')(pendingProductionRows.map(r => r.id)); }}><Trash2 size={15} /> Discard all pending</button>
+                      <button className="btn btn-primary" onClick={() => pushPendingRows('production', pendingProductionRows)}><FileSpreadsheet size={15} /> Push to Sheet</button>
+                    </div>
                   </div>
                   {buildPendingGroups(pendingProductionRows).map(group => (
                     <PendingGroupBar key={group.key} group={group} guess={matchCustomer(group.rows[0])}
@@ -4568,6 +4582,7 @@ function FIMSApp() {
                             )}
                             <td className="col-action">
                               <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm this row" onClick={() => confirmStockRow('production', row)}><CheckCircle2 size={16} /></button>
+                              <button className="icon-btn danger" title="Delete this row entirely" onClick={() => { if (window.confirm('Delete this row from the Production Register entirely?')) deleteRow('production')(row.id); }}><Trash2 size={15} /></button>
                             </td>
                           </tr>
                           );
@@ -4581,7 +4596,10 @@ function FIMSApp() {
                 <div className="panel" style={{ borderColor: 'var(--ledger-red)' }}>
                   <div className="panel-header">
                     <div><h2>Pending Dispatch Bill Review ({pendingDispatchRows.length})</h2><p className="subtitle">New Customer Dispatch Bill entries not yet pushed to any customer's Sheet. Check or fix the suggested customer, then push — nothing here counts toward balances or reaches the real Sheet until you do.</p></div>
-                    <button className="btn btn-primary" onClick={() => pushPendingRows('customerDispatch', pendingDispatchRows)}><FileSpreadsheet size={15} /> Push to Sheet</button>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button className="btn btn-danger" onClick={() => { if (window.confirm(`Discard all ${pendingDispatchRows.length} pending row(s)? This deletes them from the Customer Dispatch Bills register entirely — not just from this pending list.`)) deleteRows('customerDispatch')(pendingDispatchRows.map(r => r.id)); }}><Trash2 size={15} /> Discard all pending</button>
+                      <button className="btn btn-primary" onClick={() => pushPendingRows('customerDispatch', pendingDispatchRows)}><FileSpreadsheet size={15} /> Push to Sheet</button>
+                    </div>
                   </div>
                   {buildPendingGroups(pendingDispatchRows).map(group => (
                     <PendingGroupBar key={group.key} group={group} guess={matchCustomer(group.rows[0])}
@@ -4629,6 +4647,7 @@ function FIMSApp() {
                             )}
                             <td className="col-action">
                               <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm this row" onClick={() => confirmStockRow('customerDispatch', row)}><CheckCircle2 size={16} /></button>
+                              <button className="icon-btn danger" title="Delete this row entirely" onClick={() => { if (window.confirm('Delete this row from the Customer Dispatch Bills register entirely?')) deleteRow('customerDispatch')(row.id); }}><Trash2 size={15} /></button>
                             </td>
                           </tr>
                           );
