@@ -2745,27 +2745,54 @@ function FIMSApp() {
   // when a number was misread, which an exact/near-exact dedup key never can (the numbers genuinely
   // differ, so no dedup key built from them will ever match).
   const looseDateDescKey = (row) => `${String(row.date || '').trim().toLowerCase()}||${applyAbbreviations(String(row.description || '')).trim().toLowerCase()}`;
+  // The structured-register counterpart of looseDateDescKey, for the two registers that have no
+  // free-text description to match on — a mill slip (Raw Material In) and a consumption report both
+  // get re-uploaded the same way a production register page does (new reels/strips added below
+  // earlier ones), so the same physical reel/strip can get re-extracted and land as a second row. The
+  // field list for each deliberately EXCLUDES whichever field is (a) most exposed to OCR drift across
+  // two separate extractions of the same page, and (b) not even shown in that register's own confirmed
+  // table, so a stray misread there would otherwise sit invisibly duplicated in front of the person's
+  // eyes: reel_no/unit for Raw Material In (confirmed directly — RAW_MATERIAL_SIZE_COLUMNS drops both
+  // from the per-size view precisely because they weren't asked for there), sl_no/leftover_weight for
+  // Consumption (the extraction prompt itself warns these two are the ones most likely to slide onto
+  // the wrong row in that sheet's narrow-strip layout). weight_kg / weight_consumed stay IN the key
+  // rather than being the "disagreeing" field — unlike a handwritten piece-count, a mill's own recorded
+  // reel weight is about as close to a unique fingerprint as this data has, so two rows agreeing on
+  // every other structured field AND that exact weight are overwhelmingly more likely to be one real
+  // reel counted twice than two different reels that coincidentally weigh the same to the kg.
+  const STRUCTURED_LOOSE_KEY_FIELDS = {
+    rawMaterialIn: ['date', 'mill', 'size', 'gsm', 'bf', 'shade', 'weight_kg'],
+    consumption: ['date', 'shade', 'size', 'gsm', 'weight_consumed'],
+  };
+  const structuredLooseKey = (registerKey, row) =>
+    STRUCTURED_LOOSE_KEY_FIELDS[registerKey].map(f => String(row[f] ?? '').trim().toLowerCase()).join('||');
   // Catches the failure dedupKeyForRow structurally cannot: a freshly-extracted row that's clearly the
-  // SAME real entry as one already confirmed (same date, same item once abbreviations are expanded) but
-  // whose NUMBERS disagree — exactly what a misread digit on a re-extraction produces (an already-
-  // correct "10080" re-read as "40080" is a real, confirmed case this session). Exact dedup can't catch
-  // this at all, since the numbers genuinely differ, so nothing stops it from silently becoming a
-  // second, wrong row sitting next to the correct one. This flags it instead — visible in the normal
-  // pre-confirm review UI (the same red-highlight/warning-icon flag every other extraction uncertainty
-  // already uses) — so a person decides which number is actually right, rather than either one just
-  // winning by default. Scoped to production/customerDispatch specifically: they're the two registers
-  // with a free-text `description` field this kind of loose "same real item" matching makes sense for;
-  // registers like Raw Material or Consumption identify a row by structured fields (size/GSM/reel),
-  // where this looser matching wouldn't mean the same thing.
+  // SAME real entry as one already confirmed (same date, same item once abbreviations are expanded, or
+  // same reel/strip identity for a structured register) but whose NUMBERS disagree — exactly what a
+  // misread digit on a re-extraction produces (an already-correct "10080" re-read as "40080" is a real,
+  // confirmed case this session). Exact dedup can't catch this at all, since the numbers genuinely
+  // differ, so nothing stops it from silently becoming a second, wrong row sitting next to the correct
+  // one. This flags it instead — visible in the normal pre-confirm review UI (the same red-highlight/
+  // warning-icon flag every other extraction uncertainty already uses) — so a person decides which
+  // reading is actually right, rather than either one just winning by default.
   const flagLikelyReReadDuplicates = (registerKey, rows) => {
-    if (registerKey !== 'production' && registerKey !== 'customerDispatch') return rows;
+    const isDescriptionBased = registerKey === 'production' || registerKey === 'customerDispatch';
+    const isStructured = !!STRUCTURED_LOOSE_KEY_FIELDS[registerKey];
+    if (!isDescriptionBased && !isStructured) return rows;
     const existing = registerState[registerKey] || [];
+    const looseKeyOf = isDescriptionBased ? looseDateDescKey : (r) => structuredLooseKey(registerKey, r);
     return rows.map(r => {
-      if (!r.description || r.flagged) return r;
-      const loose = looseDateDescKey(r);
-      const match = existing.find(e => e.description && looseDateDescKey(e) === loose);
+      if (r.flagged) return r;
+      if (isDescriptionBased && !r.description) return r;
+      const loose = looseKeyOf(r);
+      const match = existing.find(e => (isDescriptionBased ? !!e.description : true) && looseKeyOf(e) === loose);
       if (!match || dedupKeyForRow(match) === dedupKeyForRow(r)) return r;
-      return { ...r, flagged: true, flagReason: `Looks like the same entry as an existing confirmed row from ${match.date} ("${match.description}") — but the numbers on this reading don't match that entry. Check the original document before confirming; this may be a misread re-extraction of a row already in the register.` };
+      const reason = isDescriptionBased
+        ? `Looks like the same entry as an existing confirmed row from ${match.date} ("${match.description}") — but the numbers on this reading don't match that entry. Check the original document before confirming; this may be a misread re-extraction of a row already in the register.`
+        : registerKey === 'rawMaterialIn'
+          ? `Looks like the same reel as an existing entry already in the Raw Material Register (${match.date}, ${match.mill}, size ${match.size}, GSM ${match.gsm}, ${match.weight_kg} kg) — but this reading's Reel No/Unit doesn't match that entry's. Check the original mill slip before confirming; this may be a misread re-extraction of a reel already recorded.`
+          : `Looks like the same strip as an existing entry already in the Consumption register (${match.date}, shade ${match.shade}, size ${match.size}, GSM ${match.gsm}, ${match.weight_consumed} kg) — but this reading's SL.No/leftover doesn't match that entry's. Check the original report before confirming; this may be a misread re-extraction of a row already recorded.`;
+      return { ...r, flagged: true, flagReason: reason };
     });
   };
   /* -------- product catalog (editable; populated via Customer Sheets tab's Sheet-ID import) -------- */
