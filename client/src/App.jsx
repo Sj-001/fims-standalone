@@ -1755,14 +1755,49 @@ function FIMSApp() {
   const [clearSelected, setClearSelected] = useState({});
   const [clearBusy, setClearBusy] = useState(false);
   const [clearMessage, setClearMessage] = useState('');
+  // Opt-in companion to clearing Consumption specifically — only makes sense (and is only offered) when
+  // Consumption is selected AND Raw Material Register is NOT also selected in the same run, since
+  // there'd be nothing to revert onto otherwise. See runClearSelected for the actual revert logic and
+  // its one known limitation (untraceable leftover rows from before leftoverRawMaterialId existed).
+  const [revertConsumedOnClear, setRevertConsumedOnClear] = useState(false);
   const toggleClearGroup = (key) => setClearSelected(prev => ({ ...prev, [key]: !prev[key] }));
   const runClearSelected = async () => {
     const chosen = CLEAR_GROUPS.filter(g => clearSelected[g.key]);
     if (!chosen.length) return;
-    const summary = chosen.map(g => g.label).join(', ');
+    const revertRawMaterial = revertConsumedOnClear && clearSelected.consumption && !clearSelected.rawMaterialIn;
+    const summary = chosen.map(g => g.label).join(', ') + (revertRawMaterial ? ' (and putting the Raw Material reels this data consumed back in stock)' : '');
     if (!window.confirm(`Permanently clear: ${summary}?\n\nThis cannot be undone.`)) return;
     setClearBusy(true); setClearMessage('');
+    let untraceableLeftoverNote = '';
     try {
+      // Snapshotted BEFORE the loop runs — reverting must read Consumption and Raw Material In exactly
+      // as they stood the moment Clear was pressed. Since revertRawMaterial is only ever true when
+      // rawMaterialIn ISN'T also in `chosen`, nothing else in this same run touches rawMaterialIn before
+      // this reads it, so the outer closure's `rawMaterialIn`/`consumption` are safe to use directly.
+      if (revertRawMaterial) {
+        const matchedIds = new Set();
+        const leftoverIdsToRemove = new Set();
+        const untraceableLeftoverRows = [];
+        consumption.forEach(r => {
+          if (r.matchStatus !== 'matched' || !r.matchedRawMaterialId) return;
+          matchedIds.add(r.matchedRawMaterialId);
+          if (r.leftoverRawMaterialId) leftoverIdsToRemove.add(r.leftoverRawMaterialId);
+          else if (num(r.leftover_weight) > 0) untraceableLeftoverRows.push(r);
+        });
+        // Un-consumes every reel a cleared row actually matched (traceable via matchedRawMaterialId),
+        // and REMOVES (not un-consumes) every leftover row a cleared row spawned — that row only exists
+        // because of the match being undone here, so leaving it behind unconsumed would double-count
+        // the same physical material as two separate stock entries once the original reel reappears.
+        const nextRawMaterial = rawMaterialIn
+          .filter(r => !leftoverIdsToRemove.has(r.id))
+          .map(r => matchedIds.has(r.id) ? { ...r, consumed: '' } : r);
+        registerSetters.rawMaterialIn(nextRawMaterial);
+        await saveRegister(STORAGE_KEYS.rawMaterialIn, nextRawMaterial);
+        if (untraceableLeftoverRows.length) {
+          const dates = [...new Set(untraceableLeftoverRows.map(r => r.date))].join(', ');
+          untraceableLeftoverNote = ` Note: ${untraceableLeftoverRows.length} of the cleared rows had a leftover (Tukda) amount recorded from before this app could trace which Raw Material row it created — those leftover reels are still sitting in the Raw Material Register and were NOT removed automatically. Check entries dated ${dates} there by hand.`;
+        }
+      }
       for (const g of chosen) {
         if (g.registerKeys) {
           for (const rk of g.registerKeys) {
@@ -1778,8 +1813,9 @@ function FIMSApp() {
           setAbbreviations([]); await window.storage.set(ABBREVIATIONS_KEY, JSON.stringify([]), false);
         }
       }
-      setClearMessage(`Cleared: ${summary}.`);
+      setClearMessage(`Cleared: ${summary}.${untraceableLeftoverNote}`);
       setClearSelected({});
+      setRevertConsumedOnClear(false);
     } catch (e) {
       setClearMessage(`Something went wrong partway through (${e.message || 'unknown error'}) — check which registers above still show data and retry just those.`);
     } finally {
@@ -2598,14 +2634,24 @@ function FIMSApp() {
       if (match) {
         claimedRawMaterialIds.add(match.id);
         rawMaterialConsumedDateById[match.id] = cRow.date;
-        consumptionUpdateById[cRow.id] = { matchStatus: 'matched', matchedRawMaterialId: match.id };
         const leftover = num(cRow.leftover_weight);
+        // Recorded on the consumption row itself (not just created and forgotten) so a later "clear
+        // Consumption, put the reels back" can find and remove exactly this spawned row — without this,
+        // reverting the ORIGINAL reel back to unconsumed while this leftover row silently stays behind
+        // would double-count that material as two separate stock entries. See runClearSelected's
+        // revertConsumedOnClear option.
+        let leftoverRawMaterialId = null;
         if (leftover > 0) {
+          leftoverRawMaterialId = genId();
           leftoverRowsToAdd.push({
-            id: genId(), date: cRow.date, mill: match.mill, reel_no: match.reel_no, size: match.size,
+            id: leftoverRawMaterialId, date: cRow.date, mill: match.mill, reel_no: match.reel_no, size: match.size,
             unit: match.unit, gsm: match.gsm, bf: match.bf, shade: match.shade, weight_kg: leftover, consumed: '',
           });
         }
+        consumptionUpdateById[cRow.id] = {
+          matchStatus: 'matched', matchedRawMaterialId: match.id,
+          ...(leftoverRawMaterialId ? { leftoverRawMaterialId } : {}),
+        };
       } else if (cRow.matchStatus !== 'unmatched') {
         consumptionUpdateById[cRow.id] = { matchStatus: 'unmatched' };
       }
@@ -2641,14 +2687,21 @@ function FIMSApp() {
     // weight (see the "WEIGHT vs. LEFTOVER" extraction rule above), i.e. exactly rRow.weight_kg — not
     // an amount used up. leftover_weight is left untouched: it's this consumption row's own reading of
     // how much was left over, independent of which reel it turned out to be.
+    const leftover = num(cRow.leftover_weight);
+    // Same id captured back onto the consumption row as the automatic matcher does above — see that
+    // effect's comment on leftoverRawMaterialId for why (traces a manual match's leftover row too, so
+    // "clear Consumption, put the reels back" can find and remove it either way).
+    const leftoverRawMaterialId = leftover > 0 ? genId() : null;
     const nextConsumption = consumption.map(r => r.id === consumptionRowId
-      ? { ...r, matchStatus: 'matched', matchedRawMaterialId: rawMaterialRowId, shade: rRow.shade, size: rRow.size, gsm: rRow.gsm, weight_consumed: rRow.weight_kg }
+      ? {
+          ...r, matchStatus: 'matched', matchedRawMaterialId: rawMaterialRowId, shade: rRow.shade, size: rRow.size, gsm: rRow.gsm, weight_consumed: rRow.weight_kg,
+          ...(leftoverRawMaterialId ? { leftoverRawMaterialId } : {}),
+        }
       : r);
     setConsumption(nextConsumption);
     persist('consumption', nextConsumption);
-    const leftover = num(cRow.leftover_weight);
-    const leftoverRows = leftover > 0 ? [{
-      id: genId(), date: cRow.date, mill: rRow.mill, reel_no: rRow.reel_no, size: rRow.size,
+    const leftoverRows = leftoverRawMaterialId ? [{
+      id: leftoverRawMaterialId, date: cRow.date, mill: rRow.mill, reel_no: rRow.reel_no, size: rRow.size,
       unit: rRow.unit, gsm: rRow.gsm, bf: rRow.bf, shade: rRow.shade, weight_kg: leftover, consumed: '',
     }] : [];
     const nextRawMaterial = [
@@ -5250,10 +5303,26 @@ function FIMSApp() {
                   <span style={{ fontSize: 13.5, fontWeight: 600 }}>Select all</span>
                 </label>
                 {CLEAR_GROUPS.map(g => (
-                  <label key={g.key} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, cursor: 'pointer' }}>
-                    <input type="checkbox" checked={!!clearSelected[g.key]} onChange={() => toggleClearGroup(g.key)} />
-                    <span style={{ fontSize: 13.5 }}>{g.label}</span>
-                  </label>
+                  <React.Fragment key={g.key}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, cursor: 'pointer' }}>
+                      <input type="checkbox" checked={!!clearSelected[g.key]} onChange={() => toggleClearGroup(g.key)} />
+                      <span style={{ fontSize: 13.5 }}>{g.label}</span>
+                    </label>
+                    {g.key === 'consumption' && clearSelected.consumption && (
+                      <label
+                        style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, marginLeft: 26, cursor: clearSelected.rawMaterialIn ? 'default' : 'pointer', opacity: clearSelected.rawMaterialIn ? 0.5 : 1 }}
+                        title={clearSelected.rawMaterialIn ? 'Not available while Raw Material Register is also selected — there would be nothing to put back.' : undefined}
+                      >
+                        <input
+                          type="checkbox"
+                          disabled={!!clearSelected.rawMaterialIn}
+                          checked={revertConsumedOnClear && !clearSelected.rawMaterialIn}
+                          onChange={() => setRevertConsumedOnClear(v => !v)}
+                        />
+                        <span style={{ fontSize: 13, color: 'var(--muted)' }}>Also mark the Raw Material reels this data consumed as unconsumed (puts them back in stock)</span>
+                      </label>
+                    )}
+                  </React.Fragment>
                 ))}
                 <div className="review-actions" style={{ marginTop: 10 }}>
                   <button className="btn btn-danger" disabled={clearBusy || !Object.values(clearSelected).some(Boolean)} onClick={runClearSelected}>
