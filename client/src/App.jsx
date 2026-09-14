@@ -2214,14 +2214,21 @@ function FIMSApp() {
       }, (secondsLeft) => {
         setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
       });
-      const rows = flagLikelyReReadDuplicates(pageConfig.register, pageConfig.shape(raw));
+      const shapedRows = flagLikelyReReadDuplicates(pageConfig.register, pageConfig.shape(raw));
+      const rows = dropAlreadyConfirmedDuplicates(pageConfig.register, shapedRows);
       if (!rows.length && !truncated) {
         // A clean, confident "nothing here" result (a duplicate copy, an e-Way Bill page, a non-spec
         // page) needs zero decisions from anyone — it's removed from the queue right away instead of
         // sitting there as a result someone has to notice and manually discard. A TRUNCATED empty
         // result is different — the response may have been cut off before it could produce anything,
         // so that one still needs a person's attention (falls through to the normal 'done' path below).
-        setErrorMsg('No data found on this page — it was automatically skipped.');
+        // Two different reasons land here, worth telling apart: genuinely nothing extracted at all, vs.
+        // everything extracted turned out to already be sitting in the register (a page re-uploaded
+        // after new rows were added below already-confirmed ones) — dropAlreadyConfirmedDuplicates
+        // removed it above, so shapedRows still has the original count to tell the two apart by.
+        setErrorMsg(shapedRows.length
+          ? 'Every row on this page was already in the register — nothing new to add, so it was skipped automatically.'
+          : 'No data found on this page — it was automatically skipped.');
         removeQueuedPages([current.id]);
       } else {
         if (truncated) setErrorMsg(`Claude's response was cut off before it finished this page — it may have more rows than the ${rows.length} shown below. Check against the original, and use "Re-extract this file" if anything's missing.`);
@@ -2279,7 +2286,7 @@ function FIMSApp() {
         }, (secondsLeft) => {
           setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
         });
-        const rows = flagLikelyReReadDuplicates(pageConfig.register, pageConfig.shape(raw));
+        const rows = dropAlreadyConfirmedDuplicates(pageConfig.register, flagLikelyReReadDuplicates(pageConfig.register, pageConfig.shape(raw)));
         anySucceeded = true;
         if (!rows.length && !truncated) {
           // Same reasoning as the single-file path (runExtraction): a clean, confident "nothing here"
@@ -2893,6 +2900,25 @@ function FIMSApp() {
           : `Looks like the same strip as an existing entry already in the Consumption register (${match.date}, shade ${match.shade}, size ${match.size}, GSM ${match.gsm}, ${match.weight_consumed} kg) — but this reading's SL.No/leftover doesn't match that entry's. Check the original report before confirming; this may be a misread re-extraction of a row already recorded.`;
       return { ...r, flagged: true, flagReason: reason };
     });
+  };
+  // A page gets re-uploaded once new rows are added below earlier ones on the same physical sheet —
+  // the model is deliberately NOT told to skip rows it recognizes (see production_sheet's systemPrompt
+  // note on {{RECENT_ENTRIES}}), specifically so the mandatory row-count check never has a reason to
+  // omit a real row. That means a re-extraction routinely reproduces rows that are ALREADY sitting in
+  // the register, confirmed, exactly as before. addRows already silently skips those at confirm time
+  // (see dedupKeyForRow) — they were never going to reach the Sheet a second time — but leaving them
+  // VISIBLE in the pre-confirm review is exactly the "why is this old row still showing up" confusion:
+  // it looks like it needs checking when it's actually just noise. Dropped here, right after
+  // extraction, using the SAME exact-match key addRows itself uses, so a row disappears from the
+  // preview if and only if it was always going to be silently skipped anyway — never a behavior change,
+  // only a visibility one. Never touches a flagged row: flagLikelyReReadDuplicates already decided that
+  // one needs a person's eyes (a misread re-extraction, not a clean duplicate), and a byte-exact
+  // duplicate is never flagged in the first place, so this ordering never conflicts with that check.
+  const dropAlreadyConfirmedDuplicates = (registerKey, rows) => {
+    const existing = registerState[registerKey] || [];
+    if (!existing.length) return rows;
+    const existingKeys = new Set(existing.map(dedupKeyForRow));
+    return rows.filter(r => r.flagged || !existingKeys.has(dedupKeyForRow(r)));
   };
   /* -------- product catalog (editable; populated via Customer Sheets tab's Sheet-ID import) -------- */
   const persistCatalog = (next) => {
