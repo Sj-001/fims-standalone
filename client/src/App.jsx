@@ -1755,16 +1755,17 @@ function FIMSApp() {
   const [clearSelected, setClearSelected] = useState({});
   const [clearBusy, setClearBusy] = useState(false);
   const [clearMessage, setClearMessage] = useState('');
-  // Opt-in companion to clearing Consumption specifically — only makes sense (and is only offered) when
-  // Consumption is selected AND Raw Material Register is NOT also selected in the same run, since
-  // there'd be nothing to revert onto otherwise. See runClearSelected for the actual revert logic and
-  // its one known limitation (untraceable leftover rows from before leftoverRawMaterialId existed).
-  const [revertConsumedOnClear, setRevertConsumedOnClear] = useState(false);
   const toggleClearGroup = (key) => setClearSelected(prev => ({ ...prev, [key]: !prev[key] }));
   const runClearSelected = async () => {
     const chosen = CLEAR_GROUPS.filter(g => clearSelected[g.key]);
     if (!chosen.length) return;
-    const revertRawMaterial = revertConsumedOnClear && clearSelected.consumption && !clearSelected.rawMaterialIn;
+    // Clearing Consumption always puts back in stock whatever it had consumed — on by default, not an
+    // opt-in, since leaving those reels stuck "consumed" forever with the record that explained why now
+    // gone is a worse default than reverting them. Only skipped when Raw Material Register is ALSO being
+    // cleared in the same run, since there'd be nothing to revert onto. See below for the actual revert
+    // logic and its one known limitation (untraceable leftover rows from before leftoverRawMaterialId
+    // existed).
+    const revertRawMaterial = clearSelected.consumption && !clearSelected.rawMaterialIn;
     const summary = chosen.map(g => g.label).join(', ') + (revertRawMaterial ? ' (and putting the Raw Material reels this data consumed back in stock)' : '');
     if (!window.confirm(`Permanently clear: ${summary}?\n\nThis cannot be undone.`)) return;
     setClearBusy(true); setClearMessage('');
@@ -1815,7 +1816,6 @@ function FIMSApp() {
       }
       setClearMessage(`Cleared: ${summary}.${untraceableLeftoverNote}`);
       setClearSelected({});
-      setRevertConsumedOnClear(false);
     } catch (e) {
       setClearMessage(`Something went wrong partway through (${e.message || 'unknown error'}) — check which registers above still show data and retry just those.`);
     } finally {
@@ -2639,7 +2639,7 @@ function FIMSApp() {
         // Consumption, put the reels back" can find and remove exactly this spawned row — without this,
         // reverting the ORIGINAL reel back to unconsumed while this leftover row silently stays behind
         // would double-count that material as two separate stock entries. See runClearSelected's
-        // revertConsumedOnClear option.
+        // automatic revert-on-clear behavior.
         let leftoverRawMaterialId = null;
         if (leftover > 0) {
           leftoverRawMaterialId = genId();
@@ -5303,26 +5303,15 @@ function FIMSApp() {
                   <span style={{ fontSize: 13.5, fontWeight: 600 }}>Select all</span>
                 </label>
                 {CLEAR_GROUPS.map(g => (
-                  <React.Fragment key={g.key}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, cursor: 'pointer' }}>
-                      <input type="checkbox" checked={!!clearSelected[g.key]} onChange={() => toggleClearGroup(g.key)} />
-                      <span style={{ fontSize: 13.5 }}>{g.label}</span>
-                    </label>
-                    {g.key === 'consumption' && clearSelected.consumption && (
-                      <label
-                        style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, marginLeft: 26, cursor: clearSelected.rawMaterialIn ? 'default' : 'pointer', opacity: clearSelected.rawMaterialIn ? 0.5 : 1 }}
-                        title={clearSelected.rawMaterialIn ? 'Not available while Raw Material Register is also selected — there would be nothing to put back.' : undefined}
-                      >
-                        <input
-                          type="checkbox"
-                          disabled={!!clearSelected.rawMaterialIn}
-                          checked={revertConsumedOnClear && !clearSelected.rawMaterialIn}
-                          onChange={() => setRevertConsumedOnClear(v => !v)}
-                        />
-                        <span style={{ fontSize: 13, color: 'var(--muted)' }}>Also mark the Raw Material reels this data consumed as unconsumed (puts them back in stock)</span>
-                      </label>
-                    )}
-                  </React.Fragment>
+                  <label key={g.key} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={!!clearSelected[g.key]} onChange={() => toggleClearGroup(g.key)} />
+                    <span style={{ fontSize: 13.5 }}>
+                      {g.label}
+                      {g.key === 'consumption' && clearSelected.consumption && !clearSelected.rawMaterialIn && (
+                        <span style={{ color: 'var(--muted)', fontWeight: 400 }}> — also puts the Raw Material reels this data consumed back in stock</span>
+                      )}
+                    </span>
+                  </label>
                 ))}
                 <div className="review-actions" style={{ marginTop: 10 }}>
                   <button className="btn btn-danger" disabled={clearBusy || !Object.values(clearSelected).some(Boolean)} onClick={runClearSelected}>
