@@ -286,6 +286,14 @@ const STORAGE_KEYS = {
   // search can look through every customer's real Sheet data locally, without a live API call per search.
   customerSheetsMirror: 'fims_customer_sheets_mirror',
 };
+// Every STORAGE_KEYS register that's "one row per real thing" AND realistically gets hand-edited in
+// the raw Google Sheet (a person typing a reel straight into RAW_MATERIAL_IN being the confirmed real
+// case) — used by the id-backfill pass on load (see the initial load effect) to catch a row that has
+// no internal id because nothing in the Sheet UI ever prompted for one. Deliberately excludes the two
+// STORAGE_KEYS entries that aren't this shape: daburSpecSheetConfig is a single config blob, not row
+// data with its own identity; customerSheetsMirror is a system-managed mirror of each customer's OWN
+// external Sheet, never a tab a person hand-edits directly.
+const ID_BACKFILL_REGISTERS = Object.keys(STORAGE_KEYS).filter(k => k !== 'daburSpecSheetConfig' && k !== 'customerSheetsMirror');
 const CATALOG_KEY = 'fims_product_catalog';
 // Exact item names, one per customer — used to correct handwriting misreads during extraction (e.g.
 // "g" vs "9", "&" vs "8"). Starts EMPTY on purpose: every customer's items get added by importing
@@ -1531,6 +1539,39 @@ function FIMSApp() {
     (async () => {
       const entries = await Promise.all(Object.entries(STORAGE_KEYS).map(async ([k, storageKey]) => [k, await loadRegister(storageKey)]));
       const loadedMap = Object.fromEntries(entries);
+      // A row typed straight into the Google Sheet by hand (rather than extracted/confirmed through
+      // the app) has no way to get the internal "id" every row is otherwise keyed by — nothing in the
+      // Sheet UI prompts for one, and there's no sensible value a person could type there anyway. Left
+      // blank, EVERY hand-typed row in a tab ends up sharing the exact same id (the empty string), so
+      // anything that looks a row up "by id" — the Consumption↔Raw Material matcher chief among them —
+      // can no longer tell those rows apart: matching or updating "the" row with that id actually hits
+      // all of them at once. Confirmed directly as the cause of real data corruption: a single genuine
+      // consumption match got its "consumed" date smeared across every other hand-typed reel sharing
+      // that same blank id, and every one of them then looked "already used up" and stopped being
+      // offered as a match to anything else — a growing pile of reels silently locked out of matching.
+      // Backfilled here, before a single row ever reaches React state or any id-keyed effect, so
+      // nothing downstream (the matcher included) ever sees a blank or duplicate id in the first place.
+      // Runs on every load but only ever touches rows that actually need it — once a tab's ids are all
+      // real and unique, this is a genuine no-op from then on.
+      const idBackfilledRegisters = [];
+      ID_BACKFILL_REGISTERS.forEach(k => {
+        const rows = loadedMap[k];
+        if (!Array.isArray(rows) || !rows.length) return;
+        const seen = new Set();
+        let changed = false;
+        const next = rows.map(r => {
+          const currentId = (r && r.id) ? String(r.id).trim() : '';
+          if (!currentId || seen.has(currentId)) {
+            changed = true;
+            const freshId = genId();
+            seen.add(freshId);
+            return { ...r, id: freshId };
+          }
+          seen.add(currentId);
+          return r;
+        });
+        if (changed) { loadedMap[k] = next; idBackfilledRegisters.push(k); }
+      });
       Object.entries(loadedMap).forEach(([k, rows]) => registerSetters[k] && registerSetters[k](rows));
       const specSheetCfg = (loadedMap.daburSpecSheetConfig || [])[0];
       if (specSheetCfg && specSheetCfg.spreadsheetId) {
@@ -1565,6 +1606,11 @@ function FIMSApp() {
         if (r4.ok) { const j = await r4.json(); setServiceAccountEmail(j.email || ''); }
       } catch (e) { /* shown as blank below; the per-error messages still work without this */ }
       setLoaded(true);
+      // Write the freshly-assigned ids back to the Sheet itself, so they're permanent from here on —
+      // not just patched in this one browser tab's local state. `persist` is declared further down in
+      // this same component; safe to reference here because this callback doesn't actually run until
+      // well after the whole component body (persist included) has finished executing for this render.
+      idBackfilledRegisters.forEach(k => persist(k, loadedMap[k]));
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
