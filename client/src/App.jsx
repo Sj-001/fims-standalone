@@ -1559,14 +1559,67 @@ function FIMSApp() {
   const [serviceAccountEmail, setServiceAccountEmail] = useState('');
   // reviewByCustomer holds the last fetched diff against a customer's REAL Sheet (a dry run — see
   // /api/customer-sheets/preview): existingTabNames/existingBlockTitles feed the Sheet-tab/Block
-  // datalist suggestions in Pending Review and Customer Sheets. Pushing itself now happens straight
-  // from Pending Review (see pushPendingRows/pushCustomerSheetNow) — no separate review-and-edit UI
-  // reads this anymore, it's purely a background data source for autocomplete suggestions.
+  // datalist suggestions in Pending Review and Customer Sheets. Its per-row `tabs[].variants[].rows`
+  // (date/existing/expected/status) is ALSO now read directly by the "Needs Your Review" conflicts
+  // panel below (see conflictsForCustomer) — a real date-collision (two dispatch bills landing on the
+  // same date, which this app's own confirmed evidence proved happens routinely) used to be computed
+  // here and then silently thrown away, never shown anywhere except a bare count after an actual push
+  // already completed. Never used to auto-resolve anything on its own; a person has to look at it.
   const [reviewByCustomer, setReviewByCustomer] = useState({}); // { [customer]: { loading, error, tabs, existingTabNames } }
   // Always empty now — nothing sets it since the review-and-edit UI it backed was removed (pushing
   // happens straight from Pending Review, see pushPendingRows) — kept only because applyReviewEdits/
   // getEditedPayload still read it as a harmless no-op rather than reworking that whole call chain.
   const [reviewEdits, setReviewEdits] = useState({}); // { [customer]: { [variantTitle]: { tabNameOverride, rowEdits: { [rowIndex]: {date,production,dispatch} }, deletedRows: { [rowIndex]: true } } } }
+  // A person's explicit, reviewed decision on one flagged date conflict: "yes, add this amount as its
+  // OWN new row for this date." Never an overwrite — this ledger has no invoice-number column and no
+  // way to tell two same-day entries apart once written, so the only safe way to get a second real
+  // entry's amount into the Sheet, without ever touching the row already there, is a genuinely new row
+  // sharing that date (see the server's v.forceNewRows handling in computeMergePatches). Keyed by
+  // `${customer}::${tabName}::${title}::${dateKey}` so the same conflict resurfacing on a later preview
+  // (nothing approved yet for it) is treated as a fresh decision, not silently reused from a stale one.
+  const [approvedSheetAdditions, setApprovedSheetAdditions] = useState({});
+  // Every row across every customer/tab/item that the last preview flagged as NOT matching what's
+  // already in the real Sheet — a genuine conflict, never silently resolved either direction (not
+  // pushed as an overwrite, not dropped). `unverifiable` (a date the Sheet says it has, but this app
+  // couldn't actually read a value for) is folded in here too — same "a person needs to look at this"
+  // treatment, just with existing shown as unknown instead of a real number.
+  const conflictsForCustomer = (customer) => {
+    const rev = reviewByCustomer[customer];
+    if (!rev || !Array.isArray(rev.tabs)) return [];
+    const out = [];
+    rev.tabs.forEach(tab => {
+      (tab.variants || []).forEach(v => {
+        (v.rows || []).forEach(r => {
+          if (r.status !== 'mismatch' && r.status !== 'unverifiable') return;
+          // dateSortKey produces the same YYYY-MM-DD normalization as the server's own canonicalDateKey
+          // for a plain D.M.YY string (which r.date always is here) — reused rather than duplicated.
+          const dateKey = dateSortKey(r.date);
+          out.push({ key: `${customer}::${tab.tabName}::${v.title}::${dateKey}`, customer, tabName: tab.tabName, title: v.title, dateKey, ...r });
+        });
+      });
+    });
+    return out;
+  };
+  // Every conflict a person has explicitly approved for one customer+tab+item, in the [date, opening,
+  // production, dispatch, closing] row shape the push payload itself uses — opening/closing are always
+  // null since the server recomputes both as live formulas for any genuinely new row, never trusting an
+  // incoming value for them (see computeMergePatches).
+  const approvedAdditionsFor = (customer, tabName, title) =>
+    Object.values(approvedSheetAdditions)
+      .filter(a => a.customer === customer && a.tabName === tabName && a.title === title)
+      .map(a => [a.date, null, a.production === '' || a.production == null ? null : Number(a.production), a.dispatch === '' || a.dispatch == null ? null : Number(a.dispatch), null]);
+  const approveSheetAddition = (conflict, production, dispatch) => {
+    setApprovedSheetAdditions(prev => ({
+      ...prev,
+      [conflict.key]: { customer: conflict.customer, tabName: conflict.tabName, title: conflict.title, date: conflict.date, production, dispatch },
+    }));
+  };
+  const unapproveSheetAddition = (key) => setApprovedSheetAdditions(prev => { const next = { ...prev }; delete next[key]; return next; });
+  // The person's in-progress edit of a NOT-YET-approved conflict's production/dispatch fields — kept
+  // separate from approvedSheetAdditions so typing into these boxes has zero effect until "Approve" is
+  // actually clicked (matches every other explicit-confirm action in this app).
+  const [conflictDrafts, setConflictDrafts] = useState({});
+  const updateConflictDraft = (key, field, value) => setConflictDrafts(prev => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
   const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
   const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch, customerSheetsMirror: setCustomerSheetsMirror };
   useEffect(() => {
@@ -3455,6 +3508,10 @@ function FIMSApp() {
           e.hasDispatch ? (e.dispatch || 0) : null,
           e.closing,
         ]),
+        // Approved date-conflict additions (see the "Needs Your Review" panel) — never merged into the
+        // row above, always sent as their OWN separate new row so the server can never mistake one for
+        // a duplicate/overwrite of a date that already has a row.
+        forceNewRows: approvedAdditionsFor(customer, sheetGroup, g.description || 'Item'),
         ...(catalogBlock ? { blockTitleOverride: catalogBlock } : {}),
       });
     });
@@ -3932,8 +3989,10 @@ function FIMSApp() {
     }
     // Always the CURRENT edited payload (review edits — value changes, deletions, moves, added rows —
     // applied on top of the freshly computed ledger), so what gets written always matches exactly what
-    // was last shown on screen. No separate "Approve" step anymore — just a plain confirm, same as any
-    // other real write in this app (Clear Data, Discard changes, etc.).
+    // was last shown on screen. Every ordinary row still goes through with just this one plain confirm,
+    // same as any other real write in this app — the separate, explicit "Approve" step lives only on
+    // the "Needs Your Review" conflicts panel (approveSheetAddition), for the one case that's never
+    // safe to wave through automatically: a date that already disagrees with what's really in the Sheet.
     const { itemGroups, unmatched } = getEditedPayload(customer);
     if (!itemGroups.some(g => (g.variants || []).some(v => (v.rows || []).length > 0))) {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Nothing new to push right now.' } }));
@@ -3956,7 +4015,7 @@ function FIMSApp() {
         // sent, so nothing was written for it (existing rows are never touched). That's not a failure,
         // but it must never look like a silent, complete success either.
         const mismatchCount = (data.results || []).reduce((s, r) => s + (r.mismatches || []).reduce((s2, m) => s2 + ((m.mismatches || []).length), 0), 0);
-        const mismatchNote = mismatchCount ? ` ${mismatchCount} date${mismatchCount === 1 ? '' : 's'} already ${mismatchCount === 1 ? 'has' : 'have'} a different number in the Sheet, so ${mismatchCount === 1 ? 'that one was' : 'those were'} left as-is — check the Preview below.` : '';
+        const mismatchNote = mismatchCount ? ` ${mismatchCount} date${mismatchCount === 1 ? '' : 's'} already ${mismatchCount === 1 ? 'has' : 'have'} a different number in the Sheet, so ${mismatchCount === 1 ? 'that one was' : 'those were'} left as-is — see "Needs Your Review — Sheet Conflicts" above.` : '';
         setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Sent ${itemGroups.length} item${itemGroups.length === 1 ? '' : 's'} to the Sheet just now.${mismatchNote}`, unmatched } }));
         patchCustomerSheetEntry(customer, { sheetId, lastPushedAt: new Date().toISOString() });
         // Refreshes this customer's slice of the Customer Sheets Mirror with what's really in the Sheet
@@ -3966,6 +4025,12 @@ function FIMSApp() {
         // The staged edits were for THIS specific diff — once it's actually written, their values are
         // now baked into the real rows the app just appended, so clear them and pull a fresh diff.
         setReviewEdits(prev => { const next = { ...prev }; delete next[customer]; return next; });
+        // Same reasoning for approved conflict additions — whatever just got sent for this customer is
+        // either now a real new row in the Sheet, or (if the server itself still refused it for some
+        // reason not caught here) will simply reappear as a fresh conflict on the next refreshReview
+        // below, ready to be looked at again rather than silently staying "approved" against a push that
+        // already happened.
+        setApprovedSheetAdditions(prev => Object.fromEntries(Object.entries(prev).filter(([, a]) => a.customer !== customer)));
         refreshReview(customer);
       } else {
         const failedTabs = (data.results || []).filter(r => !r.ok).map(r => `${r.tab}: ${r.error}`).join(' · ');
@@ -4825,6 +4890,82 @@ function FIMSApp() {
                   ))}
                 </div>
               )}
+              {(() => {
+                const conflictsByCustomer = allCustomerTabNames
+                  .map(customer => ({ customer, conflicts: conflictsForCustomer(customer) }))
+                  .filter(c => c.conflicts.length > 0);
+                if (!conflictsByCustomer.length) return null;
+                return (
+                  <div className="panel" style={{ borderColor: 'var(--ledger-red)' }}>
+                    <div className="panel-header">
+                      <div>
+                        <h2>Needs Your Review — Sheet Conflicts</h2>
+                        <p className="subtitle">A date that already has a number in the customer's real Google Sheet, where what your registers add up to disagrees — e.g. a second dispatch bill landing on a date that already has one. Never overwritten automatically. Check the numbers, then either approve adding the difference as its OWN new row (the existing row is never touched), or leave it alone if the number already in the Sheet turns out to be the right one.</p>
+                      </div>
+                    </div>
+                    {conflictsByCustomer.map(({ customer, conflicts }) => (
+                      <div key={customer} style={{ marginBottom: 18 }}>
+                        <strong style={{ fontSize: 13.5 }}>{customer}</strong>
+                        <div className="table-wrap" style={{ marginTop: 6 }}>
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>Item</th><th>Date</th><th>Sheet has</th><th>Registers add up to</th>
+                                <th style={{ width: 260 }}>Add as a new row</th><th className="col-action"></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {conflicts.map(c => {
+                                const approved = approvedSheetAdditions[c.key];
+                                const existingProd = c.existing ? c.existing.production : null;
+                                const existingDisp = c.existing ? c.existing.dispatch : null;
+                                const expectedProd = c.expected ? c.expected.production : null;
+                                const expectedDisp = c.expected ? c.expected.dispatch : null;
+                                const suggestProd = (existingProd != null && expectedProd != null) ? Math.max(0, expectedProd - existingProd) : (expectedProd != null ? expectedProd : '');
+                                const suggestDisp = (existingDisp != null && expectedDisp != null) ? Math.max(0, expectedDisp - existingDisp) : (expectedDisp != null ? expectedDisp : '');
+                                const draft = conflictDrafts[c.key] || {};
+                                const draftProd = draft.production !== undefined ? draft.production : suggestProd;
+                                const draftDisp = draft.dispatch !== undefined ? draft.dispatch : suggestDisp;
+                                return (
+                                  <tr key={c.key} className="flagged-row">
+                                    <td>{c.title}</td>
+                                    <td>{c.date}</td>
+                                    <td>{c.status === 'unverifiable' ? 'unknown (unreadable)' : `Prod ${existingProd ?? 0} · Disp ${existingDisp ?? 0}`}</td>
+                                    <td>{`Prod ${expectedProd ?? 0} · Disp ${expectedDisp ?? 0}`}</td>
+                                    <td>
+                                      {approved ? (
+                                        <span className="pill pill-ok">Approved — Prod {approved.production || 0} · Disp {approved.dispatch || 0}</span>
+                                      ) : (
+                                        <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' }}>
+                                          <input className="cell-input" style={{ maxWidth: 80 }} type="number" placeholder="Production"
+                                            value={draftProd} onChange={e => updateConflictDraft(c.key, 'production', e.target.value)} />
+                                          <input className="cell-input" style={{ maxWidth: 80 }} type="number" placeholder="Dispatch"
+                                            value={draftDisp} onChange={e => updateConflictDraft(c.key, 'dispatch', e.target.value)} />
+                                          <button className="btn btn-ghost" style={{ padding: '4px 8px', fontSize: 12 }}
+                                            onClick={() => approveSheetAddition(c, draftProd, draftDisp)}>
+                                            <CheckCircle2 size={13} /> Approve
+                                          </button>
+                                        </div>
+                                      )}
+                                    </td>
+                                    <td className="col-action">
+                                      {approved && (
+                                        <button className="icon-btn danger" title="Un-approve — won't be added on the next push" onClick={() => unapproveSheetAddition(c.key)}>
+                                          <Trash2 size={15} />
+                                        </button>
+                                      )}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()}
               {(pendingProductionRows.length > 0 || pendingDispatchRows.length > 0) && (
                 <SectionDivider icon={ListChecks} label="Needs your input" hint="New entries whose customer isn't confirmed yet — nothing here counts toward any balance until you confirm it." />
               )}

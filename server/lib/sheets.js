@@ -653,6 +653,20 @@ function computeMergePatches(existingGrid, variants) {
     perEntry.forEach(({ classified }, vi) => {
       classified.filter(c => c.status === 'new').forEach(c => allNew.push({ row: c.row, dateKey: canonicalDateKey(c.row[0]), vi }));
     });
+    // v.forceNewRows: rows a person has EXPLICITLY reviewed and approved, after seeing a real conflict
+    // reported in `mismatches` above (see the Customer Stock "Needs Your Review" panel) — a second real
+    // dispatch/production entry landing on a date that already has a row in the Sheet. This ledger has
+    // no invoice-number column and no way to tell two same-day entries apart once written, so the only
+    // safe way to add the missing amount, per the person's own explicit choice, is a genuinely NEW row
+    // for that date (never overwriting the row already there) — going through this exact same insert
+    // pipeline as any other new row. Bypasses classifyIncomingRows entirely on purpose: these rows are
+    // deliberately NOT compared against existingDates (that comparison is what produced the mismatch in
+    // the first place) — a person already looked at the conflict and decided this amount belongs.
+    perEntry.forEach(({ v }, vi) => {
+      (Array.isArray(v.forceNewRows) ? v.forceNewRows : []).forEach(row => {
+        allNew.push({ row, dateKey: canonicalDateKey((row || [])[0]), vi });
+      });
+    });
 
     const hasRealPriorRow = match.existingDates.size > 0;
     const groups = planChronologicalInserts(match.existingRowsOrdered, allNew);
@@ -809,8 +823,13 @@ function computeMergePatches(existingGrid, variants) {
     const rematch = blocks.find(b => normalizeTabKey(b.title) === key);
     if (rematch) { processBlockGroup(rematch, [{ v, incomingRows }]); return; }
     {
+      // A brand-new block has no existing rows to conflict with, so v.forceNewRows (approved additions
+      // from a PRIOR mismatch, which by definition required an already-existing block) should never
+      // realistically be populated here — merged in anyway, defensively, so nothing is ever silently
+      // lost regardless of ordering.
+      const allIncomingRows = incomingRows.concat(Array.isArray(v.forceNewRows) ? v.forceNewRows : []);
       const startCol = rightmostCol === -1 ? 0 : rightmostCol + 1;
-      const width = Math.max(header.length, ...incomingRows.map(r => (r || []).length), 1);
+      const width = Math.max(header.length, ...allIncomingRows.map(r => (r || []).length), 1);
       const openingCol = colLetter(startCol + 1);
       const prodCol = colLetter(startCol + 2);
       const dispCol = colLetter(startCol + 3);
@@ -819,7 +838,7 @@ function computeMergePatches(existingGrid, variants) {
       patches.push({ startRow0: usedHeaderRowIdx - 1, startCol0: startCol, values: [[blockTitle || '']] });
       patches.push({ startRow0: usedHeaderRowIdx, startCol0: startCol, values: [header] });
       let prevRow1 = null;
-      const values = incomingRows.map((r, i) => {
+      const values = allIncomingRows.map((r, i) => {
         const row = r || [];
         const thisRow1 = dataStartRow0 + i + 1;
         const out = [
@@ -836,8 +855,8 @@ function computeMergePatches(existingGrid, variants) {
       if (values.length) patches.push({ startRow0: dataStartRow0, startCol0: startCol, values });
       placements.push({ title: v.title, startCol0: startCol, width, lastWrittenRow1: dataStartRow0 + values.length });
       rightmostCol = startCol + width;
-      const newExistingRows = incomingRows.map((r, i) => ({ rowIdx: dataStartRow0 + i, dateKey: canonicalDateKey((r || [])[0]) }));
-      const newExistingValues = new Map(incomingRows.map((r, i) => [canonicalDateKey((r || [])[0]), { production: Number((r || [])[2]) || 0, dispatch: Number((r || [])[3]) || 0, rowIdx: dataStartRow0 + i }]));
+      const newExistingRows = allIncomingRows.map((r, i) => ({ rowIdx: dataStartRow0 + i, dateKey: canonicalDateKey((r || [])[0]) }));
+      const newExistingValues = new Map(allIncomingRows.map((r, i) => [canonicalDateKey((r || [])[0]), { production: Number((r || [])[2]) || 0, dispatch: Number((r || [])[3]) || 0, rowIdx: dataStartRow0 + i }]));
       blocks.push({
         title: blockTitle, startCol, width, nextRowIdx: dataStartRow0 + values.length,
         existingDates: new Set(newExistingRows.map(er => er.dateKey)), existingValuesByDate: newExistingValues,
@@ -1357,7 +1376,12 @@ function buildDisplayRows(match, classified) {
       const dispatch = c.fillDispatch ? c.expected.dispatch : (ex.dispatch !== undefined ? ex.dispatch : dispatch0);
       const opening = ex.opening !== undefined ? ex.opening : lastClosing;
       const closing = c.status === 'fillable' ? (opening + production - dispatch) : (ex.closing !== undefined ? ex.closing : (opening + production - dispatch));
-      rows.push({ date: row[0] || '', opening, production, dispatch, closing, status: c.status, existing: c.existing || null, fillProduction: !!c.fillProduction, fillDispatch: !!c.fillDispatch });
+      // expected: what THIS push actually computed for the date (from confirmed register data) — only
+      // set for mismatch/fillable/duplicate, never shown as this row's own production/dispatch above
+      // (those two always reflect what's REALLY in the Sheet right now), but essential for a person to
+      // see "the Sheet has 3520, but 7020 is what your registers add up to" side by side, rather than
+      // only ever seeing the Sheet's number with no way to tell anything disagreed at all.
+      rows.push({ date: row[0] || '', opening, production, dispatch, closing, status: c.status, existing: c.existing || null, expected: c.expected || null, fillProduction: !!c.fillProduction, fillDispatch: !!c.fillDispatch });
       lastClosing = closing;
     }
   });
