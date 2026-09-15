@@ -658,7 +658,7 @@ FINAL COUNT CHECK — MANDATORY BEFORE YOU FINALIZE: count the actual number of 
   },
   {
     key: 'consumption_sheet',
-    label: 'Daily Consumption Report (handwritten)',
+    label: 'Daily Consumption Report (raw material)',
     hint: 'The handwritten daily sheet workers use to record raw material consumed — columns are usually Shade, GSM, Size, Weight, and Balance Left.',
     register: 'consumption',
     systemPrompt: `You read a handwritten daily raw-material consumption report from a corrugated box factory. The sheet has Hindi column headers. Most rows share one date written once at the top. Return ONLY one JSON object:
@@ -693,7 +693,7 @@ IMPORTANT:
   },
   {
     key: 'production_sheet',
-    label: 'Production Register (handwritten)',
+    label: 'Production Register (finished goods input)',
     hint: 'The handwritten daily production register — covers both page styles: the shade/size/GSM/weight/tukda style, and the product-description + quantity style. Extracted into one unified register.',
     register: 'production',
     systemPrompt: `You read a handwritten factory production register from a corrugated box factory. There are TWO different page styles used in this register — figure out which one you're looking at and extract accordingly:
@@ -3905,7 +3905,7 @@ function FIMSApp() {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Nothing new to push right now.' } }));
       return;
     }
-    if (!window.confirm(`Push ${itemGroups.length} item tab${itemGroups.length === 1 ? '' : 's'} to ${customer}'s Google Sheet now?`)) return;
+    if (!window.confirm(`Send ${itemGroups.length} item${itemGroups.length === 1 ? '' : 's'} to ${customer}'s Google Sheet now?`)) return;
     setPushStatus(prev => ({ ...prev, [customer]: { state: 'pushing', message: '', unmatched } }));
     try {
       const res = await fetch('/api/customer-sheets/push', {
@@ -3922,8 +3922,8 @@ function FIMSApp() {
         // sent, so nothing was written for it (existing rows are never touched). That's not a failure,
         // but it must never look like a silent, complete success either.
         const mismatchCount = (data.results || []).reduce((s, r) => s + (r.mismatches || []).reduce((s2, m) => s2 + ((m.mismatches || []).length), 0), 0);
-        const mismatchNote = mismatchCount ? ` ${mismatchCount} date${mismatchCount === 1 ? '' : 's'} already had a row with different numbers and ${mismatchCount === 1 ? "wasn't" : "weren't"} touched — see the Preview below for details.` : '';
-        setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Pushed ${itemGroups.length} item tab${itemGroups.length === 1 ? '' : 's'} just now.${mismatchNote}`, unmatched } }));
+        const mismatchNote = mismatchCount ? ` ${mismatchCount} date${mismatchCount === 1 ? '' : 's'} already ${mismatchCount === 1 ? 'has' : 'have'} a different number in the Sheet, so ${mismatchCount === 1 ? 'that one was' : 'those were'} left as-is — check the Preview below.` : '';
+        setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Sent ${itemGroups.length} item${itemGroups.length === 1 ? '' : 's'} to the Sheet just now.${mismatchNote}`, unmatched } }));
         patchCustomerSheetEntry(customer, { sheetId, lastPushedAt: new Date().toISOString() });
         // Refreshes this customer's slice of the Customer Sheets Mirror with what's really in the Sheet
         // post-push (the server re-reads it fresh — see pushCustomerSheetHandler) so search reflects the
@@ -4765,7 +4765,7 @@ function FIMSApp() {
             <div>
               <div className="panel">
                 <h2 style={{ marginBottom: 6 }}>Customer Stock</h2>
-                <p className="subtitle">Review new Production Register and Customer Dispatch Bill entries here and confirm which customer they belong to. Matching is done by the Customer Mapping tab, plus anything literally bracketed next to the item name. "Push to Sheet" below confirms the customer AND pushes straight to their real Google Sheet in one step — duplicate rows already there are skipped automatically, server-side. The Customer Sheets tab is just for adding/syncing a Sheet ID.</p>
+                <p className="subtitle">Review new Production and Dispatch entries here, and confirm which customer each one belongs to (guessed automatically from the Customer Mapping tab, or anything bracketed next to the item name — check it's right). Clicking "Push to Sheet" confirms the customer and sends the entry straight to their real Google Sheet in one step; anything already there is left alone, never duplicated. The Customer Sheets tab is only for adding or updating a customer's Sheet link.</p>
               </div>
               {Object.entries(pushStatus).filter(([, s]) => s && s.state && s.state !== 'idle').length > 0 && (
                 <div className="panel">
