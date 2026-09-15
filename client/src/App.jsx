@@ -888,7 +888,10 @@ const COLUMNS = {
   ],
   customerDispatch: [
     { key: 'date', label: 'Date' }, { key: 'invoice_no', label: 'Invoice No' }, { key: 'party', label: 'Party' },
-    { key: 'buyer_order_no', label: 'Buyer Order No' }, { key: 'description', label: 'Description' },
+    // wrap: true — a bill can reference several PO/buyer-order numbers at once, comma-separated (e.g.
+    // "4300081181, 4300081182"), which a single-line input would just clip; see EditableTable's `c.wrap`
+    // handling, which renders this one as a wrapping textarea instead so the whole value is visible.
+    { key: 'buyer_order_no', label: 'Buyer Order No', wrap: true }, { key: 'description', label: 'Description' },
     { key: 'quantity', label: 'Quantity Dispatched', type: 'number' }, { key: 'rate', label: 'Rate', type: 'number' }, { key: 'amount', label: 'Amount', type: 'number' },
   ],
   // Mirrors the exact 23-column layout of the external cutting-spec Google Sheet this pushes to (see
@@ -1107,8 +1110,8 @@ function TabBlockPickerCells({ rowId, description, sheetGroupOptions, blockOptio
   return (
     <>
       <td>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          <input className="cell-input" style={{ width: 110, fontSize: 12, borderColor: tabUnresolved ? 'var(--ledger-red)' : undefined }}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+          <input className="cell-input" style={{ maxWidth: 110, fontSize: 12, borderColor: tabUnresolved ? 'var(--ledger-red)' : undefined }}
             list={`pending-sheetgroup-${rowId}`}
             placeholder="Sheet tab" value={sheetGroup} onChange={e => onChange('sheetGroup', e.target.value)} />
           <datalist id={`pending-sheetgroup-${rowId}`}>{sheetGroupOptions.map(s => <option key={s} value={s} />)}</datalist>
@@ -1119,8 +1122,8 @@ function TabBlockPickerCells({ rowId, description, sheetGroupOptions, blockOptio
         </div>
       </td>
       <td>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          <input className="cell-input" style={{ width: 140, fontSize: 12, borderColor: blockUnresolved ? 'var(--ledger-red)' : undefined }}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+          <input className="cell-input" style={{ maxWidth: 140, fontSize: 12, borderColor: blockUnresolved ? 'var(--ledger-red)' : undefined }}
             list={`pending-block-${rowId}`}
             placeholder="Block (blank = new block)" value={block} onChange={e => onChange('block', e.target.value)} />
           <datalist id={`pending-block-${rowId}`}>
@@ -1249,6 +1252,25 @@ function BatchFillRow({ columns, rows, onUpdate, selectedIds, onClearSelection }
     </tr>
   );
 }
+// Grows a wrap-mode cell's <textarea> to fit its actual content height (never taller than needed, never
+// clipping) — an effect keyed on `value`, not a plain ref/onInput pair, specifically so it re-measures
+// no matter HOW the value changed: typed directly here, or set from elsewhere entirely (BatchFillRow's
+// Fill blanks/Overwrite all/Apply to selected can set this field on a row without this textarea itself
+// ever firing input/change) — a ref-only approach would miss that second case and silently stay clipped
+// at whatever height it last had. Resetting height to 'auto' before reading scrollHeight is required too,
+// otherwise a value that just got SHORTER would keep reporting its old, now-too-tall scrollHeight and
+// never actually shrink back down.
+function AutoSizeTextarea({ value, onChange }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!ref.current) return;
+    ref.current.style.height = 'auto';
+    ref.current.style.height = `${ref.current.scrollHeight}px`;
+  }, [value]);
+  return (
+    <textarea ref={ref} className="cell-input cell-textarea" rows={1} value={value ?? ''} onChange={onChange} />
+  );
+}
 function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow, sortByDate = true, showBatchFill = false }) {
   // Row selection (also showBatchFill-only, see BatchFillRow's "Apply to selected"): a plain click
   // TOGGLES just that row's checkbox without touching any other row's selection — matches the literal
@@ -1365,12 +1387,24 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
                       {ci === 0 && !suppressFlags && row.flagged && (
                         <AlertCircle size={13} color="var(--ledger-red)" style={{ flexShrink: 0 }} title={row.flagReason || 'Flagged during extraction — the model wasn\'t confident about this row. Check it against the original document.'} />
                       )}
-                      <input
-                        className="cell-input"
-                        type={c.type === 'number' ? 'number' : 'text'}
-                        value={row[c.key] ?? ''}
-                        onChange={(e) => onUpdate(row.id, c.key, c.type === 'number' ? e.target.value : e.target.value)}
-                      />
+                      {c.wrap ? (
+                        // A plain single-line <input> can only ever show as much of a long value (e.g.
+                        // several comma-separated PO/bill numbers) as its own width allows — the rest
+                        // sits there unseen unless you click in and scroll within the box by hand. A
+                        // <textarea> wraps that same text onto as many lines as it needs instead, so the
+                        // whole value is visible at a glance, at the cost of the row growing taller.
+                        <AutoSizeTextarea
+                          value={row[c.key]}
+                          onChange={(e) => onUpdate(row.id, c.key, e.target.value)}
+                        />
+                      ) : (
+                        <input
+                          className="cell-input"
+                          type={c.type === 'number' ? 'number' : 'text'}
+                          value={row[c.key] ?? ''}
+                          onChange={(e) => onUpdate(row.id, c.key, c.type === 'number' ? e.target.value : e.target.value)}
+                        />
+                      )}
                     </div>
                   </td>
                 ))}
@@ -4108,19 +4142,30 @@ function FIMSApp() {
         .btn-danger { background: var(--ledger-red); color: #fff; }
         .icon-btn { background: transparent; border: none; cursor: pointer; color: var(--ink-soft); padding: 4px; border-radius: 4px; }
         .icon-btn.danger:hover { color: var(--ledger-red); background: var(--warn-soft); }
+        /* table-layout: fixed (below) makes every table's total width lock to exactly 100% of
+           .table-wrap, no matter how many columns it has or how long its content is — columns share
+           that fixed width instead of the table growing past its container and needing a horizontal
+           scrollbar to see the rest. overflow-x stays as a safety net (never actually triggers once a
+           table can only ever be exactly as wide as its container) rather than "hidden," which would
+           silently clip real data if some edge case ever did overflow. The tradeoff: a narrow column
+           wraps long content onto multiple lines instead of growing wider — see the wrapping rules
+           below — so a row can get taller, but every column stays visible without ever scrolling
+           sideways to reach it. */
         .table-wrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 4px; }
-        table { border-collapse: collapse; width: 100%; font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; }
+        table { border-collapse: collapse; width: 100%; table-layout: fixed; font-family: 'IBM Plex Mono', monospace; font-size: 12.5px; }
         thead th {
           text-align: left; background: var(--accent-soft); color: #5c4419; font-family: 'IBM Plex Sans', sans-serif;
-          font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; padding: 8px 10px; border-bottom: 2px solid var(--rule); white-space: nowrap;
+          font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; padding: 8px 8px; border-bottom: 2px solid var(--rule);
+          white-space: normal; overflow-wrap: anywhere;
         }
-        tbody td { border-bottom: 1px solid var(--rule); padding: 2px 4px; }
+        tbody td { border-bottom: 1px solid var(--rule); padding: 2px 4px; overflow: hidden; }
         tbody tr:hover { background: rgba(169,122,47,0.06); }
         .cell-input {
-          width: 100%; border: 1px solid transparent; background: transparent; font: inherit; color: var(--ink);
-          padding: 6px 6px; border-radius: 3px; min-width: 70px;
+          width: 100%; min-width: 0; border: 1px solid transparent; background: transparent; font: inherit; color: var(--ink);
+          padding: 6px 6px; border-radius: 3px;
         }
         .cell-input:focus { outline: none; border-color: var(--accent); background: #fff; }
+        .cell-textarea { resize: vertical; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.4; min-height: 26px; }
         .col-action { width: 34px; text-align: center; }
         .empty-state { padding: 30px; text-align: center; color: var(--ink-soft); font-size: 13px; border: 1px dashed var(--rule); border-radius: 6px; }
         .pill { font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 20px; display: inline-block; }
@@ -4560,7 +4605,7 @@ function FIMSApp() {
                       <thead>
                         <tr>
                           {COLUMNS.consumption.map(c => <th key={c.key}>{c.label}</th>)}
-                          <th>Match</th>
+                          <th style={{ width: 210 }}>Match</th>
                           <th className="col-action"></th>
                         </tr>
                       </thead>
@@ -4600,9 +4645,9 @@ function FIMSApp() {
                                     Matched{matchedReel ? ` — ${matchedReel.mill}` : ''}
                                   </span>
                                 ) : (
-                                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flexWrap: 'wrap' }}>
                                     <span className="pill pill-warn">Unmatched</span>
-                                    <select className="doc-select" style={{ width: 210, marginBottom: 0 }}
+                                    <select className="doc-select" style={{ width: '100%', minWidth: 0, marginBottom: 0 }}
                                       value={manualMatchPicks[row.id] || ''}
                                       onChange={(e) => setManualMatchPicks(prev => ({ ...prev, [row.id]: e.target.value }))}>
                                       <option value="">Pick a reel...</option>
