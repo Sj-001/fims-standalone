@@ -4574,11 +4574,17 @@ function FIMSApp() {
                         }).map(row => {
                           const matched = row.matchStatus === 'matched';
                           const matchedReel = matched ? rawMaterialIn.find(r => r.id === row.matchedRawMaterialId) : null;
-                          // Candidate reels for a manual pick: unconsumed, same numeric size as this consumption
-                          // row — narrows the dropdown to plausible reels instead of listing all of stock.
+                          // Candidate reels for a manual pick: unconsumed, same numeric size AND same numeric
+                          // GSM as this consumption row — narrows the dropdown to plausible reels instead of
+                          // listing all of stock (confirmed directly: with only size filtered, a mixed-GSM
+                          // stock room made for a long, hard-to-scan list of reels that could never actually
+                          // be the right one). WEIGHT is deliberately still not filtered on — a manual pick
+                          // exists specifically for rows the automatic exact matcher (size+GSM+weight) already
+                          // failed to resolve, and weight is usually the one field that's off (a misread
+                          // digit), so filtering on it too would hide the very reel this row is actually about.
                           const candidates = matched ? [] : rawMaterialIn
-                            .filter(r => !r.consumed && num(r.size) === num(row.size))
-                            .sort((a, b) => num(a.gsm) - num(b.gsm) || num(a.weight_kg) - num(b.weight_kg));
+                            .filter(r => !r.consumed && num(r.size) === num(row.size) && num(r.gsm) === num(row.gsm))
+                            .sort((a, b) => num(a.weight_kg) - num(b.weight_kg));
                           return (
                             <tr key={row.id}>
                               {COLUMNS.consumption.map(c => (
