@@ -888,10 +888,10 @@ const COLUMNS = {
   ],
   customerDispatch: [
     { key: 'date', label: 'Date' }, { key: 'invoice_no', label: 'Invoice No' }, { key: 'party', label: 'Party' },
-    // wrap: true — a bill can reference several PO/buyer-order numbers at once, comma-separated (e.g.
-    // "4300081181, 4300081182"), which a single-line input would just clip; see EditableTable's `c.wrap`
-    // handling, which renders this one as a wrapping textarea instead so the whole value is visible.
-    { key: 'buyer_order_no', label: 'Buyer Order No', wrap: true }, { key: 'description', label: 'Description' },
+    // A bill can reference several PO/buyer-order numbers at once, comma-separated (e.g. "4300081181,
+    // 4300081182") — every column now wraps and gets a content-proportional width (see EditableTable),
+    // so this one no longer needs a special flag to be fully visible; kept as an ordinary column.
+    { key: 'buyer_order_no', label: 'Buyer Order No' }, { key: 'description', label: 'Description' },
     { key: 'quantity', label: 'Quantity Dispatched', type: 'number' }, { key: 'rate', label: 'Rate', type: 'number' }, { key: 'amount', label: 'Amount', type: 'number' },
   ],
   // Mirrors the exact 23-column layout of the external cutting-spec Google Sheet this pushes to (see
@@ -1354,13 +1354,31 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
       return next;
     });
   };
+  // Every column gets a WIDTH proportional to how much content it typically holds, instead of an equal
+  // share regardless of what's actually in it — confirmed directly as a real bug: forcing every column
+  // equally wide crushed short fields (Date, Invoice No) down to 3-4 visible characters while a long
+  // field (Buyer Order No, several comma-separated numbers) still didn't have enough room and wrapped
+  // into a near-unreadable stack of fragments. Sampled from the real data currently in THIS table
+  // (capped, so a huge register doesn't scan every row on every render) rather than hand-tuned per
+  // register/column — adapts automatically to whatever's actually in each specific table, on any screen
+  // size, since these are percentages of the table's own width, not fixed pixels.
+  const colWidthPercents = (() => {
+    const SAMPLE_SIZE = 40;
+    const sample = rows.slice(0, SAMPLE_SIZE);
+    const weights = columns.map(c => {
+      const maxLen = Math.max(c.label.length, ...sample.map(r => String(r[c.key] ?? '').length), 3);
+      return Math.min(50, Math.max(6, maxLen));
+    });
+    const total = weights.reduce((a, b) => a + b, 0) || 1;
+    return weights.map(w => (w / total) * 100);
+  })();
   return (
     <div className="table-wrap">
       <table>
         <thead>
           <tr>
             {showBatchFill && <th className="col-select"></th>}
-            {columns.map(c => <th key={c.key}>{c.label}</th>)}
+            {columns.map((c, i) => <th key={c.key} style={{ width: `${colWidthPercents[i]}%` }}>{c.label}</th>)}
             <th className="col-action"></th>
           </tr>
           {showBatchFill && <BatchFillRow columns={columns} rows={rows} onUpdate={onUpdate} selectedIds={selectedIds} onClearSelection={() => setRawSelectedIds(new Set())} />}
@@ -1387,24 +1405,19 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
                       {ci === 0 && !suppressFlags && row.flagged && (
                         <AlertCircle size={13} color="var(--ledger-red)" style={{ flexShrink: 0 }} title={row.flagReason || 'Flagged during extraction — the model wasn\'t confident about this row. Check it against the original document.'} />
                       )}
-                      {c.wrap ? (
-                        // A plain single-line <input> can only ever show as much of a long value (e.g.
-                        // several comma-separated PO/bill numbers) as its own width allows — the rest
-                        // sits there unseen unless you click in and scroll within the box by hand. A
-                        // <textarea> wraps that same text onto as many lines as it needs instead, so the
-                        // whole value is visible at a glance, at the cost of the row growing taller.
-                        <AutoSizeTextarea
-                          value={row[c.key]}
-                          onChange={(e) => onUpdate(row.id, c.key, e.target.value)}
-                        />
-                      ) : (
-                        <input
-                          className="cell-input"
-                          type={c.type === 'number' ? 'number' : 'text'}
-                          value={row[c.key] ?? ''}
-                          onChange={(e) => onUpdate(row.id, c.key, c.type === 'number' ? e.target.value : e.target.value)}
-                        />
-                      )}
+                      {/* Every column wraps now, not just ones opted in — a plain single-line <input>
+                          can only ever show as much of a value as its own width allows, and the fixed,
+                          content-proportional column widths above mean ANY column can end up narrower
+                          than its longest real value (a party name, a description, a multi-invoice
+                          Buyer Order No). A <textarea> wraps that text onto as many lines as it needs
+                          instead, so the whole value is always visible at a glance, at the cost of the
+                          row growing taller. Number-typed columns keep their numeric onUpdate coercion
+                          (unchanged from the plain-input version) even though the control itself is now
+                          a textarea, not an <input type="number">. */}
+                      <AutoSizeTextarea
+                        value={row[c.key]}
+                        onChange={(e) => onUpdate(row.id, c.key, e.target.value)}
+                      />
                     </div>
                   </td>
                 ))}
@@ -1607,7 +1620,13 @@ function FIMSApp() {
   const approvedAdditionsFor = (customer, tabName, title) =>
     Object.values(approvedSheetAdditions)
       .filter(a => a.customer === customer && a.tabName === tabName && a.title === title)
-      .map(a => [a.date, null, a.production === '' || a.production == null ? null : Number(a.production), a.dispatch === '' || a.dispatch == null ? null : Number(a.dispatch), null]);
+      // normalizeDateToDots here too, not just in buildCustomerSheetPayload's own rows — confirmed
+      // directly as a real gap: an approved addition's date reached the Sheet unnormalized ("14.09.26"
+      // next to an already-consistent "14.9.26" for the same day) because this was the one write path
+      // that skipped it. The server now also normalizes as a last-mile safety net, but keeping this one
+      // consistent too means the "Needs Your Review" panel and the Sheet always agree on the exact date
+      // string, not just "close enough."
+      .map(a => [normalizeDateToDots(a.date), null, a.production === '' || a.production == null ? null : Number(a.production), a.dispatch === '' || a.dispatch == null ? null : Number(a.dispatch), null]);
   const approveSheetAddition = (conflict, production, dispatch) => {
     setApprovedSheetAdditions(prev => ({
       ...prev,

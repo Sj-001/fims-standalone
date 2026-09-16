@@ -388,6 +388,43 @@ function canonicalDateKey(v) {
   return s.toLowerCase();
 }
 
+// Formats any of the date-string variants this app or a real customer file might contain into this
+// app's one standard DISPLAY convention (D.M.YY — day/month without a leading zero, 2-digit year),
+// mirroring the client's normalizeDateToDots exactly so a date reads identically everywhere: the
+// extraction preview, every register, and the customer's real Sheet. Applied as the FINAL step right
+// before a date is actually written to a real Sheet cell (see its call sites in computeMergePatches) —
+// a last-mile safety net so no future write path, client-side bug, or hand-typed inconsistency in a
+// source document can ever put a differently-formatted date next to an already-consistent one.
+// Confirmed directly as a real gap: a second dispatch bill's date reached the Sheet as "14.09.26" next
+// to an existing "14.9.26" for the very same day, because the one write path that added it (an
+// explicitly-approved conflict addition) never ran the date back through the client's own normalizer.
+function normalizeDateDisplay(v) {
+  if (typeof v === 'number' && isFinite(v)) {
+    const ms = Math.round((v - 25569) * 86400 * 1000);
+    const d = new Date(ms);
+    return `${d.getUTCDate()}.${d.getUTCMonth() + 1}.${String(d.getUTCFullYear()).slice(-2)}`;
+  }
+  const s = normalizeCellStr(v);
+  if (!s) return s;
+  const shortYear = (y) => (String(y).length > 2 ? String(y).slice(-2) : String(y));
+  let m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$/);
+  if (m) return `${Number(m[1])}.${Number(m[2])}.${shortYear(m[3])}`;
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (m) return `${Number(m[1])}.${Number(m[2])}.${shortYear(m[3])}`;
+  m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})$/);
+  if (m) {
+    const mo = MONTH_ABBR_TO_NUM[m[2].toLowerCase()];
+    if (mo) return `${Number(m[1])}.${mo}.${shortYear(m[3])}`;
+  }
+  m = s.match(/^(\d{1,2})\/([A-Za-z]{3})\/(\d{2,4})$/);
+  if (m) {
+    const mo = MONTH_ABBR_TO_NUM[m[2].toLowerCase()];
+    if (mo) return `${Number(m[1])}.${mo}.${shortYear(m[3])}`;
+  }
+  // Unrecognized format — don't guess, leave untouched (matches normalizeDateToDots's own behavior).
+  return s;
+}
+
 // Parses an EXISTING tab's grid into its variant blocks, using the same "find the row containing a
 // 'date' cell" heuristic used for import — so a merge-push can tell, per variant, exactly which dates
 // already have a row (whether the app put it there on a previous push, or a person typed it in by
@@ -728,7 +765,7 @@ function computeMergePatches(existingGrid, variants) {
         const isVeryFirstOfBlock = gi === 0 && ri === 0 && !hasRealPriorRow;
         const opening = isVeryFirstOfBlock ? 0 : `=${closingCol}${thisRow1 - 1}`;
         const out = [
-          forceTextValue(row[0] || ''),
+          forceTextValue(normalizeDateDisplay(row[0] || '')),
           opening,
           Number(row[2]) || 0,
           Number(row[3]) || 0,
@@ -842,7 +879,7 @@ function computeMergePatches(existingGrid, variants) {
         const row = r || [];
         const thisRow1 = dataStartRow0 + i + 1;
         const out = [
-          forceTextValue(row[0] || ''),
+          forceTextValue(normalizeDateDisplay(row[0] || '')),
           i === 0 ? 0 : `=${closingCol}${prevRow1}`,
           Number(row[2]) || 0,
           Number(row[3]) || 0,
