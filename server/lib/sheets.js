@@ -475,13 +475,32 @@ function parseExistingBlocks(grid) {
       existingDates.add(dateKey);
       existingRowsOrdered.push({ rowIdx: r, dateKey });
       if (width >= 4) {
-        existingValuesByDate.set(dateKey, {
-          production: Number((rows[r] || [])[startCol + 2]) || 0,
-          dispatch: Number((rows[r] || [])[startCol + 3]) || 0,
-          opening: Number((rows[r] || [])[startCol + 1]) || 0,
-          closing: Number((rows[r] || [])[startCol + width - 1]) || 0,
-          rowIdx: r,
-        });
+        const thisProduction = Number((rows[r] || [])[startCol + 2]) || 0;
+        const thisDispatch = Number((rows[r] || [])[startCol + 3]) || 0;
+        const thisOpening = Number((rows[r] || [])[startCol + 1]) || 0;
+        const thisClosing = Number((rows[r] || [])[startCol + width - 1]) || 0;
+        const prevForDate = existingValuesByDate.get(dateKey);
+        if (prevForDate) {
+          // A SECOND (or later) physical row for a date that already has one — dates are explicitly
+          // NOT unique in this ledger (confirmed directly: multiple real dispatch bills routinely share
+          // a day), so this must SUM into the running total for that date, not overwrite it. Getting
+          // this wrong silently breaks the whole point of auto-adding a difference as a new row: the
+          // NEXT push would only ever see whichever single row happened to be parsed last, miscompute
+          // the disagreement, and keep appending more rows for the same date forever. Opening stays the
+          // FIRST row's opening (where this date's activity actually starts); Closing becomes the LAST
+          // row's closing (where the running balance actually ends up after all of them). rowIdx is
+          // cleared once a date has more than one row — a targeted single-cell "fillable" write only
+          // makes sense when it's unambiguous which one row to fill.
+          existingValuesByDate.set(dateKey, {
+            production: prevForDate.production + thisProduction,
+            dispatch: prevForDate.dispatch + thisDispatch,
+            opening: prevForDate.opening,
+            closing: thisClosing,
+            rowIdx: undefined,
+          });
+        } else {
+          existingValuesByDate.set(dateKey, { production: thisProduction, dispatch: thisDispatch, opening: thisOpening, closing: thisClosing, rowIdx: r });
+        }
       }
       nextRowIdx = r + 1;
       lastRowValues = [];
@@ -533,8 +552,14 @@ function classifyIncomingRows(match, incomingRows) {
     if (productionConflict || dispatchConflict) {
       return { row, status: 'mismatch', existing: existingVals, expected };
     }
-    const fillProduction = hasProduction && existingVals.production === 0 && expected.production !== 0;
-    const fillDispatch = hasDispatch && existingVals.dispatch === 0 && expected.dispatch !== 0;
+    // rowIdx !== undefined required: a date with MORE THAN ONE physical row (see parseExistingBlocks —
+    // dates aren't unique in this ledger) has no single unambiguous row to target a fillable write at,
+    // so it's deliberately excluded here rather than risk writing into the wrong one of several rows
+    // sharing that date. Falls through to 'mismatch' (if the values actually disagree) or 'duplicate'
+    // (if they already match) instead — both of those compare the SUMMED total, which is always safe
+    // regardless of how many rows make it up.
+    const fillProduction = hasProduction && existingVals.production === 0 && expected.production !== 0 && existingVals.rowIdx !== undefined;
+    const fillDispatch = hasDispatch && existingVals.dispatch === 0 && expected.dispatch !== 0 && existingVals.rowIdx !== undefined;
     if (fillProduction || fillDispatch) {
       return { row, status: 'fillable', existing: existingVals, expected, fillProduction, fillDispatch, rowIdx: existingVals.rowIdx };
     }
