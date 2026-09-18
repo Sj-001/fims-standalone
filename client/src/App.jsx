@@ -4592,16 +4592,26 @@ function FIMSApp() {
                         }).map(row => {
                           const matched = row.matchStatus === 'matched';
                           const matchedReel = matched ? rawMaterialIn.find(r => r.id === row.matchedRawMaterialId) : null;
-                          // Candidate reels for a manual pick: unconsumed, same numeric size AND same numeric
-                          // GSM as this consumption row — narrows the dropdown to plausible reels instead of
-                          // listing all of stock (confirmed directly: with only size filtered, a mixed-GSM
-                          // stock room made for a long, hard-to-scan list of reels that could never actually
-                          // be the right one). WEIGHT is deliberately still not filtered on — a manual pick
-                          // exists specifically for rows the automatic exact matcher (size+GSM+weight) already
-                          // failed to resolve, and weight is usually the one field that's off (a misread
-                          // digit), so filtering on it too would hide the very reel this row is actually about.
+                          // Candidate reels for a manual pick: unconsumed, same numeric size, same numeric
+                          // GSM, and same shade (when both sides actually have one recorded) as this
+                          // consumption row — narrows the dropdown to plausible reels instead of listing all
+                          // of stock (confirmed directly: with only size filtered, a mixed-GSM stock room
+                          // made for a long, hard-to-scan list of reels that could never actually be the
+                          // right one). Shade is skipped as a filter when either side has no shade captured,
+                          // same reasoning as weight below — better to show extra candidates than to hide the
+                          // right reel because a shade code wasn't read. WEIGHT is deliberately still not
+                          // filtered on — a manual pick exists specifically for rows the automatic exact
+                          // matcher (size+GSM+weight) already failed to resolve, and weight is usually the
+                          // one field that's off (a misread digit), so filtering on it too would hide the
+                          // very reel this row is actually about.
+                          const rowShade = String(row.shade || '').trim().toLowerCase();
                           const candidates = matched ? [] : rawMaterialIn
                             .filter(r => !r.consumed && num(r.size) === num(row.size) && num(r.gsm) === num(row.gsm))
+                            .filter(r => {
+                              const rShade = String(r.shade || '').trim().toLowerCase();
+                              if (!rowShade || !rShade) return true;
+                              return rShade === rowShade;
+                            })
                             .sort((a, b) => num(a.weight_kg) - num(b.weight_kg));
                           return (
                             <tr key={row.id}>
@@ -4625,7 +4635,7 @@ function FIMSApp() {
                                       onChange={(e) => setManualMatchPicks(prev => ({ ...prev, [row.id]: e.target.value }))}>
                                       <option value="">Pick a reel...</option>
                                       {candidates.map(c => (
-                                        <option value={c.id} key={c.id}>{c.mill || 'Mill?'} · {c.size}/{c.gsm}gsm · {c.weight_kg}kg · {c.date}</option>
+                                        <option value={c.id} key={c.id}>{c.size} / {c.gsm}gsm{c.shade ? ` ${c.shade}` : ''} · {c.weight_kg}kg · {c.date}</option>
                                       ))}
                                     </select>
                                     <button className="btn btn-ghost" disabled={!manualMatchPicks[row.id]}
