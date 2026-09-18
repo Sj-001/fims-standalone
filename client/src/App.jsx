@@ -3895,20 +3895,6 @@ function FIMSApp() {
     registerAliases(customer, [item], sheetGroup, block);
     setNewAliasForm({ customer: '', item: '', sheetGroup: '', block: '' });
   };
-  // Builds the [date, opening, production, dispatch, closing] row shape the push payload itself uses
-  // for a difference that needs to land as its OWN new row (opening/closing always null — the server
-  // recomputes both as live formulas for any genuinely new row, never trusting an incoming value for
-  // them; see computeMergePatches). Shared by the auto-resolve step below.
-  const diffRowFor = (mm) => {
-    const existingProd = mm.existing ? mm.existing.production : null;
-    const existingDisp = mm.existing ? mm.existing.dispatch : null;
-    const expectedProd = mm.expected ? mm.expected.production : null;
-    const expectedDisp = mm.expected ? mm.expected.dispatch : null;
-    const diffProd = (existingProd != null && expectedProd != null) ? Math.max(0, expectedProd - existingProd) : (expectedProd || 0);
-    const diffDisp = (existingDisp != null && expectedDisp != null) ? Math.max(0, expectedDisp - existingDisp) : (expectedDisp || 0);
-    if (!diffProd && !diffDisp) return null; // nothing actually missing — e.g. a stale/rounding non-issue
-    return [normalizeDateToDots(mm.date), null, diffProd || null, diffDisp || null, null];
-  };
   const pushCustomerSheetNow = async (customer) => {
     const sheetId = getCustomerSheetId(customer).trim();
     if (!sheetId) {
@@ -3945,45 +3931,21 @@ function FIMSApp() {
         setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: failedTabs || data.error || `Push failed (HTTP ${res.status}).`, unmatched } }));
         return;
       }
-      let rowsWritten = (data.results || []).reduce((s, r) => s + (r.newRows || 0), 0);
-      // A date that already had a row in the Sheet, but with a different number than what this push
-      // computed — never silently overwritten, and no longer something a person has to review and
-      // approve by hand either (per explicit direction: dates aren't unique here, a second real entry
-      // landing on an already-used date is normal, not a mistake). The difference — whatever hasn't
-      // actually reached the Sheet yet — is sent right away as its own new row for that same date, in
-      // one immediate follow-up request. The row already there is still never touched, only grown
-      // alongside; if this follow-up itself fails for any reason, nothing is lost — the exact same
-      // difference gets recomputed and retried automatically on the next push.
-      const followUpVariantsByTab = {};
-      (data.results || []).forEach(r => {
-        (r.mismatches || []).forEach(vm => {
-          const forceNewRows = (vm.mismatches || []).map(diffRowFor).filter(Boolean);
-          if (!forceNewRows.length) return;
-          (followUpVariantsByTab[r.tab] = followUpVariantsByTab[r.tab] || []).push({ title: vm.title, rows: [], forceNewRows });
-        });
-      });
-      const followUpItemGroups = Object.entries(followUpVariantsByTab).map(([tabName, variants]) => ({ tabName, variants }));
-      let autoAddedRowCount = 0;
-      if (followUpItemGroups.length) {
-        try {
-          const res2 = await fetch('/api/customer-sheets/push', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'include',
-            body: JSON.stringify({ spreadsheetId: sheetId, itemGroups: followUpItemGroups }),
-          });
-          const data2 = await res2.json().catch(() => ({}));
-          if (res2.ok && data2.ok) {
-            autoAddedRowCount = (data2.results || []).reduce((s, r) => s + (r.newRows || 0), 0);
-            rowsWritten += autoAddedRowCount;
-          }
-        } catch (e2) { /* main push already succeeded; an unresolved difference just gets recomputed and
-          retried on the next push, same as if it had never been attempted this time. */ }
-      }
-      const autoNote = autoAddedRowCount
-        ? ` Also automatically added ${autoAddedRowCount} row${autoAddedRowCount === 1 ? '' : 's'} for date${autoAddedRowCount === 1 ? '' : 's'} that already had a different number in the Sheet — the existing rows were never touched.`
+      const rowsWritten = (data.results || []).reduce((s, r) => s + (r.newRows || 0), 0);
+      // EMERGENCY DISABLE: this used to automatically fire a second push resolving any same-date
+      // disagreement by adding the difference as its own new row, no review required. Turned OFF here
+      // after it was confirmed to have corrupted a real, live customer Sheet — a block ended up with
+      // duplicate/out-of-order dates and a deeply negative running balance following a push that
+      // combined several old mismatches with new rows in one go. The exact mechanics of how that
+      // happened aren't nailed down yet, so writing anything automatically for a mismatch — especially
+      // one touching old, previously-settled history — isn't safe until they are. A mismatch is now
+      // only ever REPORTED, never auto-resolved; nothing is written for it, and (same as always) the
+      // existing row is never overwritten either.
+      const mismatchCount = (data.results || []).reduce((s, r) => s + (r.mismatches || []).reduce((s2, vm) => s2 + (vm.mismatches || []).length, 0), 0);
+      const mismatchNote = mismatchCount
+        ? ` ${mismatchCount} date${mismatchCount === 1 ? '' : 's'} already ${mismatchCount === 1 ? 'has' : 'have'} a different number in the Sheet and ${mismatchCount === 1 ? 'was' : 'were'} left untouched.`
         : '';
-      setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Sent ${rowsWritten} row${rowsWritten === 1 ? '' : 's'} to the Sheet just now.${autoNote}`, unmatched } }));
+      setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Sent ${rowsWritten} row${rowsWritten === 1 ? '' : 's'} to the Sheet just now.${mismatchNote}`, unmatched } }));
       patchCustomerSheetEntry(customer, { sheetId, lastPushedAt: new Date().toISOString() });
       // Refreshes this customer's slice of the Customer Sheets Mirror with what's really in the Sheet
       // post-push (the server re-reads it fresh — see pushCustomerSheetHandler) so search reflects the
