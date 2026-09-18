@@ -1570,6 +1570,27 @@ function FIMSApp() {
         });
         if (changed) { loadedMap[k] = next; idBackfilledRegisters.push(k); }
       });
+      // pushedToSheet migration: every ALREADY-CONFIRMED Production/Customer Dispatch row that predates
+      // this flag's existence has no way to say whether it was already pushed to the customer's real
+      // Sheet — and a push now only ever sends rows NOT marked pushed (see buildCustomerSheetPayload),
+      // since the server no longer compares against the Sheet's content to work that out itself. Left
+      // unmarked, EVERY row of a customer's confirmed history would look "new" the moment this code
+      // first runs, and the next push would resend and duplicate a customer's entire history in the
+      // real Sheet. Defaulted to already-pushed here instead: this app's whole workflow is
+      // confirm-then-push, so a row that's already confirmed has almost certainly already been pushed.
+      // The one-time cost of that assumption is the opposite, far safer failure mode — a row genuinely
+      // confirmed but never actually pushed would just need a manual nudge (edit and re-save it) to be
+      // picked up, rather than flooding the Sheet with duplicates.
+      ['production', 'customerDispatch'].forEach(k => {
+        const rows = loadedMap[k];
+        if (!Array.isArray(rows) || !rows.length) return;
+        let changed = false;
+        const next = rows.map(r => {
+          if (r && r.stockConfirmed && r.pushedToSheet === undefined) { changed = true; return { ...r, pushedToSheet: true }; }
+          return r;
+        });
+        if (changed) { loadedMap[k] = next; if (!idBackfilledRegisters.includes(k)) idBackfilledRegisters.push(k); }
+      });
       Object.entries(loadedMap).forEach(([k, rows]) => registerSetters[k] && registerSetters[k](rows));
       const specSheetCfg = (loadedMap.daburSpecSheetConfig || [])[0];
       if (specSheetCfg && specSheetCfg.spreadsheetId) {
@@ -3125,9 +3146,10 @@ function FIMSApp() {
   // takes effect on the NEXT render, so buildCustomerSheetPayload (which reads live production/
   // customerDispatch state) would still see the pre-confirm data if called right after. Instead this
   // queues the touched customers in pendingPushCustomers; the effect below fires once the confirmed
-  // rows have actually landed in state and does the real push then. Duplicate detection happens
-  // entirely server-side during that push (see classifyIncomingRows in server/lib/sheets.js) — a row
-  // that's already correctly in the real Sheet is silently skipped, never re-written.
+  // rows have actually landed in state and does the real push then. Duplicate detection is entirely
+  // app-side now (see buildCustomerSheetPayload's pushedToSheet filtering) — a row already marked
+  // pushed is never included in the payload in the first place, so there's nothing for the server to
+  // skip or compare.
   const [pendingPushCustomers, setPendingPushCustomers] = useState(null);
   const pushPendingRows = (registerKey, rows) => {
     const resolved = rows.filter(r => r.confirmedCustomer || isKnownCustomerGuess(r));
@@ -3186,7 +3208,11 @@ function FIMSApp() {
       return next;
     });
   };
-  const customerStockGroups = (() => {
+  // Shared by customerStockGroups (the full-history view this page displays and searches) and the
+  // push-payload builder (buildCustomerSheetPayload), which needs this exact same customer+item+date
+  // merge run over only the not-yet-pushed subset of rows — one implementation so the two can never
+  // disagree about how a date's production+dispatch gets combined.
+  const buildStockGroupsFrom = (productionRows, dispatchRows) => {
     const groups = {};
     // Merges by DATE within each customer+item group — a Production Register row and a Customer
     // Dispatch Bill row landing on the same date are two separate approvals (confirmed independently,
@@ -3197,7 +3223,8 @@ function FIMSApp() {
     // dispatch for the same date, summed in alongside any dispatch bill's quantity, not overwritten by
     // it. `productionIds`/`dispatchIds` keep every contributing row's real id (there can be more than
     // one dispatch bill for the same item on the same day), so a delete on the merged row can still
-    // reach back to the exact underlying register row(s) it came from.
+    // reach back to the exact underlying register row(s) it came from, and so a push can mark exactly
+    // those ids as pushed once it succeeds.
     const addEntry = (row, source) => {
       const customer = row.confirmedCustomer || matchCustomer(row);
       const variantKey = normalizeVariant(row.description);
@@ -3227,8 +3254,8 @@ function FIMSApp() {
         entry.hasDispatch = true;
       }
     };
-    confirmedProductionRows.forEach(row => addEntry(row, 'production'));
-    confirmedDispatchRows.forEach(row => addEntry(row, 'customerDispatch'));
+    productionRows.forEach(row => addEntry(row, 'production'));
+    dispatchRows.forEach(row => addEntry(row, 'customerDispatch'));
     return Object.values(groups).map(g => {
       const sorted = Object.values(g.byDate).sort((a, b) => dateSortKey(a.date).localeCompare(dateSortKey(b.date)));
       let running = 0;
@@ -3241,7 +3268,8 @@ function FIMSApp() {
       const totalDispatch = sorted.reduce((s, e) => s + num(e.dispatch), 0);
       return { id: g.id, customer: g.customer, description: g.description, ledger, totalProduction, totalDispatch, closingBalance: running };
     });
-  })();
+  };
+  const customerStockGroups = buildStockGroupsFrom(confirmedProductionRows, confirmedDispatchRows);
   const customerNames = Array.from(new Set(customerStockGroups.map(g => g.customer))).sort((a, b) => (a === 'Unassigned') - (b === 'Unassigned') || a.localeCompare(b));
   // Every flat register the topbar search box can look through — one entry per register, carrying its
   // own rows/columns so the results panel can render each with the exact same EditableTable used on
@@ -3386,7 +3414,18 @@ function FIMSApp() {
   // see DOCUMENT_TYPES above) — this second call right before push is a safety net for anything that
   // reached the ledger some other way (a manually typed/edited row), not the primary defense anymore.
   const buildCustomerSheetPayload = (customer) => {
-    const groups = customerStockGroups.filter(g => g.customer === customer);
+    // Only rows never yet pushed — a push must never resend a row the Sheet already has, and per the
+    // no-touching-old-entries rule the server no longer compares against the Sheet's existing content to
+    // work that out itself, so the app is the one source of truth for what's already there. Running this
+    // through the exact same buildStockGroupsFrom merge as the full-history view means a date that's
+    // partly pushed (e.g. production pushed already, a new dispatch bill for the same date just
+    // confirmed) still correctly produces just the new contribution as its own row, not a resend of the
+    // whole date.
+    const unpushedGroups = buildStockGroupsFrom(
+      confirmedProductionRows.filter(row => !row.pushedToSheet),
+      confirmedDispatchRows.filter(row => !row.pushedToSheet),
+    );
+    const groups = unpushedGroups.filter(g => g.customer === customer);
     const sheetGroupByItem = {};
     const blockByItem = {};
     productCatalog.filter(c => c.customer === customer).forEach(c => {
@@ -3416,16 +3455,18 @@ function FIMSApp() {
         title: g.description || 'Item',
         header: ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
         // null (not 0) whenever this date has NO real production/dispatch entry behind it at all — a
-        // dispatch bill has no opinion on production, and vice versa. Sending a literal 0 in that case
-        // would read as "confirmed zero," which the server would then compare against whatever the real
-        // Sheet already has for that column — exactly the false "mismatch" a pure dispatch-only upload
-        // must never trigger just because it has nothing to say about production.
+        // dispatch bill has no opinion on production, and vice versa. A literal 0 would misrepresent a
+        // column this upload has no opinion on as a confirmed zero.
         rows: g.ledger.map(e => [
           normalizeDateToDots(e.date), e.opening,
           (e.productionIds && e.productionIds.length) ? (e.pieces || 0) : null,
           e.hasDispatch ? (e.dispatch || 0) : null,
           e.closing,
         ]),
+        // Parallel array to `rows` — which underlying Production/Customer Dispatch register row ids fed
+        // each row, so pushCustomerSheetNow can mark exactly those ids pushedToSheet once the push
+        // actually succeeds, and never sends this to the server (stripped before the fetch body is built).
+        rowSourceIds: g.ledger.map(e => ({ productionIds: e.productionIds, dispatchIds: e.dispatchIds })),
         ...(catalogBlock ? { blockTitleOverride: catalogBlock } : {}),
       });
     });
@@ -3902,19 +3943,71 @@ function FIMSApp() {
       return;
     }
     // Always the CURRENT edited payload (review edits — value changes, deletions, moves, added rows —
-    // applied on top of the freshly computed ledger), so what gets written always matches exactly what
-    // was last shown on screen.
+    // applied on top of the freshly computed ledger of not-yet-pushed rows), so what gets written always
+    // matches exactly what was last shown on screen.
     const { itemGroups, unmatched } = getEditedPayload(customer);
     // Rows, not item/product groups — confirmed directly as confusing wording: "Sent 8 items" read as
     // if only 8 rows total existed, when it actually meant "8 different products," each with its own
-    // handful of dated rows. This counts every row about to be sent (including ones that'll turn out to
-    // already be duplicates and get silently skipped server-side — the exact count actually WRITTEN is
-    // reported separately after the push completes, since duplicates can only be told apart server-side).
+    // handful of dated rows. Since the app only ever sends rows it hasn't already marked pushed (see
+    // buildCustomerSheetPayload), every row counted here is a genuinely new row the server will insert —
+    // nothing is filtered or skipped server-side anymore.
     const totalRowsToSend = itemGroups.reduce((s, g) => s + (g.variants || []).reduce((s2, v) => s2 + (v.rows || []).length, 0), 0);
     if (!totalRowsToSend) {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Nothing new to push right now.' } }));
       return;
     }
+    // rowSourceIds (which Production/Customer Dispatch register row ids fed each row) is a client-only
+    // bookkeeping field — collected here, per tab, so a push can mark exactly those rows pushedToSheet
+    // once it's confirmed which tabs actually succeeded, then stripped before anything goes over the
+    // wire, since the server has no use for it. Kept per-tab rather than one flat set because a push
+    // response can report SOME tabs ok and others failed in the same call (e.g. every real data write
+    // succeeded but the purely cosmetic highlighting pass afterward failed) — only the ids belonging to
+    // a tab that's actually ok:true in the response may ever be marked pushed; anything else must stay
+    // eligible to be sent again, since it's genuinely unknown whether the Sheet really has it yet.
+    const idsToMarkByTab = {};
+    const wireItemGroups = itemGroups.map(g => {
+      const tabIds = { production: new Set(), customerDispatch: new Set() };
+      idsToMarkByTab[g.tabName] = tabIds;
+      return {
+        ...g,
+        variants: (g.variants || []).map(v => {
+          (v.rowSourceIds || []).forEach(src => {
+            (src.productionIds || []).forEach(id => tabIds.production.add(id));
+            (src.dispatchIds || []).forEach(id => tabIds.customerDispatch.add(id));
+          });
+          const { rowSourceIds, ...wireVariant } = v;
+          return wireVariant;
+        }),
+      };
+    });
+    // The rows a now-successful tab just got written are never touched again by this app (see the
+    // no-touching-old-entries rule) — marking them pushed is what keeps the next push from resending
+    // (duplicating) them, so this has to run for every tab the response actually confirms as ok, even
+    // when the overall push is reported as a partial failure.
+    const markPushedForTabs = (tabNames) => {
+      const productionIds = new Set();
+      const dispatchIds = new Set();
+      tabNames.forEach(t => {
+        const ids = idsToMarkByTab[t];
+        if (!ids) return;
+        ids.production.forEach(id => productionIds.add(id));
+        ids.customerDispatch.forEach(id => dispatchIds.add(id));
+      });
+      if (productionIds.size) {
+        setProduction(prev => {
+          const next = prev.map(r => productionIds.has(r.id) ? { ...r, pushedToSheet: true } : r);
+          persist('production', next);
+          return next;
+        });
+      }
+      if (dispatchIds.size) {
+        setCustomerDispatch(prev => {
+          const next = prev.map(r => dispatchIds.has(r.id) ? { ...r, pushedToSheet: true } : r);
+          persist('customerDispatch', next);
+          return next;
+        });
+      }
+    };
     if (!window.confirm(`Send ${totalRowsToSend} row${totalRowsToSend === 1 ? '' : 's'} to ${customer}'s Google Sheet now?`)) return;
     setPushStatus(prev => ({ ...prev, [customer]: { state: 'pushing', message: '', unmatched } }));
     try {
@@ -3922,34 +4015,29 @@ function FIMSApp() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({ spreadsheetId: sheetId, itemGroups }),
+        body: JSON.stringify({ spreadsheetId: sheetId, itemGroups: wireItemGroups }),
       });
       if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return; }
       const data = await res.json().catch(() => ({}));
+      const okTabs = (data.results || []).filter(r => r.ok && r.tab).map(r => r.tab);
+      if (okTabs.length) markPushedForTabs(okTabs);
       if (!(res.ok && data.ok)) {
         const failedTabs = (data.results || []).filter(r => !r.ok).map(r => `${r.tab}: ${r.error}`).join(' · ');
-        setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: failedTabs || data.error || `Push failed (HTTP ${res.status}).`, unmatched } }));
+        const partialRows = (data.results || []).filter(r => r.ok).reduce((s, r) => s + (r.newRows || 0), 0);
+        const partialNote = partialRows ? ` ${partialRows} row${partialRows === 1 ? '' : 's'} still made it through before this failure.` : '';
+        setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: (failedTabs || data.error || `Push failed (HTTP ${res.status}).`) + partialNote, unmatched } }));
+        // Even on an overall-failed push, whatever DID land in the Sheet (the tabs in okTabs) is real —
+        // still worth reflecting in the mirror and re-diffing the review, same as a full success would.
+        if (okTabs.length) { replaceCustomerMirrorRows(customer, data.mirrorRows || []); refreshReview(customer); }
         return;
       }
       const rowsWritten = (data.results || []).reduce((s, r) => s + (r.newRows || 0), 0);
-      // EMERGENCY DISABLE: this used to automatically fire a second push resolving any same-date
-      // disagreement by adding the difference as its own new row, no review required. Turned OFF here
-      // after it was confirmed to have corrupted a real, live customer Sheet — a block ended up with
-      // duplicate/out-of-order dates and a deeply negative running balance following a push that
-      // combined several old mismatches with new rows in one go. The exact mechanics of how that
-      // happened aren't nailed down yet, so writing anything automatically for a mismatch — especially
-      // one touching old, previously-settled history — isn't safe until they are. A mismatch is now
-      // only ever REPORTED, never auto-resolved; nothing is written for it, and (same as always) the
-      // existing row is never overwritten either.
-      const mismatchCount = (data.results || []).reduce((s, r) => s + (r.mismatches || []).reduce((s2, vm) => s2 + (vm.mismatches || []).length, 0), 0);
-      const mismatchNote = mismatchCount
-        ? ` ${mismatchCount} date${mismatchCount === 1 ? '' : 's'} already ${mismatchCount === 1 ? 'has' : 'have'} a different number in the Sheet and ${mismatchCount === 1 ? 'was' : 'were'} left untouched.`
-        : '';
-      setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Sent ${rowsWritten} row${rowsWritten === 1 ? '' : 's'} to the Sheet just now.${mismatchNote}`, unmatched } }));
+      setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Sent ${rowsWritten} row${rowsWritten === 1 ? '' : 's'} to the Sheet just now.`, unmatched } }));
       patchCustomerSheetEntry(customer, { sheetId, lastPushedAt: new Date().toISOString() });
       // Refreshes this customer's slice of the Customer Sheets Mirror with what's really in the Sheet
       // post-push (the server re-reads it fresh — see pushCustomerSheetHandler) so search reflects the
-      // just-written rows immediately, not just whatever the mirror last had at import time.
+      // just-written rows immediately, not just whatever the mirror last had at import time. Read-only,
+      // same as every other mirror refresh — never itself a source of a write back to the Sheet.
       replaceCustomerMirrorRows(customer, data.mirrorRows || []);
       // The staged edits were for THIS specific diff — once it's actually written, their values are
       // now baked into the real rows the app just appended, so clear them and pull a fresh diff.
