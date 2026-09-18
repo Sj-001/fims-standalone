@@ -285,15 +285,20 @@ const STORAGE_KEYS = {
   // Stored as just another flat register (same generic tab-bridge everything else here uses), so global
   // search can look through every customer's real Sheet data locally, without a live API call per search.
   customerSheetsMirror: 'fims_customer_sheets_mirror',
+  // One row per (customer, sheetTab, block): how many real rows that block held as of the last time this
+  // app actually looked (a push succeeding, an import, or an explicit "Sync from Sheet") — the baseline
+  // syncFromSheet compares a fresh read against to find rows someone added by hand directly in the real
+  // Sheet. See updateKnownCountsFromMirrorRows/syncFromSheet.
+  customerSheetKnownCounts: 'fims_customer_sheet_known_counts',
 };
 // Every STORAGE_KEYS register that's "one row per real thing" AND realistically gets hand-edited in
 // the raw Google Sheet (a person typing a reel straight into RAW_MATERIAL_IN being the confirmed real
 // case) — used by the id-backfill pass on load (see the initial load effect) to catch a row that has
-// no internal id because nothing in the Sheet UI ever prompted for one. Deliberately excludes the two
+// no internal id because nothing in the Sheet UI ever prompted for one. Deliberately excludes the
 // STORAGE_KEYS entries that aren't this shape: daburSpecSheetConfig is a single config blob, not row
-// data with its own identity; customerSheetsMirror is a system-managed mirror of each customer's OWN
-// external Sheet, never a tab a person hand-edits directly.
-const ID_BACKFILL_REGISTERS = Object.keys(STORAGE_KEYS).filter(k => k !== 'daburSpecSheetConfig' && k !== 'customerSheetsMirror');
+// data with its own identity; customerSheetsMirror and customerSheetKnownCounts are both system-managed
+// reflections of a customer's OWN external Sheet, never a tab a person hand-edits directly.
+const ID_BACKFILL_REGISTERS = Object.keys(STORAGE_KEYS).filter(k => k !== 'daburSpecSheetConfig' && k !== 'customerSheetsMirror' && k !== 'customerSheetKnownCounts');
 const CATALOG_KEY = 'fims_product_catalog';
 // Exact item names, one per customer — used to correct handwriting misreads during extraction (e.g.
 // "g" vs "9", "&" vs "8"). Starts EMPTY on purpose: every customer's items get added by importing
@@ -1515,6 +1520,7 @@ function FIMSApp() {
   const [daburPO, setDaburPO] = useState([]);
   const [daburDispatch, setDaburDispatch] = useState([]);
   const [customerSheetsMirror, setCustomerSheetsMirror] = useState([]); // [{id, customer, sheetTab, block, date, opening, production, dispatch, closing}]
+  const [customerSheetKnownCounts, setCustomerSheetKnownCounts] = useState([]); // [{id, customer, sheetTab, block, count}]
   const [trainingExamples, setTrainingExamples] = useState({});
   const [customerMapping, setCustomerMapping] = useState(DEFAULT_CUSTOMER_MAPPING);
   const [productCatalog, setProductCatalog] = useState(DEFAULT_PRODUCT_CATALOG);
@@ -1532,7 +1538,7 @@ function FIMSApp() {
   // getEditedPayload still read it as a harmless no-op rather than reworking that whole call chain.
   const [reviewEdits, setReviewEdits] = useState({}); // { [customer]: { [variantTitle]: { tabNameOverride, rowEdits: { [rowIndex]: {date,production,dispatch} }, deletedRows: { [rowIndex]: true } } } }
   const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
-  const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch, customerSheetsMirror: setCustomerSheetsMirror };
+  const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch, customerSheetsMirror: setCustomerSheetsMirror, customerSheetKnownCounts: setCustomerSheetKnownCounts };
   useEffect(() => {
     (async () => {
       const entries = await Promise.all(Object.entries(STORAGE_KEYS).map(async ([k, storageKey]) => [k, await loadRegister(storageKey)]));
@@ -1752,6 +1758,28 @@ function FIMSApp() {
     setCustomerSheetsMirror(prev => {
       const next = [...prev.filter(r => r.customer !== customer), ...(freshRowsForCustomer || []).map(r => ({ id: genId(), customer, ...r }))];
       persist('customerSheetsMirror', next);
+      return next;
+    });
+  };
+  // Re-baselines this customer's "how many rows does each real block have" counters to whatever a fresh
+  // read of their Sheet just showed — called every time this app actually looks at the real Sheet (a
+  // push succeeding, an import/re-sync, or syncFromSheet itself once it's done pulling in whatever was
+  // new). This is the ONLY thing syncFromSheet compares a later fresh read against, never the Sheet's
+  // row CONTENT — see syncFromSheet for why (the app's own count-based rule, not a content diff).
+  const updateKnownCountsFromMirrorRows = (customer, freshMirrorRows) => {
+    const counts = new Map(); // `${sheetTab}||${block}` -> { sheetTab, block, count }
+    (freshMirrorRows || []).forEach(r => {
+      const key = `${r.sheetTab}||${r.block}`;
+      const existing = counts.get(key);
+      if (existing) existing.count += 1;
+      else counts.set(key, { sheetTab: r.sheetTab, block: r.block, count: 1 });
+    });
+    setCustomerSheetKnownCounts(prev => {
+      const next = [
+        ...prev.filter(c => c.customer !== customer),
+        ...Array.from(counts.values()).map(v => ({ id: genId(), customer, sheetTab: v.sheetTab, block: v.block, count: v.count })),
+      ];
+      persist('customerSheetKnownCounts', next);
       return next;
     });
   };
@@ -3797,6 +3825,11 @@ function FIMSApp() {
     // Seeds/refreshes this customer's slice of the Customer Sheets Mirror with every real ledger row
     // read at import time, so global search can find it immediately — no separate sync step needed.
     replaceCustomerMirrorRows(customer, sheetReview.mirrorRows);
+    // Also re-baselines the known-row-count for every block from this same fresh read — this is what
+    // makes a customer's FIRST-ever import/re-sync double as syncFromSheet's safe starting point (see
+    // its comment): the very first count for a block is simply whatever's really there right now, never
+    // treated as "all new," so syncFromSheet only ever reports rows added AFTER this baseline.
+    updateKnownCountsFromMirrorRows(customer, sheetReview.mirrorRows);
     const reassignedCount = reassignUnassignedRows();
     const verb = isFullResync ? 'Re-synced' : sheetReview.mode === 'generate' ? 'Generated' : 'Imported';
     setImportResultMessage(
@@ -3946,11 +3979,14 @@ function FIMSApp() {
     // applied on top of the freshly computed ledger of not-yet-pushed rows), so what gets written always
     // matches exactly what was last shown on screen.
     const { itemGroups, unmatched } = getEditedPayload(customer);
-    // Rows, not item/product groups — confirmed directly as confusing wording: "Sent 8 items" read as
-    // if only 8 rows total existed, when it actually meant "8 different products," each with its own
-    // handful of dated rows. Since the app only ever sends rows it hasn't already marked pushed (see
-    // buildCustomerSheetPayload), every row counted here is a genuinely new row the server will insert —
-    // nothing is filtered or skipped server-side anymore.
+    // "Items" in this message means individual dated entries, not products/variants — confirmed
+    // directly as confusing wording once before: counting itemGroups (products) instead of entries made
+    // "Sent 8 items" read as if only 8 things total existed, when it actually meant "8 different
+    // products," each with its own handful of dated rows. Counting rows.length here, displayed as
+    // "items", is the fix: the number always means exactly how many entries just went to the Sheet.
+    // Since the app only ever sends rows it hasn't already marked pushed (see buildCustomerSheetPayload),
+    // every one counted here is a genuinely new entry the server will insert — nothing is filtered or
+    // skipped server-side anymore.
     const totalRowsToSend = itemGroups.reduce((s, g) => s + (g.variants || []).reduce((s2, v) => s2 + (v.rows || []).length, 0), 0);
     if (!totalRowsToSend) {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Nothing new to push right now.' } }));
@@ -4008,7 +4044,7 @@ function FIMSApp() {
         });
       }
     };
-    if (!window.confirm(`Send ${totalRowsToSend} row${totalRowsToSend === 1 ? '' : 's'} to ${customer}'s Google Sheet now?`)) return;
+    if (!window.confirm(`Send ${totalRowsToSend} item${totalRowsToSend === 1 ? '' : 's'} to ${customer}?`)) return;
     setPushStatus(prev => ({ ...prev, [customer]: { state: 'pushing', message: '', unmatched } }));
     try {
       const res = await fetch('/api/customer-sheets/push', {
@@ -4024,27 +4060,131 @@ function FIMSApp() {
       if (!(res.ok && data.ok)) {
         const failedTabs = (data.results || []).filter(r => !r.ok).map(r => `${r.tab}: ${r.error}`).join(' · ');
         const partialRows = (data.results || []).filter(r => r.ok).reduce((s, r) => s + (r.newRows || 0), 0);
-        const partialNote = partialRows ? ` ${partialRows} row${partialRows === 1 ? '' : 's'} still made it through before this failure.` : '';
+        const partialNote = partialRows ? ` ${partialRows} item${partialRows === 1 ? '' : 's'} still sent.` : '';
         setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: (failedTabs || data.error || `Push failed (HTTP ${res.status}).`) + partialNote, unmatched } }));
         // Even on an overall-failed push, whatever DID land in the Sheet (the tabs in okTabs) is real —
-        // still worth reflecting in the mirror and re-diffing the review, same as a full success would.
-        if (okTabs.length) { replaceCustomerMirrorRows(customer, data.mirrorRows || []); refreshReview(customer); }
+        // still worth reflecting in the mirror, re-baselining known counts, and re-diffing the review,
+        // same as a full success would.
+        if (okTabs.length) {
+          replaceCustomerMirrorRows(customer, data.mirrorRows || []);
+          updateKnownCountsFromMirrorRows(customer, data.mirrorRows || []);
+          refreshReview(customer);
+        }
         return;
       }
       const rowsWritten = (data.results || []).reduce((s, r) => s + (r.newRows || 0), 0);
-      setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Sent ${rowsWritten} row${rowsWritten === 1 ? '' : 's'} to the Sheet just now.`, unmatched } }));
+      setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Sent ${rowsWritten} item${rowsWritten === 1 ? '' : 's'} to ${customer}.`, unmatched } }));
       patchCustomerSheetEntry(customer, { sheetId, lastPushedAt: new Date().toISOString() });
       // Refreshes this customer's slice of the Customer Sheets Mirror with what's really in the Sheet
       // post-push (the server re-reads it fresh — see pushCustomerSheetHandler) so search reflects the
       // just-written rows immediately, not just whatever the mirror last had at import time. Read-only,
-      // same as every other mirror refresh — never itself a source of a write back to the Sheet.
+      // same as every other mirror refresh — never itself a source of a write back to the Sheet. Also
+      // re-baselines the known-row-count for every block, so syncFromSheet's next comparison starts from
+      // exactly what's really there now, not from before this push's rows were added.
       replaceCustomerMirrorRows(customer, data.mirrorRows || []);
+      updateKnownCountsFromMirrorRows(customer, data.mirrorRows || []);
       // The staged edits were for THIS specific diff — once it's actually written, their values are
       // now baked into the real rows the app just appended, so clear them and pull a fresh diff.
       setReviewEdits(prev => { const next = { ...prev }; delete next[customer]; return next; });
       refreshReview(customer);
     } catch (e) {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: e.message || 'Network error — could not reach the server.', unmatched } }));
+    }
+  };
+  const [syncStatus, setSyncStatus] = useState({}); // { [customer]: { state: 'syncing'|'done'|'error', message } }
+  // Finds the item name this app would normally use for a real block, so a row pulled in from the Sheet
+  // groups correctly with everything else already tracked for that item instead of starting a stray
+  // second group labeled by the raw block title. Falls back to the block title itself when nothing in
+  // the Known Product Catalog maps to it (a block created directly in the Sheet, never catalogued) —
+  // still perfectly usable, it just won't have a shorter/cleaner display name until it's catalogued.
+  const describeBlockForCustomer = (customer, sheetTab, block) => {
+    const norm = (s) => String(s || '').trim().toLowerCase();
+    const match = productCatalog.find(c => c.customer === customer && norm(c.sheetGroup) === norm(sheetTab) && norm(c.block || c.item) === norm(block));
+    return (match && match.item) || block;
+  };
+  // Pulls rows someone added by hand directly in a customer's real Sheet into this app's own Production
+  // Register / Customer Dispatch Bills — the Sheet -> App half of the sync rule (never the other way:
+  // this reads the Sheet, it NEVER writes to it). Whether a block has any new rows is judged purely by
+  // ROW COUNT, not by comparing dates or numbers — comparing content is exactly the kind of "read the
+  // sheet and make a decision about what disagrees" logic that caused real corruption in the push path
+  // (see computeMergePatches on the server), and it's unnecessary here anyway: a block only ever grows,
+  // so however many MORE rows it has than this app last knew about are, by construction, new, and they're
+  // always the newest ones — the tail — since a person adding to a running ledger by hand adds at the end,
+  // exactly like this app's own pushes do.
+  //
+  // A block this app has never looked at before (no stored count yet — including every block that
+  // existed before this feature shipped) pulls nothing on its first sync: that first read just sets the
+  // baseline count, safely, instead of treating a whole pre-existing history as "new" and flooding the
+  // register with it. Only a SECOND sync, after the baseline exists, can ever detect and pull real
+  // additions — same reasoning as the pushedToSheet migration.
+  const syncFromSheet = async (customer) => {
+    const sheetId = getCustomerSheetId(customer).trim();
+    if (!sheetId) { setSyncStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Add a Google Sheet ID for this customer first.' } })); return; }
+    setSyncStatus(prev => ({ ...prev, [customer]: { state: 'syncing', message: '' } }));
+    try {
+      const res = await fetch('/api/customer-sheets/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ spreadsheetId: sheetId }),
+      });
+      if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return; }
+      const data = await res.json().catch(() => ({}));
+      if (!(res.ok && data.ok)) {
+        setSyncStatus(prev => ({ ...prev, [customer]: { state: 'error', message: data.error || `Sync failed (HTTP ${res.status}).` } }));
+        return;
+      }
+      const mirrorRows = data.mirrorRows || [];
+      // Groups the fresh read by real block, keeping each block's rows in the SAME physical/chronological
+      // order the Sheet itself has them in (extractMirrorRowsFromGrid, server-side, already reads them
+      // top-to-bottom) — required for "the extra ones are the tail" to actually mean the newest ones.
+      const byBlock = new Map(); // `${sheetTab}||${block}` -> { sheetTab, block, rows: [] }
+      mirrorRows.forEach(r => {
+        const key = `${r.sheetTab}||${r.block}`;
+        if (!byBlock.has(key)) byBlock.set(key, { sheetTab: r.sheetTab, block: r.block, rows: [] });
+        byBlock.get(key).rows.push(r);
+      });
+      const newProductionRows = [];
+      const newDispatchRows = [];
+      byBlock.forEach(({ sheetTab, block, rows }) => {
+        const known = customerSheetKnownCounts.find(c => c.customer === customer && c.sheetTab === sheetTab && c.block === block);
+        if (!known) return; // never baselined before — this read only sets the baseline, see comment above
+        if (rows.length <= known.count) return; // nothing new
+        const description = describeBlockForCustomer(customer, sheetTab, block);
+        rows.slice(known.count).forEach(r => {
+          // stockConfirmed + pushedToSheet: true, both from the moment this row is created — it's
+          // already sitting in the real Sheet (that's the whole reason it's being pulled in), so it must
+          // never be treated as pending confirmation, and a later push must never send it back out and
+          // duplicate it there.
+          if (r.production) {
+            newProductionRows.push({
+              id: genId(), date: r.date, party: '', description, customerHint: '', pieces: r.production, dispatch: 0,
+              confirmedCustomer: customer, stockConfirmed: true, pushedToSheet: true, pulledFromSheet: true,
+            });
+          }
+          if (r.dispatch) {
+            newDispatchRows.push({
+              id: genId(), date: r.date, invoice_no: '', party: customer, buyer_order_no: '', description,
+              quantity: r.dispatch, rate: '', amount: '',
+              confirmedCustomer: customer, stockConfirmed: true, pushedToSheet: true, pulledFromSheet: true,
+            });
+          }
+        });
+      });
+      if (newProductionRows.length) {
+        setProduction(prev => { const next = [...prev, ...newProductionRows]; persist('production', next); return next; });
+      }
+      if (newDispatchRows.length) {
+        setCustomerDispatch(prev => { const next = [...prev, ...newDispatchRows]; persist('customerDispatch', next); return next; });
+      }
+      // Re-baseline AFTER pulling the delta in, using this exact same fresh read — the counts and the
+      // rows they were computed from can never drift apart this way.
+      updateKnownCountsFromMirrorRows(customer, mirrorRows);
+      replaceCustomerMirrorRows(customer, mirrorRows);
+      const pulled = newProductionRows.length + newDispatchRows.length;
+      setSyncStatus(prev => ({ ...prev, [customer]: { state: 'done', message: pulled ? `Pulled in ${pulled} entr${pulled === 1 ? 'y' : 'ies'} added directly in the Sheet.` : 'Nothing new in the Sheet.' } }));
+    } catch (e) {
+      setSyncStatus(prev => ({ ...prev, [customer]: { state: 'error', message: e.message || 'Network error — could not reach the server.' } }));
     }
   };
   /* -------- export --------
@@ -5418,10 +5558,18 @@ function FIMSApp() {
                           {registryEntry?.lastPushedAt && <> · last pushed {new Date(registryEntry.lastPushedAt).toLocaleString()}</>}
                         </p>
                       </div>
-                      <button className="btn btn-ghost" onClick={() => importSheetById(sheetId, { mode: 'resync', resyncCustomer: customer })} disabled={sheetImportBusy || !sheetId.trim()} title="Re-read this customer's Sheet fresh and replace their catalog with exactly what's in it now (removes anything renamed or deleted there) — you'll see a review + confirm before anything changes">
-                        <RefreshCw size={15} /> Re-sync
-                      </button>
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <button className="btn btn-ghost" onClick={() => syncFromSheet(customer)} disabled={syncStatus[customer]?.state === 'syncing' || !sheetId.trim()} title="Read this customer's Sheet and pull in any rows added directly there by hand — never writes anything to the Sheet itself">
+                          <Download size={15} /> Sync entries
+                        </button>
+                        <button className="btn btn-ghost" onClick={() => importSheetById(sheetId, { mode: 'resync', resyncCustomer: customer })} disabled={sheetImportBusy || !sheetId.trim()} title="Re-read this customer's Sheet fresh and replace their catalog with exactly what's in it now (removes anything renamed or deleted there) — you'll see a review + confirm before anything changes">
+                          <RefreshCw size={15} /> Re-sync
+                        </button>
+                      </div>
                     </div>
+                    {syncStatus[customer]?.state === 'syncing' && <div className="doc-hint" style={{ marginTop: 6 }}><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle', marginRight: 4 }} />syncing…</div>}
+                    {syncStatus[customer]?.state === 'done' && <div className="doc-hint" style={{ marginTop: 6, color: 'var(--ok)' }}>✓ {syncStatus[customer].message}</div>}
+                    {syncStatus[customer]?.state === 'error' && <div style={{ marginTop: 6, color: 'var(--ledger-red)', fontSize: 12.5 }}>{syncStatus[customer].message}</div>}
                     <div className="field-row">
                       <input className="text-input" style={{ minWidth: 340, flex: 1 }} placeholder="Paste this customer's Google Sheet link or ID" value={sheetId} onChange={e => updateCustomerSheetId(customer, e.target.value)} autoComplete="off" spellCheck={false} />
                       {registryEntry && (
