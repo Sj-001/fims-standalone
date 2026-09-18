@@ -1091,11 +1091,18 @@ const normalizeTabKey = (name) => {
   // spaces are already handled everywhere else in this function.
   s = s.replace(/[-‐-―]/g, ' ');
   TAB_KEY_ALIASES.forEach(([pattern, replacement]) => { s = s.replace(pattern, replacement); });
-  // Trailing "x60ppkt" / "×60 pkt" / "*60" style pack-count marker: an explicit multiplier symbol
-  // (x/×/*) is an unambiguous signal that whatever follows is a pack/carton count, never part of a
-  // real product code — so strip the whole tail regardless of exactly how the unit word after the
-  // digits is spelled (pkt/ppkt/pcs/nos/ctn/etc. all show up in the real sheets, with typos).
-  s = s.replace(/[x×*]\s*\d+\s*[a-z]{0,8}\.?\s*$/i, '').trim();
+  // Trailing "x60"/"×144"/"*120" with NOTHING after the number: an explicit multiplier symbol followed
+  // immediately by digits and nothing else is unambiguous — always a pack/carton count, never part of
+  // a real product code — so this bare form is always safe to strip outright.
+  s = s.replace(/[x×*]\s*\d+\s*\.?\s*$/i, '').trim();
+  // Trailing "x60pkt" / "×60 pkt" / "*120 nos" — same multiplier symbol, but now followed by a real
+  // word. Only safe to strip when that word is a KNOWN packaging unit (pkt/ppkt/pcs/nos/ctn/etc., the
+  // same whitelist the bare-number rule below uses) — accepting ANY word up to 8 letters here (the
+  // previous version of this rule) silently erased a real, distinguishing word instead of packaging
+  // noise: "Blacko 32g x120 new" collapsed to "blacko32g", the exact same key as the totally different,
+  // unrelated item "Blacko 32g" — confirmed directly as a real misroute (the wrong item's tab absorbed
+  // a real production entry meant for the "x120 new" variant's own tab).
+  s = s.replace(/[x×*]\s*\d+\s*(pkt|pkts|ppkt|ppkts|pcs|nos|ctn|ctns|box|boxes|bag|bags|unit|units)\.?\s*$/i, '').trim();
   // Trailing "60 PKT" / "60pkt" style pack-count with NO multiplier symbol — ambiguous in general (a
   // bare number+word could be a real product code, e.g. "N200 Jumbo"), so only strip a known list of
   // packaging-unit words here rather than any word.
