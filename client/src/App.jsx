@@ -4,7 +4,6 @@ import {
   Upload, Image as ImageIcon, Package, Boxes, Search, Truck, ClipboardList,
   FileSpreadsheet, Download, CheckCircle2, XCircle, Trash2, Loader2,
   AlertCircle, LayoutDashboard, FileText, Archive, ListChecks, Plus, RefreshCw, Link2, Info, Check,
-  ChevronLeft, ChevronRight
 } from 'lucide-react';
 /* ============================== helpers ============================== */
 const num = (v) => {
@@ -2025,16 +2024,12 @@ function FIMSApp() {
     }
     return skipped;
   };
-  // Collapsible sidebar — mainly so the upload preview (and the review table next to it) has more
-  // room to breathe on a laptop-width screen. A pure UI preference, not app data, so it's kept in
-  // plain localStorage (not the Google-Sheets-backed window.storage shim used for real business data)
-  // and just falls back to expanded if that read ever fails.
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
-    try { return localStorage.getItem('fims_sidebar_collapsed') === '1'; } catch (e) { return false; }
-  });
-  useEffect(() => {
-    try { localStorage.setItem('fims_sidebar_collapsed', sidebarCollapsed ? '1' : '0'); } catch (e) { /* noop */ }
-  }, [sidebarCollapsed]);
+  // Sidebar is a collapsed icon rail by default, purely so the upload preview (and the review table
+  // next to it) has more room to breathe on a laptop-width screen — expands only while the cursor is
+  // actually over it (pick a tab, move away, it collapses again) rather than staying open as a lasting
+  // preference. Transient render state on purpose, not persisted anywhere: "default" means every load,
+  // not "whatever I last had it set to."
+  const [sidebarExpanded, setSidebarExpanded] = useState(false);
   // Topbar search — replaced the old dedicated "Order Availability Check" tab. Instead of a single
   // party/keyword form scoped to just Production + Dispatch, this is a plain substring search across
   // every flat register PLUS Customer Stock (produced/dispatched/balance by customer+item), so the same
@@ -4276,34 +4271,37 @@ function FIMSApp() {
           margin: 0;
           color: var(--ink);
         }
+        /* Rail reserves a fixed 60px in the normal flex layout, always — hovering the sidebar never
+           shifts or reflows the main content next to it; the expanded sidebar instead floats OVER it as
+           an absolutely-positioned overlay (see .sidebar.expanded), same pattern as a VS-Code-style
+           hover-expand activity bar. */
+        .sidebar-rail { width: 60px; flex-shrink: 0; position: relative; }
         .sidebar {
-          width: 232px;
-          flex-shrink: 0;
+          position: absolute; top: 0; left: 0; bottom: 0;
+          width: 60px;
           background: var(--ink);
           color: #e8e5dc;
           display: flex;
           flex-direction: column;
           padding: 20px 0;
           transition: width 0.15s ease;
+          overflow: hidden;
+          z-index: 50;
         }
-        .sidebar.collapsed { width: 60px; }
-        .sidebar.collapsed .nav-item { justify-content: center; padding: 10px 0; }
-        .sidebar.collapsed .nav-item span { display: none; }
+        .sidebar.expanded { width: 232px; box-shadow: 4px 0 20px rgba(0,0,0,0.3); }
+        .sidebar .nav-item { justify-content: center; padding: 10px 0; }
+        .sidebar .nav-item span { display: none; }
+        .sidebar.expanded .nav-item { justify-content: flex-start; padding: 10px 18px; }
+        .sidebar.expanded .nav-item span { display: inline; }
         .brand {
-          padding: 0 18px 18px 18px;
+          padding: 0 0 14px 0;
           border-bottom: 1px solid rgba(255,255,255,0.12);
           margin-bottom: 10px;
+          text-align: center;
         }
-        .sidebar.collapsed .brand { padding: 0 0 14px 0; text-align: center; }
+        .sidebar.expanded .brand { padding: 0 18px 18px 18px; text-align: left; }
         .brand h1 { font-size: 17px; line-height: 1.3; color: #f6f3ec; }
         .brand p { font-size: 11px; color: #a7a396; margin-top: 4px; letter-spacing: 0.04em; text-transform: uppercase; }
-        .sidebar-toggle {
-          margin: 10px auto 0 auto;
-          background: transparent; border: 1px solid rgba(255,255,255,0.18); color: #cfcabd;
-          border-radius: 6px; width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
-          cursor: pointer; flex-shrink: 0;
-        }
-        .sidebar-toggle:hover { background: rgba(255,255,255,0.08); color: #f6f3ec; }
         .nav-item {
           display: flex; align-items: center; gap: 10px;
           padding: 10px 18px;
@@ -4449,27 +4447,30 @@ function FIMSApp() {
         .spin { animation: fims-spin 1s linear infinite; }
         @keyframes fims-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
       `}</style>
-      <aside className={`sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
-        <div className="brand">
-          {sidebarCollapsed
-            ? <div style={{ fontSize: 13, fontWeight: 700, color: '#f6f3ec' }} title="Shyam Adarsh Pack — Inventory & Production">SA</div>
-            : <><h1>Shyam Adarsh Pack</h1><p>Inventory &amp; Production</p></>}
-        </div>
-        {NAV.map(item => {
-          const Icon = item.icon;
-          const count = counts[item.key];
-          return (
-            <div key={item.key} className={`nav-item ${activeTab === item.key ? 'active' : ''}`} onClick={() => setActiveTab(item.key)} title={sidebarCollapsed ? item.label : undefined}>
-              <Icon size={16} />
-              <span>{item.label}</span>
-              {!sidebarCollapsed && typeof count === 'number' && <span className="nav-count">{count}</span>}
-            </div>
-          );
-        })}
-        <button className="sidebar-toggle" onClick={() => setSidebarCollapsed(v => !v)} title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
-          {sidebarCollapsed ? <ChevronRight size={15} /> : <ChevronLeft size={15} />}
-        </button>
-      </aside>
+      <div className="sidebar-rail">
+        <aside
+          className={`sidebar ${sidebarExpanded ? 'expanded' : ''}`}
+          onMouseEnter={() => setSidebarExpanded(true)}
+          onMouseLeave={() => setSidebarExpanded(false)}
+        >
+          <div className="brand">
+            {sidebarExpanded
+              ? <><h1>Shyam Adarsh Pack</h1><p>Inventory &amp; Production</p></>
+              : <div style={{ fontSize: 13, fontWeight: 700, color: '#f6f3ec' }} title="Shyam Adarsh Pack — Inventory & Production">SA</div>}
+          </div>
+          {NAV.map(item => {
+            const Icon = item.icon;
+            const count = counts[item.key];
+            return (
+              <div key={item.key} className={`nav-item ${activeTab === item.key ? 'active' : ''}`} onClick={() => setActiveTab(item.key)} title={!sidebarExpanded ? item.label : undefined}>
+                <Icon size={16} />
+                <span>{item.label}</span>
+                {sidebarExpanded && typeof count === 'number' && <span className="nav-count">{count}</span>}
+              </div>
+            );
+          })}
+        </aside>
+      </div>
       <div className="main">
         <div className="topbar">
           <h2>{activeTab === 'search' ? `Search: "${globalQuery}"` : NAV.find(n => n.key === activeTab)?.label}</h2>
