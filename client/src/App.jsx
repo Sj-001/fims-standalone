@@ -3159,11 +3159,21 @@ function FIMSApp() {
     });
     if (tabBlockDraft) setPendingTabBlockForms(prev => { const next = { ...prev }; delete next[row.id]; return next; });
   };
-  // "Push to Sheet" (Pending Production/Dispatch Review) must never silently confirm a row onto a
-  // fabricated new-customer guess — only rows that are either already explicitly picked
-  // (row.confirmedCustomer set via the dropdown) or whose automatic guess is a real known customer get
-  // bulk-confirmed and pushed. Anything genuinely unresolved is left pending and reported, so it gets a
-  // deliberate pick instead of a phantom customer.
+  // The ONE way any pending row gets confirmed, anywhere in this app — the bulk "Push to Sheet"
+  // button, the per-group confirm, and the single-row confirm icon all call this same function.
+  // Confirming a row without pushing it used to be possible (a separate confirmStockRow-only path on
+  // the single-row and group buttons) and it was a real trap: a row confirmed that way vanishes from
+  // Pending Review immediately, with nothing in the UI showing it's still sitting there unsent — it
+  // would only ever surface again, invisibly bundled in, the next time ANYTHING else got pushed for
+  // that same customer. Confirmed directly as genuinely confusing: a push reported "5 items" when only
+  // 4 rows were visible anywhere on screen, the 5th being exactly this kind of forgotten leftover.
+  // Every confirm path now goes through here so a row is never left in that limbo state again — it's
+  // either still pending (visible, actionable) or confirmed-and-pushed, never confirmed-and-forgotten.
+  //
+  // Must never silently confirm a row onto a fabricated new-customer guess — only rows that are either
+  // already explicitly picked (row.confirmedCustomer set via the dropdown) or whose automatic guess is
+  // a real known customer get confirmed and pushed. Anything genuinely unresolved is left pending and
+  // reported, so it gets a deliberate pick instead of a phantom customer.
   //
   // Confirming and pushing can't happen in the same synchronous pass: confirmStockRow's setState only
   // takes effect on the NEXT render, so buildCustomerSheetPayload (which reads live production/
@@ -5053,7 +5063,7 @@ function FIMSApp() {
                     <PendingGroupBar key={group.key} group={group} guess={matchCustomer(group.rows[0])}
                       isKnownGuess={isKnownCustomerGuess(group.rows[0])} knownCustomers={allCustomerTabNames}
                       onBulkChange={updatePendingCustomerBulk('production')}
-                      onConfirmGroup={() => group.rows.forEach(r => confirmStockRow('production', r))} />
+                      onConfirmGroup={() => pushPendingRows('production', group.rows)} />
                   ))}
                   <div className="table-wrap">
                     <table>
@@ -5093,7 +5103,7 @@ function FIMSApp() {
                               </>
                             )}
                             <td className="col-action">
-                              <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm this row" onClick={() => confirmStockRow('production', row)}><CheckCircle2 size={16} /></button>
+                              <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm & push this row" onClick={() => pushPendingRows('production', [row])}><CheckCircle2 size={16} /></button>
                               <button className="icon-btn danger" title="Delete this row entirely" onClick={() => { if (window.confirm('Delete this row from the Production Register entirely?')) deleteRow('production')(row.id); }}><Trash2 size={15} /></button>
                             </td>
                           </tr>
@@ -5117,7 +5127,7 @@ function FIMSApp() {
                     <PendingGroupBar key={group.key} group={group} guess={matchCustomer(group.rows[0])}
                       isKnownGuess={isKnownCustomerGuess(group.rows[0])} knownCustomers={allCustomerTabNames}
                       onBulkChange={updatePendingCustomerBulk('customerDispatch')}
-                      onConfirmGroup={() => group.rows.forEach(r => confirmStockRow('customerDispatch', r))} />
+                      onConfirmGroup={() => pushPendingRows('customerDispatch', group.rows)} />
                   ))}
                   <div className="table-wrap">
                     <table>
@@ -5158,7 +5168,7 @@ function FIMSApp() {
                               </>
                             )}
                             <td className="col-action">
-                              <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm this row" onClick={() => confirmStockRow('customerDispatch', row)}><CheckCircle2 size={16} /></button>
+                              <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm & push this row" onClick={() => pushPendingRows('customerDispatch', [row])}><CheckCircle2 size={16} /></button>
                               <button className="icon-btn danger" title="Delete this row entirely" onClick={() => { if (window.confirm('Delete this row from the Customer Dispatch Bills register entirely?')) deleteRow('customerDispatch')(row.id); }}><Trash2 size={15} /></button>
                             </td>
                           </tr>
