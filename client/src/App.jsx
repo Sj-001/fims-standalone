@@ -3175,36 +3175,34 @@ function FIMSApp() {
   // a real known customer get confirmed and pushed. Anything genuinely unresolved is left pending and
   // reported, so it gets a deliberate pick instead of a phantom customer.
   //
-  // Confirming and pushing can't happen in the same synchronous pass: confirmStockRow's setState only
-  // takes effect on the NEXT render, so buildCustomerSheetPayload (which reads live production/
-  // customerDispatch state) would still see the pre-confirm data if called right after. Instead this
-  // queues the touched customers in pendingPushCustomers; the effect below fires once the confirmed
-  // rows have actually landed in state and does the real push then. Duplicate detection is entirely
-  // app-side now (see buildCustomerSheetPayload's pushedToSheet filtering) — a row already marked
-  // pushed is never included in the payload in the first place, so there's nothing for the server to
-  // skip or compare.
-  const [pendingPushCustomers, setPendingPushCustomers] = useState(null);
+  // Pushes EXACTLY these rows — nothing else, ever. This used to hand off to pushCustomerSheetNow via a
+  // queued customer name, which then rebuilt its OWN payload from "everything currently unpushed for
+  // that customer" — meaning a push could silently include something confirmed in a completely earlier,
+  // unrelated action. Explicit instruction after that caused real confusion and a real duplicated row:
+  // a push must only ever send what was just confirmed in THIS action. So the confirmed row objects are
+  // built right here, in memory, and handed straight to pushCustomerSheetNow — no re-reading of register
+  // state, no rebuilt "what's outstanding" sweep, no render-cycle wait.
   const pushPendingRows = (registerKey, rows) => {
     const resolved = rows.filter(r => r.confirmedCustomer || isKnownCustomerGuess(r));
     const skipped = rows.length - resolved.length;
-    const customersTouched = new Set();
+    const byCustomer = new Map();
     resolved.forEach(r => {
       const customer = (r.confirmedCustomer || matchCustomer(r)).trim() || 'Unassigned';
-      if (customer !== 'Unassigned') customersTouched.add(customer);
-      confirmStockRow(registerKey, r);
+      confirmStockRow(registerKey, r, customer);
+      if (customer === 'Unassigned') return; // never auto-pushed — needs a deliberate pick first
+      if (!byCustomer.has(customer)) byCustomer.set(customer, []);
+      byCustomer.get(customer).push({ ...r, confirmedCustomer: customer, stockConfirmed: true });
     });
-    if (skipped > 0) window.alert(`Confirmed and queued ${resolved.length} row${resolved.length === 1 ? '' : 's'} to push. Skipped ${skipped} row${skipped === 1 ? '' : 's'} whose customer couldn't be matched automatically — pick a customer in the dropdown for ${skipped === 1 ? 'it' : 'them'}, then push again.`);
-    if (customersTouched.size) setPendingPushCustomers(prev => new Set([...(prev || []), ...customersTouched]));
+    if (skipped > 0) window.alert(`Confirmed ${resolved.length} row${resolved.length === 1 ? '' : 's'}. Skipped ${skipped} row${skipped === 1 ? '' : 's'} whose customer couldn't be matched automatically — pick a customer in the dropdown for ${skipped === 1 ? 'it' : 'them'}, then push again.`);
+    byCustomer.forEach((confirmedRows, customer) => {
+      if (!getCustomerSheetId(customer).trim()) return; // no Sheet linked yet — confirmed locally, nothing to push to
+      pushCustomerSheetNow(
+        customer,
+        registerKey === 'production' ? confirmedRows : [],
+        registerKey === 'customerDispatch' ? confirmedRows : [],
+      );
+    });
   };
-  useEffect(() => {
-    if (!pendingPushCustomers || !pendingPushCustomers.size) return;
-    const toPush = pendingPushCustomers;
-    setPendingPushCustomers(null);
-    toPush.forEach(customer => {
-      if (getCustomerSheetId(customer).trim()) pushCustomerSheetNow(customer);
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pendingPushCustomers, production, customerDispatch]);
   const updatePendingCustomer = (registerKey) => (id, value) => {
     registerSetters[registerKey](prev => {
       const next = prev.map(r => r.id === id ? { ...r, confirmedCustomer: value } : r);
@@ -3446,19 +3444,15 @@ function FIMSApp() {
   // Rows land in the ledger already dot-formatted now (normalizeDateToDots runs at extraction time,
   // see DOCUMENT_TYPES above) — this second call right before push is a safety net for anything that
   // reached the ledger some other way (a manually typed/edited row), not the primary defense anymore.
-  const buildCustomerSheetPayload = (customer) => {
-    // Only rows never yet pushed — a push must never resend a row the Sheet already has, and per the
-    // no-touching-old-entries rule the server no longer compares against the Sheet's existing content to
-    // work that out itself, so the app is the one source of truth for what's already there. Running this
-    // through the exact same buildStockGroupsFrom merge as the full-history view means a date that's
-    // partly pushed (e.g. production pushed already, a new dispatch bill for the same date just
-    // confirmed) still correctly produces just the new contribution as its own row, not a resend of the
-    // whole date.
-    const unpushedGroups = buildStockGroupsFrom(
-      confirmedProductionRows.filter(row => !row.pushedToSheet),
-      confirmedDispatchRows.filter(row => !row.pushedToSheet),
-    );
-    const groups = unpushedGroups.filter(g => g.customer === customer);
+  // customer's own confirmed history — for showing "what's still outstanding" (the Customer Sheets tab
+  // count, refreshReview's live diff/block-picker) — NOT for deciding what an actual push sends. An
+  // explicit instruction after real confusion and a real duplicated row: pushing must never silently
+  // sweep in anything beyond the exact rows just confirmed in THAT action, no matter what else happens
+  // to be sitting around unpushed for the same customer. See pushCustomerSheetNow, the only place that
+  // decides what actually gets sent — it calls buildCustomerSheetPayloadFromRows directly with the
+  // specific rows it was handed, never this function.
+  const buildCustomerSheetPayloadFromRows = (customer, productionRows, dispatchRows) => {
+    const groups = buildStockGroupsFrom(productionRows, dispatchRows).filter(g => g.customer === customer);
     const sheetGroupByItem = {};
     const blockByItem = {};
     productCatalog.filter(c => c.customer === customer).forEach(c => {
@@ -3510,6 +3504,14 @@ function FIMSApp() {
     // rewrites it. The app never reads or writes that tab at all now, for any customer.
     return { itemGroups, unmatched: Array.from(new Set(unmatched)) };
   };
+  // Display-only view of everything still outstanding (confirmed, not yet pushed) for a customer —
+  // used purely to show counts/diffs on screen. Never used to decide what a push actually sends; see
+  // buildCustomerSheetPayloadFromRows above.
+  const buildCustomerSheetPayload = (customer) => buildCustomerSheetPayloadFromRows(
+    customer,
+    confirmedProductionRows.filter(row => !row.pushedToSheet),
+    confirmedDispatchRows.filter(row => !row.pushedToSheet),
+  );
   // reviewEdits[customer] is always empty now (see its declaration) — kept as a harmless no-op pass-
   // through rather than reworking every call site that still asks for the "edited" payload.
   const applyReviewEdits = (itemGroups, editsForCustomer) => {
@@ -3546,6 +3548,10 @@ function FIMSApp() {
   };
   const getEditedPayload = (customer) => {
     const { itemGroups, unmatched } = buildCustomerSheetPayload(customer);
+    return { itemGroups: applyReviewEdits(itemGroups, reviewEdits[customer]), unmatched };
+  };
+  const getEditedPayloadFromRows = (customer, productionRows, dispatchRows) => {
+    const { itemGroups, unmatched } = buildCustomerSheetPayloadFromRows(customer, productionRows, dispatchRows);
     return { itemGroups: applyReviewEdits(itemGroups, reviewEdits[customer]), unmatched };
   };
   // Declared up here (rather than down by the rest of their assign-form logic, further below) because
@@ -3979,38 +3985,41 @@ function FIMSApp() {
   // wouldn't be visible until React re-renders, which is exactly the same kind of gap that let a row
   // get pushed twice in the first place — see the comment inside pushCustomerSheetNow.
   const pushInFlightRef = useRef(new Set());
-  const pushQueuedRef = useRef(new Set());
-  const pushCustomerSheetNow = async (customer) => {
+  const pushQueuedRef = useRef(new Map()); // customer -> { productionRows, dispatchRows } waiting their turn
+  // Pushes EXACTLY productionRows/dispatchRows — the specific rows the caller was just handed, nothing
+  // recomputed, nothing swept in from elsewhere. This used to rebuild its own payload from "everything
+  // currently unpushed for this customer," which is exactly how a row confirmed in one action ended up
+  // silently riding along with a completely different, later push — explicit instruction after that
+  // caused real confusion and a real duplicated row: what you push is exactly and only what was just
+  // confirmed, every time, no exceptions.
+  const pushCustomerSheetNow = async (customer, productionRows, dispatchRows) => {
     const sheetId = getCustomerSheetId(customer).trim();
     if (!sheetId) {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Add a Google Sheet ID for this customer first (see field above).' } }));
       return;
     }
-    // A row only gets marked pushedToSheet AFTER a push's response comes back — a real network round
-    // trip, never instant. If a SECOND push for this SAME customer starts while the first one is still
-    // in flight, it builds its payload from the exact same "not yet marked pushed" rows the first one
-    // is already sending, and would send them again the moment it lands — confirmed directly as the
-    // cause of a real duplicate: confirming a production entry (which kicks off its own push) and then
-    // pushing that customer's pending dispatch entries before the first push had finished sent that
-    // same production row twice. Queuing a second call instead of letting it race the first is what
-    // closes that window — it reruns (with a fresh payload, fresh confirm) only once the in-flight one
-    // has actually finished marking whatever it sent.
+    // If a push for this SAME customer is already in flight, this call's rows wait their turn instead
+    // of being sent right alongside it — merged with anything else already waiting, so nothing queued
+    // up in the meantime is dropped. They go out, still as their own exact set, the moment the
+    // in-flight one finishes.
     if (pushInFlightRef.current.has(customer)) {
-      pushQueuedRef.current.add(customer);
+      const existing = pushQueuedRef.current.get(customer) || { productionRows: [], dispatchRows: [] };
+      pushQueuedRef.current.set(customer, {
+        productionRows: [...existing.productionRows, ...productionRows],
+        dispatchRows: [...existing.dispatchRows, ...dispatchRows],
+      });
       return;
     }
     // Always the CURRENT edited payload (review edits — value changes, deletions, moves, added rows —
-    // applied on top of the freshly computed ledger of not-yet-pushed rows), so what gets written always
-    // matches exactly what was last shown on screen.
-    const { itemGroups, unmatched } = getEditedPayload(customer);
+    // applied on top of exactly the rows this call was given), so what gets written always matches
+    // exactly what was just confirmed — never anything else outstanding for this customer.
+    const { itemGroups, unmatched } = getEditedPayloadFromRows(customer, productionRows, dispatchRows);
     // "Items" in this message means individual dated entries, not products/variants — confirmed
     // directly as confusing wording once before: counting itemGroups (products) instead of entries made
     // "Sent 8 items" read as if only 8 things total existed, when it actually meant "8 different
     // products," each with its own handful of dated rows. Counting rows.length here, displayed as
-    // "items", is the fix: the number always means exactly how many entries just went to the Sheet.
-    // Since the app only ever sends rows it hasn't already marked pushed (see buildCustomerSheetPayload),
-    // every one counted here is a genuinely new entry the server will insert — nothing is filtered or
-    // skipped server-side anymore.
+    // "items", is the fix: the number always means exactly how many entries just went to the Sheet —
+    // exactly the productionRows/dispatchRows this call was given, nothing more.
     const totalRowsToSend = itemGroups.reduce((s, g) => s + (g.variants || []).reduce((s2, v) => s2 + (v.rows || []).length, 0), 0);
     if (!totalRowsToSend) {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Nothing new to push right now.' } }));
@@ -4131,11 +4140,13 @@ function FIMSApp() {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: e.message || 'Network error — could not reach the server.', unmatched } }));
     } finally {
       pushInFlightRef.current.delete(customer);
-      // Anything that tried to push this same customer while this one was running gets its turn now —
-      // fresh payload, fresh confirm() — never racing what this call just finished sending.
-      if (pushQueuedRef.current.has(customer)) {
+      // Anything that tried to push this same customer while this one was running gets its turn now,
+      // with exactly the rows it was queued with — never re-reading state, never sweeping in anything
+      // else — and its own fresh confirm().
+      const queued = pushQueuedRef.current.get(customer);
+      if (queued) {
         pushQueuedRef.current.delete(customer);
-        pushCustomerSheetNow(customer);
+        pushCustomerSheetNow(customer, queued.productionRows, queued.dispatchRows);
       }
     }
   };
