@@ -4024,10 +4024,22 @@ function FIMSApp() {
     // succeeded but the purely cosmetic highlighting pass afterward failed) — only the ids belonging to
     // a tab that's actually ok:true in the response may ever be marked pushed; anything else must stay
     // eligible to be sent again, since it's genuinely unknown whether the Sheet really has it yet.
-    const idsToMarkByTab = {};
-    const wireItemGroups = itemGroups.map(g => {
+    //
+    // Keyed by POSITION (index into itemGroups), never by tab NAME — confirmed directly as a real bug:
+    // the server resolves a sent tabName against whatever the real Sheet tab is actually called
+    // (resolveTabPlansAgainstExisting, matched case/whitespace-insensitively), and reports results back
+    // under THAT real name, which can differ from what this app sent — a catalog entry's sheetGroup
+    // typed as "jeera" while the real tab is "JEERA", for instance. Looking that returned name back up
+    // in a map keyed by the name this app sent silently found nothing, marked nothing pushed even
+    // though the row had genuinely landed, and left it eligible to be sent again — which is exactly what
+    // happened to a real production entry: pushed successfully, never marked, then resent whenever the
+    // next push for that customer happened, duplicating it. results[] is built in the exact same order
+    // tabPlans (and therefore itemGroups) were sent in, at every step of the server pipeline, so the
+    // index into itemGroups is a stable, rename-proof way to match a response entry back to its rows.
+    const idsToMarkByIndex = [];
+    const wireItemGroups = itemGroups.map((g, gi) => {
       const tabIds = { production: new Set(), customerDispatch: new Set() };
-      idsToMarkByTab[g.tabName] = tabIds;
+      idsToMarkByIndex[gi] = tabIds;
       return {
         ...g,
         variants: (g.variants || []).map(v => {
@@ -4044,11 +4056,11 @@ function FIMSApp() {
     // no-touching-old-entries rule) — marking them pushed is what keeps the next push from resending
     // (duplicating) them, so this has to run for every tab the response actually confirms as ok, even
     // when the overall push is reported as a partial failure.
-    const markPushedForTabs = (tabNames) => {
+    const markPushedForIndexes = (indexes) => {
       const productionIds = new Set();
       const dispatchIds = new Set();
-      tabNames.forEach(t => {
-        const ids = idsToMarkByTab[t];
+      indexes.forEach(i => {
+        const ids = idsToMarkByIndex[i];
         if (!ids) return;
         ids.production.forEach(id => productionIds.add(id));
         ids.customerDispatch.forEach(id => dispatchIds.add(id));
@@ -4080,17 +4092,20 @@ function FIMSApp() {
       });
       if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return; }
       const data = await res.json().catch(() => ({}));
-      const okTabs = (data.results || []).filter(r => r.ok && r.tab).map(r => r.tab);
-      if (okTabs.length) markPushedForTabs(okTabs);
+      // i < wireItemGroups.length excludes the synthetic '(highlighting)' entry a formatting-only
+      // failure appends AFTER every real per-tab result — never a stand-in for an actual itemGroups
+      // entry, so it must never be looked up by index either.
+      const okIndexes = (data.results || []).reduce((acc, r, i) => { if (r.ok && i < wireItemGroups.length) acc.push(i); return acc; }, []);
+      if (okIndexes.length) markPushedForIndexes(okIndexes);
       if (!(res.ok && data.ok)) {
         const failedTabs = (data.results || []).filter(r => !r.ok).map(r => `${r.tab}: ${r.error}`).join(' · ');
         const partialRows = (data.results || []).filter(r => r.ok).reduce((s, r) => s + (r.newRows || 0), 0);
         const partialNote = partialRows ? ` ${partialRows} item${partialRows === 1 ? '' : 's'} still sent.` : '';
         setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: (failedTabs || data.error || `Push failed (HTTP ${res.status}).`) + partialNote, unmatched } }));
-        // Even on an overall-failed push, whatever DID land in the Sheet (the tabs in okTabs) is real —
+        // Even on an overall-failed push, whatever DID land in the Sheet (the tabs in okIndexes) is real —
         // still worth reflecting in the mirror, re-baselining known counts, and re-diffing the review,
         // same as a full success would.
-        if (okTabs.length) {
+        if (okIndexes.length) {
           replaceCustomerMirrorRows(customer, data.mirrorRows || []);
           updateKnownCountsFromMirrorRows(customer, data.mirrorRows || []);
           refreshReview(customer);
