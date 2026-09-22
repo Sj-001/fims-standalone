@@ -3974,10 +3974,29 @@ function FIMSApp() {
     registerAliases(customer, [item], sheetGroup, block);
     setNewAliasForm({ customer: '', item: '', sheetGroup: '', block: '' });
   };
+  // Refs, not state — pushCustomerSheetNow needs to check-and-set this synchronously, in the same tick
+  // a push starts, so a second call arriving before the next render can still see it. A state update
+  // wouldn't be visible until React re-renders, which is exactly the same kind of gap that let a row
+  // get pushed twice in the first place — see the comment inside pushCustomerSheetNow.
+  const pushInFlightRef = useRef(new Set());
+  const pushQueuedRef = useRef(new Set());
   const pushCustomerSheetNow = async (customer) => {
     const sheetId = getCustomerSheetId(customer).trim();
     if (!sheetId) {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Add a Google Sheet ID for this customer first (see field above).' } }));
+      return;
+    }
+    // A row only gets marked pushedToSheet AFTER a push's response comes back — a real network round
+    // trip, never instant. If a SECOND push for this SAME customer starts while the first one is still
+    // in flight, it builds its payload from the exact same "not yet marked pushed" rows the first one
+    // is already sending, and would send them again the moment it lands — confirmed directly as the
+    // cause of a real duplicate: confirming a production entry (which kicks off its own push) and then
+    // pushing that customer's pending dispatch entries before the first push had finished sent that
+    // same production row twice. Queuing a second call instead of letting it race the first is what
+    // closes that window — it reruns (with a fresh payload, fresh confirm) only once the in-flight one
+    // has actually finished marking whatever it sent.
+    if (pushInFlightRef.current.has(customer)) {
+      pushQueuedRef.current.add(customer);
       return;
     }
     // Always the CURRENT edited payload (review edits — value changes, deletions, moves, added rows —
@@ -4051,6 +4070,7 @@ function FIMSApp() {
     };
     if (!window.confirm(`Send ${totalRowsToSend} item${totalRowsToSend === 1 ? '' : 's'} to ${customer}?`)) return;
     setPushStatus(prev => ({ ...prev, [customer]: { state: 'pushing', message: '', unmatched } }));
+    pushInFlightRef.current.add(customer);
     try {
       const res = await fetch('/api/customer-sheets/push', {
         method: 'POST',
@@ -4094,6 +4114,14 @@ function FIMSApp() {
       refreshReview(customer);
     } catch (e) {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: e.message || 'Network error — could not reach the server.', unmatched } }));
+    } finally {
+      pushInFlightRef.current.delete(customer);
+      // Anything that tried to push this same customer while this one was running gets its turn now —
+      // fresh payload, fresh confirm() — never racing what this call just finished sending.
+      if (pushQueuedRef.current.has(customer)) {
+        pushQueuedRef.current.delete(customer);
+        pushCustomerSheetNow(customer);
+      }
     }
   };
   const [syncStatus, setSyncStatus] = useState({}); // { [customer]: { state: 'syncing'|'done'|'error', message } }
