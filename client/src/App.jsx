@@ -5120,11 +5120,22 @@ function FIMSApp() {
                 <div className="panel">
                   <h2 style={{ marginBottom: 6 }}>Push Status</h2>
                   {Object.entries(pushStatus).filter(([, s]) => s && s.state && s.state !== 'idle').map(([customer, s]) => (
-                    <div key={customer} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                      <strong>{customer}:</strong>
-                      {s.state === 'pushing' && <span className="doc-hint"><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle', marginRight: 4 }} />pushing…</span>}
-                      {s.state === 'done' && <span className="doc-hint" style={{ color: 'var(--ok)' }}>✓ {s.message}</span>}
-                      {s.state === 'error' && <span style={{ color: 'var(--ledger-red)', fontSize: 12.5 }}>{s.message}</span>}
+                    <div key={customer} style={{ marginBottom: 6 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <strong>{customer}:</strong>
+                        {s.state === 'pushing' && <span className="doc-hint"><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle', marginRight: 4 }} />pushing…</span>}
+                        {s.state === 'done' && <span className="doc-hint" style={{ color: 'var(--ok)' }}>✓ {s.message}</span>}
+                        {s.state === 'error' && <span style={{ color: 'var(--ledger-red)', fontSize: 12.5 }}>{s.message}</span>}
+                      </div>
+                      {/* Never silent: an item with no Sheet Tab mapped yet is confirmed but deliberately
+                          left out of what gets sent (see buildCustomerSheetPayloadFromRows) — this is the
+                          only place that ever said so. Shown for every state (pushing/done/error), since
+                          it's known before the request even goes out and stays true either way. */}
+                      {s.unmatched && s.unmatched.length > 0 && (
+                        <div style={{ color: 'var(--ledger-red)', fontSize: 12.5, marginTop: 2 }}>
+                          ⚠ Not sent — no Sheet Tab mapped yet for: {s.unmatched.join(', ')}. Map {s.unmatched.length === 1 ? 'it' : 'them'} in the Known Product Catalog, then push again.
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
