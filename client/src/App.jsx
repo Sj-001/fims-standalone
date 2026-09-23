@@ -4178,6 +4178,21 @@ function FIMSApp() {
       }
     }
   };
+  // The only way to push has always been confirming a PENDING row (individually, by group, or in bulk)
+  // — there was never a way to (re)push something already confirmed but never actually sent, e.g. a row
+  // whose tab/block was picked and confirmed in the same action that (before the routingOverrides fix
+  // above) silently missed its own push. That row is stockConfirmed, gone from Pending Review, with no
+  // button left anywhere to trigger it — confirmed directly as a real dead end. This is the explicit,
+  // visible way out: push exactly what's currently confirmed-but-unsent for ONE customer, nothing more
+  // (same "never sweep in something from an unrelated action" rule — this IS the action, chosen on
+  // purpose, not an implicit side effect of pushing something else).
+  const pushOutstandingForCustomer = (customer) => {
+    pushCustomerSheetNow(
+      customer,
+      confirmedProductionRows.filter(r => !r.pushedToSheet && (r.confirmedCustomer || '').trim() === customer),
+      confirmedDispatchRows.filter(r => !r.pushedToSheet && (r.confirmedCustomer || '').trim() === customer),
+    );
+  };
   const [syncStatus, setSyncStatus] = useState({}); // { [customer]: { state: 'syncing'|'done'|'error', message } }
   // Finds the item name this app would normally use for a real block, so a row pulled in from the Sheet
   // groups correctly with everything else already tracked for that item instead of starting a stray
@@ -5650,6 +5665,7 @@ function FIMSApp() {
               {allCustomerTabNames.map(customer => {
                 const { itemGroups } = buildCustomerSheetPayload(customer);
                 const variantCount = itemGroups.reduce((s, g) => s + (g.variants || []).length, 0);
+                const outstandingRowCount = itemGroups.reduce((s, g) => s + (g.variants || []).reduce((s2, v) => s2 + (v.rows || []).length, 0), 0);
                 const sheetId = getCustomerSheetId(customer);
                 const registryEntry = customerSheetIds.find(c => c.customer === customer);
                 return (
@@ -5663,6 +5679,11 @@ function FIMSApp() {
                         </p>
                       </div>
                       <div style={{ display: 'flex', gap: 8 }}>
+                        {outstandingRowCount > 0 && (
+                          <button className="btn btn-primary" onClick={() => pushOutstandingForCustomer(customer)} disabled={!sheetId.trim()} title="Push everything already confirmed for this customer that hasn't reached the Sheet yet — e.g. a row confirmed here but never actually sent">
+                            <FileSpreadsheet size={15} /> Push outstanding ({outstandingRowCount})
+                          </button>
+                        )}
                         <button className="btn btn-ghost" onClick={() => syncFromSheet(customer)} disabled={syncStatus[customer]?.state === 'syncing' || !sheetId.trim()} title="Read this customer's Sheet and pull in any rows added directly there by hand — never writes anything to the Sheet itself">
                           <Download size={15} /> Sync entries
                         </button>
@@ -5671,6 +5692,14 @@ function FIMSApp() {
                         </button>
                       </div>
                     </div>
+                    {pushStatus[customer]?.state === 'pushing' && <div className="doc-hint" style={{ marginTop: 6 }}><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle', marginRight: 4 }} />pushing…</div>}
+                    {pushStatus[customer]?.state === 'done' && <div className="doc-hint" style={{ marginTop: 6, color: 'var(--ok)' }}>✓ {pushStatus[customer].message}</div>}
+                    {pushStatus[customer]?.state === 'error' && <div style={{ marginTop: 6, color: 'var(--ledger-red)', fontSize: 12.5 }}>{pushStatus[customer].message}</div>}
+                    {pushStatus[customer]?.unmatched?.length > 0 && (
+                      <div style={{ marginTop: 2, color: 'var(--ledger-red)', fontSize: 12.5 }}>
+                        ⚠ Not sent — no Sheet Tab mapped yet for: {pushStatus[customer].unmatched.join(', ')}. Map {pushStatus[customer].unmatched.length === 1 ? 'it' : 'them'} in the Known Product Catalog, then push again.
+                      </div>
+                    )}
                     {syncStatus[customer]?.state === 'syncing' && <div className="doc-hint" style={{ marginTop: 6 }}><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle', marginRight: 4 }} />syncing…</div>}
                     {syncStatus[customer]?.state === 'done' && <div className="doc-hint" style={{ marginTop: 6, color: 'var(--ok)' }}>✓ {syncStatus[customer].message}</div>}
                     {syncStatus[customer]?.state === 'error' && <div style={{ marginTop: 6, color: 'var(--ledger-red)', fontSize: 12.5 }}>{syncStatus[customer].message}</div>}
