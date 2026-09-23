@@ -3185,21 +3185,36 @@ function FIMSApp() {
   const pushPendingRows = (registerKey, rows) => {
     const resolved = rows.filter(r => r.confirmedCustomer || isKnownCustomerGuess(r));
     const skipped = rows.length - resolved.length;
-    const byCustomer = new Map();
+    const byCustomer = new Map(); // customer -> { rows: [...], routingOverrides: { [normalizedItemKey]: {sheetGroup, block} } }
     resolved.forEach(r => {
       const customer = (r.confirmedCustomer || matchCustomer(r)).trim() || 'Unassigned';
+      // Read BEFORE confirmStockRow — it registers this same draft into the Product Catalog
+      // (registerAliases) and then clears it, but that catalog write is an async state update that
+      // hasn't actually landed by the time this same action goes on to build the push payload below.
+      // Without capturing it here too, a row whose tab/block was JUST picked (an item the catalog
+      // didn't already know) would get confirmed and silently left out of its own push — the
+      // payload-builder would still see the catalog as it was before this pick, find no routing, and
+      // drop it into "unmatched" with no error shown anywhere. Confirmed directly as a real, silent miss.
+      const tabBlockDraft = pendingTabBlockForms[r.id];
       confirmStockRow(registerKey, r, customer);
       if (customer === 'Unassigned') return; // never auto-pushed — needs a deliberate pick first
-      if (!byCustomer.has(customer)) byCustomer.set(customer, []);
-      byCustomer.get(customer).push({ ...r, confirmedCustomer: customer, stockConfirmed: true });
+      if (!byCustomer.has(customer)) byCustomer.set(customer, { rows: [], routingOverrides: {} });
+      const bucket = byCustomer.get(customer);
+      bucket.rows.push({ ...r, confirmedCustomer: customer, stockConfirmed: true });
+      const draftSheetGroup = (tabBlockDraft && tabBlockDraft.sheetGroup || '').trim();
+      if (draftSheetGroup) {
+        const key = normalizeForCatalogMatch(r.description || '');
+        bucket.routingOverrides[key] = { sheetGroup: draftSheetGroup, block: (tabBlockDraft.block || r.description || '').trim() };
+      }
     });
     if (skipped > 0) window.alert(`Confirmed ${resolved.length} row${resolved.length === 1 ? '' : 's'}. Skipped ${skipped} row${skipped === 1 ? '' : 's'} whose customer couldn't be matched automatically — pick a customer in the dropdown for ${skipped === 1 ? 'it' : 'them'}, then push again.`);
-    byCustomer.forEach((confirmedRows, customer) => {
+    byCustomer.forEach(({ rows: confirmedRows, routingOverrides }, customer) => {
       if (!getCustomerSheetId(customer).trim()) return; // no Sheet linked yet — confirmed locally, nothing to push to
       pushCustomerSheetNow(
         customer,
         registerKey === 'production' ? confirmedRows : [],
         registerKey === 'customerDispatch' ? confirmedRows : [],
+        routingOverrides,
       );
     });
   };
@@ -3451,7 +3466,7 @@ function FIMSApp() {
   // to be sitting around unpushed for the same customer. See pushCustomerSheetNow, the only place that
   // decides what actually gets sent — it calls buildCustomerSheetPayloadFromRows directly with the
   // specific rows it was handed, never this function.
-  const buildCustomerSheetPayloadFromRows = (customer, productionRows, dispatchRows) => {
+  const buildCustomerSheetPayloadFromRows = (customer, productionRows, dispatchRows, routingOverrides = {}) => {
     const groups = buildStockGroupsFrom(productionRows, dispatchRows).filter(g => g.customer === customer);
     const sheetGroupByItem = {};
     const blockByItem = {};
@@ -3459,6 +3474,18 @@ function FIMSApp() {
       const key = normalizeForCatalogMatch(c.item);
       sheetGroupByItem[key] = (c.sheetGroup || c.item || '').trim();
       if (c.block && c.block.trim()) blockByItem[key] = c.block.trim();
+    });
+    // A tab/block picked on a Pending Review row for an item the catalog didn't already know is
+    // registered into the Product Catalog (registerAliases) at confirm time — but that's an async state
+    // update that hasn't landed yet in THIS render, so the loop above would never see it if this same
+    // action goes straight on to push. Confirmed directly as a real, silent miss: a freshly-routed
+    // production entry got confirmed and simply never sent, with no error, no warning — it just fell
+    // into `unmatched` below as if nothing had been picked for it at all. Layering the just-picked
+    // routing on top here, keyed exactly like the catalog map above, is what makes a routed-and-pushed
+    // row actually go out in the SAME action it was routed in, not just the one after.
+    Object.entries(routingOverrides).forEach(([key, o]) => {
+      sheetGroupByItem[key] = o.sheetGroup;
+      if (o.block) blockByItem[key] = o.block;
     });
     const unmatched = [];
     const tabsMap = {};
@@ -3550,8 +3577,8 @@ function FIMSApp() {
     const { itemGroups, unmatched } = buildCustomerSheetPayload(customer);
     return { itemGroups: applyReviewEdits(itemGroups, reviewEdits[customer]), unmatched };
   };
-  const getEditedPayloadFromRows = (customer, productionRows, dispatchRows) => {
-    const { itemGroups, unmatched } = buildCustomerSheetPayloadFromRows(customer, productionRows, dispatchRows);
+  const getEditedPayloadFromRows = (customer, productionRows, dispatchRows, routingOverrides) => {
+    const { itemGroups, unmatched } = buildCustomerSheetPayloadFromRows(customer, productionRows, dispatchRows, routingOverrides);
     return { itemGroups: applyReviewEdits(itemGroups, reviewEdits[customer]), unmatched };
   };
   // Declared up here (rather than down by the rest of their assign-form logic, further below) because
@@ -3992,7 +4019,7 @@ function FIMSApp() {
   // silently riding along with a completely different, later push — explicit instruction after that
   // caused real confusion and a real duplicated row: what you push is exactly and only what was just
   // confirmed, every time, no exceptions.
-  const pushCustomerSheetNow = async (customer, productionRows, dispatchRows) => {
+  const pushCustomerSheetNow = async (customer, productionRows, dispatchRows, routingOverrides = {}) => {
     const sheetId = getCustomerSheetId(customer).trim();
     if (!sheetId) {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Add a Google Sheet ID for this customer first (see field above).' } }));
@@ -4003,17 +4030,18 @@ function FIMSApp() {
     // up in the meantime is dropped. They go out, still as their own exact set, the moment the
     // in-flight one finishes.
     if (pushInFlightRef.current.has(customer)) {
-      const existing = pushQueuedRef.current.get(customer) || { productionRows: [], dispatchRows: [] };
+      const existing = pushQueuedRef.current.get(customer) || { productionRows: [], dispatchRows: [], routingOverrides: {} };
       pushQueuedRef.current.set(customer, {
         productionRows: [...existing.productionRows, ...productionRows],
         dispatchRows: [...existing.dispatchRows, ...dispatchRows],
+        routingOverrides: { ...existing.routingOverrides, ...routingOverrides },
       });
       return;
     }
     // Always the CURRENT edited payload (review edits — value changes, deletions, moves, added rows —
     // applied on top of exactly the rows this call was given), so what gets written always matches
     // exactly what was just confirmed — never anything else outstanding for this customer.
-    const { itemGroups, unmatched } = getEditedPayloadFromRows(customer, productionRows, dispatchRows);
+    const { itemGroups, unmatched } = getEditedPayloadFromRows(customer, productionRows, dispatchRows, routingOverrides);
     // "Items" in this message means individual dated entries, not products/variants — confirmed
     // directly as confusing wording once before: counting itemGroups (products) instead of entries made
     // "Sent 8 items" read as if only 8 things total existed, when it actually meant "8 different
@@ -4146,7 +4174,7 @@ function FIMSApp() {
       const queued = pushQueuedRef.current.get(customer);
       if (queued) {
         pushQueuedRef.current.delete(customer);
-        pushCustomerSheetNow(customer, queued.productionRows, queued.dispatchRows);
+        pushCustomerSheetNow(customer, queued.productionRows, queued.dispatchRows, queued.routingOverrides);
       }
     }
   };
