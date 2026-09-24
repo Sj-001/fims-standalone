@@ -601,15 +601,40 @@ function dateSortKey(raw) {
 const REAL_DATE_RE = /^\d{1,2}\.\d{1,2}\.\d{2,4}$/;
 // Rows genuinely representing the SAME real-world line, extracted twice (the same page uploaded twice,
 // or included in two overlapping photos), should never both land in a register — see addRows, which
-// uses this to skip a newly-extracted row that already exactly matches one already there. Matched by
-// every real data field EXCEPT id/confirmation-state (id, stockConfirmed, confirmedCustomer, flagged,
-// flagReason — which legitimately differ for what's otherwise the same entry). Deliberately EXACT, not
-// fuzzy: a looser match (say, just date+description) risks silently dropping a genuinely different row
-// that happens to share those two fields, which is a far worse failure than occasionally missing a
-// duplicate whose OCR reading varied slightly between two extractions of the same page.
-const DEDUP_EXCLUDE_FIELDS = new Set(['id', 'stockConfirmed', 'confirmedCustomer', 'flagged', 'flagReason']);
-function rowDedupKey(row) {
-  return Object.keys(row).filter(k => !DEDUP_EXCLUDE_FIELDS.has(k)).sort()
+// uses this to skip a newly-extracted row that already exactly matches one already there. Deliberately
+// EXACT, not fuzzy: a looser match (say, just date+description) risks silently dropping a genuinely
+// different row that happens to share those two fields, which is a far worse failure than occasionally
+// missing a duplicate whose OCR reading varied slightly between two extractions of the same page.
+//
+// Matched by an EXPLICIT, fixed field list per register — never by "whatever keys happen to be on this
+// particular object" (Object.keys(row)). That used to be the whole key: filter out a few known
+// lifecycle fields (id, stockConfirmed, confirmedCustomer, flagged, flagReason) and hash the rest. It
+// silently broke the moment TWO DIFFERENT CODE PATHS produce rows with different shapes for the exact
+// same real entry — confirmed directly as a real duplicate: an extraction-shaped production row (always
+// carries shade/size/gsm/weight, even blank, for Style B) and a row pulled in via Sync from Sheet
+// (carries pushedToSheet/pulledFromSheet instead, never shade/size/gsm/weight) hashed to two completely
+// different keys for what was the same physical entry, so the "already here" check never found a match,
+// ever, for that row — regardless of how many times it got re-extracted. An explicit field list is
+// immune to this: it only ever looks at the fields that actually define a row's real-world identity for
+// that register, so an extra or missing bookkeeping field from any current or future code path can never
+// affect the result.
+const DEDUP_FIELDS = {
+  rawMaterialIn: ['date', 'mill', 'reel_no', 'size', 'unit', 'gsm', 'bf', 'shade', 'weight_kg'],
+  consumption: ['sl_no', 'date', 'shade', 'size', 'gsm', 'weight_consumed', 'leftover_weight'],
+  production: ['date', 'party', 'description', 'customerHint', 'pieces', 'dispatch'],
+  customerDispatch: ['date', 'invoice_no', 'party', 'buyer_order_no', 'description', 'quantity', 'rate', 'amount'],
+  daburPO: ['po_number', 'date', 'material_desc', 'hsn', 'quantity', 'rate', 'delivery_date'],
+  daburDispatch: ['date', 'invoice_no', 'party', 'buyer_order_no', 'description', 'quantity', 'rate', 'amount'],
+  daburSpecs: [
+    'item_code', 'item_name', 'no_of_ply', 'box_length_mm', 'box_width_mm', 'box_height_mm', 'paper_comb',
+    'box_length_inch', 'box_width_inch', 'box_height_inch', 'sheet_size_inch', 'no_of_partitions',
+    'paper_comb_partitions', 'partition_longer_piece', 'partition_shorter_piece', 'partition_longer_piece_inch',
+    'partition_shorter_piece_inch', 'partition_longer_qty', 'partition_shorter_qty', 'no_of_plate',
+    'paper_comb_plate', 'plate_size_mm', 'plate_size_inch',
+  ],
+};
+function rowDedupKey(fields, row) {
+  return fields
     .map(k => `${k}=${typeof row[k] === 'number' ? row[k] : String(row[k] ?? '').trim().toLowerCase()}`)
     .join('|');
 }
@@ -2007,10 +2032,10 @@ function FIMSApp() {
     let toAdd = rows;
     let skipped = 0;
     if (DEDUP_REGISTERS.has(registerKey)) {
-      const existingKeys = new Set((registerState[registerKey] || []).map(dedupKeyForRow));
+      const existingKeys = new Set((registerState[registerKey] || []).map(r => dedupKeyForRow(registerKey, r)));
       const seenInBatch = new Set();
       toAdd = rows.filter(r => {
-        const key = dedupKeyForRow(r);
+        const key = dedupKeyForRow(registerKey, r);
         if (existingKeys.has(key) || seenInBatch.has(key)) { skipped++; return false; }
         seenInBatch.add(key);
         return true;
@@ -2911,7 +2936,11 @@ function FIMSApp() {
   // risks the opposite, worse failure: silently treating two genuinely different rows as duplicates and
   // dropping a real one. Only touches `description`; every other field still goes through rowDedupKey
   // completely unmodified.
-  const dedupKeyForRow = (row) => (row && row.description) ? rowDedupKey({ ...row, description: applyAbbreviations(String(row.description)) }) : rowDedupKey(row);
+  const dedupKeyForRow = (registerKey, row) => {
+    const fields = DEDUP_FIELDS[registerKey];
+    const r = (row && row.description) ? { ...row, description: applyAbbreviations(String(row.description)) } : row;
+    return rowDedupKey(fields, r);
+  };
   // date + normalized description ONLY — deliberately ignores every numeric field, unlike
   // dedupKeyForRow. This is what lets flagLikelyReReadDuplicates (below) recognize "same real row" even
   // when a number was misread, which an exact/near-exact dedup key never can (the numbers genuinely
@@ -2964,7 +2993,7 @@ function FIMSApp() {
       if (isDescriptionBased && !r.description) return r;
       const loose = looseKeyOf(r);
       const match = existing.find(e => (isDescriptionBased ? !!e.description : true) && looseKeyOf(e) === loose);
-      if (!match || dedupKeyForRow(match) === dedupKeyForRow(r)) return r;
+      if (!match || dedupKeyForRow(registerKey, match) === dedupKeyForRow(registerKey, r)) return r;
       const reason = isDescriptionBased
         ? `Looks like the same entry as an existing confirmed row from ${match.date} ("${match.description}") — but the numbers on this reading don't match that entry. Check the original document before confirming; this may be a misread re-extraction of a row already in the register.`
         : registerKey === 'rawMaterialIn'
@@ -2989,8 +3018,8 @@ function FIMSApp() {
   const dropAlreadyConfirmedDuplicates = (registerKey, rows, extraExisting = []) => {
     const existing = [...(registerState[registerKey] || []), ...extraExisting];
     if (!existing.length) return rows;
-    const existingKeys = new Set(existing.map(dedupKeyForRow));
-    return rows.filter(r => r.flagged || !existingKeys.has(dedupKeyForRow(r)));
+    const existingKeys = new Set(existing.map(r => dedupKeyForRow(registerKey, r)));
+    return rows.filter(r => r.flagged || !existingKeys.has(dedupKeyForRow(registerKey, r)));
   };
   /* -------- product catalog (editable; populated via Customer Sheets tab's Sheet-ID import) -------- */
   const persistCatalog = (next) => {
