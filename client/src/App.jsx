@@ -2256,8 +2256,15 @@ function FIMSApp() {
       }, (secondsLeft) => {
         setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
       });
-      const shapedRows = flagLikelyReReadDuplicates(pageConfig.register, pageConfig.shape(raw));
-      const rows = dropAlreadyConfirmedDuplicates(pageConfig.register, shapedRows);
+      // Rows from other pages already extracted (but not yet confirmed) for this SAME register — see
+      // flagLikelyReReadDuplicates' comment. fileResults is fresh here (this function call is a fresh
+      // closure each time it fires), so this reads whatever's actually sitting in the review queue right
+      // now, not a stale snapshot.
+      const extraExistingForDedup = fileResults
+        .filter(r => r.id !== current.id && (DOCUMENT_TYPES.find(d => d.key === r.docTypeKey) || {}).register === pageConfig.register)
+        .flatMap(r => r.rows || []);
+      const shapedRows = flagLikelyReReadDuplicates(pageConfig.register, pageConfig.shape(raw), extraExistingForDedup);
+      const rows = dropAlreadyConfirmedDuplicates(pageConfig.register, shapedRows, extraExistingForDedup);
       if (!rows.length && !truncated) {
         // A clean, confident "nothing here" result (a duplicate copy, an e-Way Bill page, a non-spec
         // page) needs zero decisions from anyone — it's removed from the queue right away instead of
@@ -2305,6 +2312,13 @@ function FIMSApp() {
     let haltedForRetry = false;
     let lastHaltError = null;
     let cancelled = false;
+    // Rows extracted so far in THIS SAME batch run, per register — fileResults (component state) is a
+    // stale snapshot for the rest of this loop no matter how many setFileResults calls already fired,
+    // since this whole function is one continuous execution, not a fresh render per target. Without this
+    // local accumulator, two pages in one "Extract all" both capturing the same physical entries (new
+    // rows added below old ones on the same sheet, whole page rephotographed) would each check dedup
+    // against an "existing" set that has neither of them — see flagLikelyReReadDuplicates' comment.
+    const extractedThisRunByRegister = {};
     for (let t = 0; t < targets.length; t++) {
       const p = targets[t];
       // skip files that were removed from the queue mid-batch (e.g. via the × on a thumbnail)
@@ -2328,7 +2342,9 @@ function FIMSApp() {
         }, (secondsLeft) => {
           setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
         });
-        const rows = dropAlreadyConfirmedDuplicates(pageConfig.register, flagLikelyReReadDuplicates(pageConfig.register, pageConfig.shape(raw)));
+        const extraExistingForDedup = extractedThisRunByRegister[pageConfig.register] || [];
+        const rows = dropAlreadyConfirmedDuplicates(pageConfig.register, flagLikelyReReadDuplicates(pageConfig.register, pageConfig.shape(raw), extraExistingForDedup), extraExistingForDedup);
+        extractedThisRunByRegister[pageConfig.register] = [...extraExistingForDedup, ...rows];
         anySucceeded = true;
         if (!rows.length && !truncated) {
           // Same reasoning as the single-file path (runExtraction): a clean, confident "nothing here"
@@ -2930,11 +2946,17 @@ function FIMSApp() {
   // one. This flags it instead — visible in the normal pre-confirm review UI (the same red-highlight/
   // warning-icon flag every other extraction uncertainty already uses) — so a person decides which
   // reading is actually right, rather than either one just winning by default.
-  const flagLikelyReReadDuplicates = (registerKey, rows) => {
+  // extraExisting: rows already extracted earlier in the SAME "Extract all" batch, for this same
+  // register, but not yet confirmed/added — so not yet in registerState. Without these, two pages
+  // uploaded together that both capture the same physical entries (routine here: new rows get added
+  // below old ones on the same sheet, and the whole page gets rephotographed) each pass their OWN dedup
+  // check clean, since neither has been confirmed yet and so neither sees the other as "already there."
+  // Confirmed directly as the cause of real duplicate rows landing in the Production Register.
+  const flagLikelyReReadDuplicates = (registerKey, rows, extraExisting = []) => {
     const isDescriptionBased = registerKey === 'production' || registerKey === 'customerDispatch';
     const isStructured = !!STRUCTURED_LOOSE_KEY_FIELDS[registerKey];
     if (!isDescriptionBased && !isStructured) return rows;
-    const existing = registerState[registerKey] || [];
+    const existing = [...(registerState[registerKey] || []), ...extraExisting];
     const looseKeyOf = isDescriptionBased ? looseDateDescKey : (r) => structuredLooseKey(registerKey, r);
     return rows.map(r => {
       if (r.flagged) return r;
@@ -2963,8 +2985,8 @@ function FIMSApp() {
   // only a visibility one. Never touches a flagged row: flagLikelyReReadDuplicates already decided that
   // one needs a person's eyes (a misread re-extraction, not a clean duplicate), and a byte-exact
   // duplicate is never flagged in the first place, so this ordering never conflicts with that check.
-  const dropAlreadyConfirmedDuplicates = (registerKey, rows) => {
-    const existing = registerState[registerKey] || [];
+  const dropAlreadyConfirmedDuplicates = (registerKey, rows, extraExisting = []) => {
+    const existing = [...(registerState[registerKey] || []), ...extraExisting];
     if (!existing.length) return rows;
     const existingKeys = new Set(existing.map(dedupKeyForRow));
     return rows.filter(r => r.flagged || !existingKeys.has(dedupKeyForRow(r)));
