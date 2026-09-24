@@ -5243,53 +5243,79 @@ function FIMSApp() {
                       onBulkChange={updatePendingCustomerBulk('production')}
                       onConfirmGroup={() => pushPendingRows('production', group.rows)} />
                   ))}
-                  <div className="table-wrap">
-                    <table>
-                      <thead><tr><th>Date</th><th>Description</th><th>Pieces</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
-                      <tbody>
-                        {pendingProductionRows.map(row => {
-                          const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
-                          const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
-                          const needsTabBlock = effectiveCustomer && !catalogEntry;
-                          const draft = pendingTabBlockForms[row.id];
-                          const tabBlockUnresolved = needsTabBlock && (!((draft && draft.sheetGroup) || '').trim() || !((draft && draft.block) || '').trim());
-                          return (
-                          <tr key={row.id} className={tabBlockUnresolved ? 'needs-tabblock-row' : ''}>
-                            <td style={{ padding: '6px 10px' }}>{row.date}</td>
-                            <td style={{ padding: '6px 10px' }}>{row.description}</td>
-                            <td style={{ padding: '6px 10px' }}>{row.pieces || ''}</td>
-                            <td>
-                              <CustomerSuggestCell value={row.confirmedCustomer} guess={matchCustomer(row)}
-                                isKnownGuess={isKnownCustomerGuess(row)} knownCustomers={allCustomerTabNames}
-                                onChange={v => updatePendingCustomer('production')(row.id, v)} />
-                            </td>
-                            {needsTabBlock ? (
-                              <TabBlockPickerCells rowId={row.id} description={row.description}
-                                sheetGroupOptions={Array.from(new Set([
-                                  ...productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup),
-                                  ...getRealTabNamesForCustomer(effectiveCustomer),
-                                ])).filter(Boolean)}
-                                blockOptions={Array.from(new Set([
-                                  ...getRealBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || ''),
-                                  ...getCatalogBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || ''),
-                                ])).filter(Boolean)}
-                                draft={draft} onChange={(field, value) => updatePendingTabBlockForm(row.id, field, value)} />
-                            ) : (
-                              <>
-                                <td className="doc-hint">{catalogEntry ? (catalogEntry.sheetGroup || catalogEntry.item) : ''}</td>
-                                <td className="doc-hint">{catalogEntry ? (catalogEntry.block || catalogEntry.item) : ''}</td>
-                              </>
-                            )}
-                            <td className="col-action">
-                              <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm & push this row" onClick={() => pushPendingRows('production', [row])}><CheckCircle2 size={16} /></button>
-                              <button className="icon-btn danger" title="Delete this row entirely" onClick={() => { if (window.confirm('Delete this row from the Production Register entirely?')) deleteRow('production')(row.id); }}><Trash2 size={15} /></button>
-                            </td>
-                          </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
+                  {(() => {
+                    // Split so the table always shows exactly "what Push to Sheet would actually send
+                    // right now" first — Unassigned rows never get auto-pushed (see pushPendingRows), so
+                    // mixed in with the rest they just looked like noise in the main list. Unassigned
+                    // ones move to their own section below, clearly separated, instead of interleaved.
+                    const isRowAssigned = (row) => !!(row.confirmedCustomer || isKnownCustomerGuess(row));
+                    const assignedRows = pendingProductionRows.filter(isRowAssigned);
+                    const unassignedRows = pendingProductionRows.filter(r => !isRowAssigned(r));
+                    const renderRow = (row) => {
+                      const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
+                      const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
+                      const needsTabBlock = effectiveCustomer && !catalogEntry;
+                      const draft = pendingTabBlockForms[row.id];
+                      const tabBlockUnresolved = needsTabBlock && (!((draft && draft.sheetGroup) || '').trim() || !((draft && draft.block) || '').trim());
+                      return (
+                      <tr key={row.id} className={tabBlockUnresolved ? 'needs-tabblock-row' : ''}>
+                        <td style={{ padding: '6px 10px' }}>{row.date}</td>
+                        <td style={{ padding: '6px 10px' }}>{row.description}</td>
+                        <td style={{ padding: '6px 10px' }}>{row.pieces || ''}</td>
+                        <td>
+                          <CustomerSuggestCell value={row.confirmedCustomer} guess={matchCustomer(row)}
+                            isKnownGuess={isKnownCustomerGuess(row)} knownCustomers={allCustomerTabNames}
+                            onChange={v => updatePendingCustomer('production')(row.id, v)} />
+                        </td>
+                        {needsTabBlock ? (
+                          <TabBlockPickerCells rowId={row.id} description={row.description}
+                            sheetGroupOptions={Array.from(new Set([
+                              ...productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup),
+                              ...getRealTabNamesForCustomer(effectiveCustomer),
+                            ])).filter(Boolean)}
+                            blockOptions={Array.from(new Set([
+                              ...getRealBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || ''),
+                              ...getCatalogBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || ''),
+                            ])).filter(Boolean)}
+                            draft={draft} onChange={(field, value) => updatePendingTabBlockForm(row.id, field, value)} />
+                        ) : (
+                          <>
+                            <td className="doc-hint">{catalogEntry ? (catalogEntry.sheetGroup || catalogEntry.item) : ''}</td>
+                            <td className="doc-hint">{catalogEntry ? (catalogEntry.block || catalogEntry.item) : ''}</td>
+                          </>
+                        )}
+                        <td className="col-action">
+                          <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm & push this row" onClick={() => pushPendingRows('production', [row])}><CheckCircle2 size={16} /></button>
+                          <button className="icon-btn danger" title="Delete this row entirely" onClick={() => { if (window.confirm('Delete this row from the Production Register entirely?')) deleteRow('production')(row.id); }}><Trash2 size={15} /></button>
+                        </td>
+                      </tr>
+                      );
+                    };
+                    return (
+                      <>
+                        <div className="table-wrap">
+                          <table>
+                            <thead><tr><th>Date</th><th>Description</th><th>Pieces</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
+                            <tbody>{assignedRows.map(renderRow)}</tbody>
+                          </table>
+                        </div>
+                        {unassignedRows.length > 0 && (
+                          <>
+                            <div className="stock-section-divider" style={{ marginTop: 14 }}>
+                              <span className="stock-section-divider-label">Unassigned ({unassignedRows.length})</span>
+                              <span className="doc-hint" style={{ marginLeft: 8 }}>No known customer guessed — pick one above before these can be pushed.</span>
+                            </div>
+                            <div className="table-wrap">
+                              <table>
+                                <thead><tr><th>Date</th><th>Description</th><th>Pieces</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
+                                <tbody>{unassignedRows.map(renderRow)}</tbody>
+                              </table>
+                            </div>
+                          </>
+                        )}
+                      </>
+                    );
+                  })()}
                 </div>
               )}
               {pendingDispatchRows.length > 0 && (
@@ -5307,54 +5333,78 @@ function FIMSApp() {
                       onBulkChange={updatePendingCustomerBulk('customerDispatch')}
                       onConfirmGroup={() => pushPendingRows('customerDispatch', group.rows)} />
                   ))}
-                  <div className="table-wrap">
-                    <table>
-                      <thead><tr><th>Date</th><th>Invoice No</th><th>Description</th><th>Quantity</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
-                      <tbody>
-                        {pendingDispatchRows.map(row => {
-                          const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
-                          const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
-                          const needsTabBlock = effectiveCustomer && !catalogEntry;
-                          const draft = pendingTabBlockForms[row.id];
-                          const tabBlockUnresolved = needsTabBlock && (!((draft && draft.sheetGroup) || '').trim() || !((draft && draft.block) || '').trim());
-                          return (
-                          <tr key={row.id} className={tabBlockUnresolved ? 'needs-tabblock-row' : ''}>
-                            <td style={{ padding: '6px 10px' }}>{row.date}</td>
-                            <td style={{ padding: '6px 10px' }}>{row.invoice_no}</td>
-                            <td style={{ padding: '6px 10px' }}>{row.description}</td>
-                            <td style={{ padding: '6px 10px' }}>{row.quantity || ''}</td>
-                            <td>
-                              <CustomerSuggestCell value={row.confirmedCustomer} guess={matchCustomer(row)}
-                                isKnownGuess={isKnownCustomerGuess(row)} knownCustomers={allCustomerTabNames}
-                                onChange={v => updatePendingCustomer('customerDispatch')(row.id, v)} />
-                            </td>
-                            {needsTabBlock ? (
-                              <TabBlockPickerCells rowId={row.id} description={row.description}
-                                sheetGroupOptions={Array.from(new Set([
-                                  ...productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup),
-                                  ...getRealTabNamesForCustomer(effectiveCustomer),
-                                ])).filter(Boolean)}
-                                blockOptions={Array.from(new Set([
-                                  ...getRealBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || ''),
-                                  ...getCatalogBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || ''),
-                                ])).filter(Boolean)}
-                                draft={draft} onChange={(field, value) => updatePendingTabBlockForm(row.id, field, value)} />
-                            ) : (
-                              <>
-                                <td className="doc-hint">{catalogEntry ? (catalogEntry.sheetGroup || catalogEntry.item) : ''}</td>
-                                <td className="doc-hint">{catalogEntry ? (catalogEntry.block || catalogEntry.item) : ''}</td>
-                              </>
-                            )}
-                            <td className="col-action">
-                              <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm & push this row" onClick={() => pushPendingRows('customerDispatch', [row])}><CheckCircle2 size={16} /></button>
-                              <button className="icon-btn danger" title="Delete this row entirely" onClick={() => { if (window.confirm('Delete this row from the Customer Dispatch Bills register entirely?')) deleteRow('customerDispatch')(row.id); }}><Trash2 size={15} /></button>
-                            </td>
-                          </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
+                  {(() => {
+                    // Same split as Pending Production Review — see its comment. Unassigned rows never
+                    // get auto-pushed, so they move to their own section below the ones actually ready.
+                    const isRowAssigned = (row) => !!(row.confirmedCustomer || isKnownCustomerGuess(row));
+                    const assignedRows = pendingDispatchRows.filter(isRowAssigned);
+                    const unassignedRows = pendingDispatchRows.filter(r => !isRowAssigned(r));
+                    const renderRow = (row) => {
+                      const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
+                      const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
+                      const needsTabBlock = effectiveCustomer && !catalogEntry;
+                      const draft = pendingTabBlockForms[row.id];
+                      const tabBlockUnresolved = needsTabBlock && (!((draft && draft.sheetGroup) || '').trim() || !((draft && draft.block) || '').trim());
+                      return (
+                      <tr key={row.id} className={tabBlockUnresolved ? 'needs-tabblock-row' : ''}>
+                        <td style={{ padding: '6px 10px' }}>{row.date}</td>
+                        <td style={{ padding: '6px 10px' }}>{row.invoice_no}</td>
+                        <td style={{ padding: '6px 10px' }}>{row.description}</td>
+                        <td style={{ padding: '6px 10px' }}>{row.quantity || ''}</td>
+                        <td>
+                          <CustomerSuggestCell value={row.confirmedCustomer} guess={matchCustomer(row)}
+                            isKnownGuess={isKnownCustomerGuess(row)} knownCustomers={allCustomerTabNames}
+                            onChange={v => updatePendingCustomer('customerDispatch')(row.id, v)} />
+                        </td>
+                        {needsTabBlock ? (
+                          <TabBlockPickerCells rowId={row.id} description={row.description}
+                            sheetGroupOptions={Array.from(new Set([
+                              ...productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup),
+                              ...getRealTabNamesForCustomer(effectiveCustomer),
+                            ])).filter(Boolean)}
+                            blockOptions={Array.from(new Set([
+                              ...getRealBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || ''),
+                              ...getCatalogBlocksForTab(effectiveCustomer, (draft && draft.sheetGroup) || ''),
+                            ])).filter(Boolean)}
+                            draft={draft} onChange={(field, value) => updatePendingTabBlockForm(row.id, field, value)} />
+                        ) : (
+                          <>
+                            <td className="doc-hint">{catalogEntry ? (catalogEntry.sheetGroup || catalogEntry.item) : ''}</td>
+                            <td className="doc-hint">{catalogEntry ? (catalogEntry.block || catalogEntry.item) : ''}</td>
+                          </>
+                        )}
+                        <td className="col-action">
+                          <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm & push this row" onClick={() => pushPendingRows('customerDispatch', [row])}><CheckCircle2 size={16} /></button>
+                          <button className="icon-btn danger" title="Delete this row entirely" onClick={() => { if (window.confirm('Delete this row from the Customer Dispatch Bills register entirely?')) deleteRow('customerDispatch')(row.id); }}><Trash2 size={15} /></button>
+                        </td>
+                      </tr>
+                      );
+                    };
+                    return (
+                      <>
+                        <div className="table-wrap">
+                          <table>
+                            <thead><tr><th>Date</th><th>Invoice No</th><th>Description</th><th>Quantity</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
+                            <tbody>{assignedRows.map(renderRow)}</tbody>
+                          </table>
+                        </div>
+                        {unassignedRows.length > 0 && (
+                          <>
+                            <div className="stock-section-divider" style={{ marginTop: 14 }}>
+                              <span className="stock-section-divider-label">Unassigned ({unassignedRows.length})</span>
+                              <span className="doc-hint" style={{ marginLeft: 8 }}>No known customer guessed — pick one above before these can be pushed.</span>
+                            </div>
+                            <div className="table-wrap">
+                              <table>
+                                <thead><tr><th>Date</th><th>Invoice No</th><th>Description</th><th>Quantity</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
+                                <tbody>{unassignedRows.map(renderRow)}</tbody>
+                              </table>
+                            </div>
+                          </>
+                        )}
+                      </>
+                    );
+                  })()}
                 </div>
               )}
               {(() => {
