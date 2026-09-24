@@ -3234,39 +3234,48 @@ function FIMSApp() {
   // a push must only ever send what was just confirmed in THIS action. So the confirmed row objects are
   // built right here, in memory, and handed straight to pushCustomerSheetNow — no re-reading of register
   // state, no rebuilt "what's outstanding" sweep, no render-cycle wait.
+  //
+  // Committing to the register (confirmStockRow — sets stockConfirmed, registers catalog/name aliases)
+  // is deliberately DEFERRED until pushCustomerSheetNow's own confirm() dialog is actually accepted, not
+  // done eagerly here. It used to run immediately, before the dialog even appeared — so clicking Cancel
+  // on "Send 4 items to X?" still silently confirmed those rows and removed them from Pending Review,
+  // even though nothing was actually sent. Per explicit instruction: Cancel must mean nothing happened
+  // at all — the rows stay exactly as they were, still pending, still visible, still editable. Only an
+  // actual Discard (deleteRow/deleteRows) removes a row now, and that already deletes it from the
+  // register outright, not just from this view.
   const pushPendingRows = (registerKey, rows) => {
     const resolved = rows.filter(r => r.confirmedCustomer || isKnownCustomerGuess(r));
     const skipped = rows.length - resolved.length;
-    const byCustomer = new Map(); // customer -> { rows: [...], routingOverrides: { [normalizedItemKey]: {sheetGroup, block} } }
+    const byCustomer = new Map(); // customer -> { rows: [...], routingOverrides: {...}, commit: fn }
     resolved.forEach(r => {
       const customer = (r.confirmedCustomer || matchCustomer(r)).trim() || 'Unassigned';
-      // Read BEFORE confirmStockRow — it registers this same draft into the Product Catalog
-      // (registerAliases) and then clears it, but that catalog write is an async state update that
-      // hasn't actually landed by the time this same action goes on to build the push payload below.
-      // Without capturing it here too, a row whose tab/block was JUST picked (an item the catalog
-      // didn't already know) would get confirmed and silently left out of its own push — the
-      // payload-builder would still see the catalog as it was before this pick, find no routing, and
-      // drop it into "unmatched" with no error shown anywhere. Confirmed directly as a real, silent miss.
-      const tabBlockDraft = pendingTabBlockForms[r.id];
-      confirmStockRow(registerKey, r, customer);
       if (customer === 'Unassigned') return; // never auto-pushed — needs a deliberate pick first
-      if (!byCustomer.has(customer)) byCustomer.set(customer, { rows: [], routingOverrides: {} });
+      if (!byCustomer.has(customer)) byCustomer.set(customer, { rows: [], routingOverrides: {}, commits: [] });
       const bucket = byCustomer.get(customer);
       bucket.rows.push({ ...r, confirmedCustomer: customer, stockConfirmed: true });
+      bucket.commits.push(() => confirmStockRow(registerKey, r, customer));
+      // Read now, not inside the deferred commit — pendingTabBlockForms[r.id] only exists while the row
+      // is genuinely still pending; confirmStockRow itself clears it once it actually runs.
+      const tabBlockDraft = pendingTabBlockForms[r.id];
       const draftSheetGroup = (tabBlockDraft && tabBlockDraft.sheetGroup || '').trim();
       if (draftSheetGroup) {
         const key = normalizeForCatalogMatch(r.description || '');
         bucket.routingOverrides[key] = { sheetGroup: draftSheetGroup, block: (tabBlockDraft.block || r.description || '').trim() };
       }
     });
-    if (skipped > 0) window.alert(`Confirmed ${resolved.length} row${resolved.length === 1 ? '' : 's'}. Skipped ${skipped} row${skipped === 1 ? '' : 's'} whose customer couldn't be matched automatically — pick a customer in the dropdown for ${skipped === 1 ? 'it' : 'them'}, then push again.`);
-    byCustomer.forEach(({ rows: confirmedRows, routingOverrides }, customer) => {
-      if (!getCustomerSheetId(customer).trim()) return; // no Sheet linked yet — confirmed locally, nothing to push to
+    if (skipped > 0) window.alert(`Skipped ${skipped} row${skipped === 1 ? '' : 's'} whose customer couldn't be matched automatically — pick a customer in the dropdown for ${skipped === 1 ? 'it' : 'them'}, then push again.`);
+    byCustomer.forEach(({ rows: confirmedRows, routingOverrides, commits }, customer) => {
+      const commitAll = () => commits.forEach(commit => commit());
+      // No Sheet linked yet — nothing to push to, so there's no confirm() dialog to gate on; commit
+      // straight away, exactly like before. Only the "there IS a Sheet, and a push dialog is about to
+      // ask" path needs the defer-until-accepted treatment.
+      if (!getCustomerSheetId(customer).trim()) { commitAll(); return; }
       pushCustomerSheetNow(
         customer,
         registerKey === 'production' ? confirmedRows : [],
         registerKey === 'customerDispatch' ? confirmedRows : [],
         routingOverrides,
+        commitAll,
       );
     });
   };
@@ -4064,14 +4073,18 @@ function FIMSApp() {
   // wouldn't be visible until React re-renders, which is exactly the same kind of gap that let a row
   // get pushed twice in the first place — see the comment inside pushCustomerSheetNow.
   const pushInFlightRef = useRef(new Set());
-  const pushQueuedRef = useRef(new Map()); // customer -> { productionRows, dispatchRows } waiting their turn
+  const pushQueuedRef = useRef(new Map()); // customer -> { productionRows, dispatchRows, routingOverrides, onConfirmedFns } waiting their turn
   // Pushes EXACTLY productionRows/dispatchRows — the specific rows the caller was just handed, nothing
   // recomputed, nothing swept in from elsewhere. This used to rebuild its own payload from "everything
   // currently unpushed for this customer," which is exactly how a row confirmed in one action ended up
   // silently riding along with a completely different, later push — explicit instruction after that
   // caused real confusion and a real duplicated row: what you push is exactly and only what was just
   // confirmed, every time, no exceptions.
-  const pushCustomerSheetNow = async (customer, productionRows, dispatchRows, routingOverrides = {}) => {
+  // onConfirmed: called right after the confirm() dialog below is accepted, before anything is sent —
+  // this is what actually commits the rows to the register (see pushPendingRows). Never called at all
+  // if the dialog is cancelled, or if either early-return above it fires — so Cancel, no Sheet ID, and
+  // nothing-to-send all leave the register completely untouched, exactly as before this call started.
+  const pushCustomerSheetNow = async (customer, productionRows, dispatchRows, routingOverrides = {}, onConfirmed) => {
     const sheetId = getCustomerSheetId(customer).trim();
     if (!sheetId) {
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: 'Add a Google Sheet ID for this customer first (see field above).' } }));
@@ -4080,13 +4093,16 @@ function FIMSApp() {
     // If a push for this SAME customer is already in flight, this call's rows wait their turn instead
     // of being sent right alongside it — merged with anything else already waiting, so nothing queued
     // up in the meantime is dropped. They go out, still as their own exact set, the moment the
-    // in-flight one finishes.
+    // in-flight one finishes — including this call's own onConfirmed, merged alongside anyone else's
+    // already waiting, so every queued caller's rows get committed exactly once, when THAT retry's own
+    // confirm() dialog is accepted — never before.
     if (pushInFlightRef.current.has(customer)) {
-      const existing = pushQueuedRef.current.get(customer) || { productionRows: [], dispatchRows: [], routingOverrides: {} };
+      const existing = pushQueuedRef.current.get(customer) || { productionRows: [], dispatchRows: [], routingOverrides: {}, onConfirmedFns: [] };
       pushQueuedRef.current.set(customer, {
         productionRows: [...existing.productionRows, ...productionRows],
         dispatchRows: [...existing.dispatchRows, ...dispatchRows],
         routingOverrides: { ...existing.routingOverrides, ...routingOverrides },
+        onConfirmedFns: onConfirmed ? [...existing.onConfirmedFns, onConfirmed] : existing.onConfirmedFns,
       });
       return;
     }
@@ -4170,6 +4186,7 @@ function FIMSApp() {
       }
     };
     if (!window.confirm(`Send ${totalRowsToSend} item${totalRowsToSend === 1 ? '' : 's'} to ${customer}?`)) return;
+    if (onConfirmed) onConfirmed();
     setPushStatus(prev => ({ ...prev, [customer]: { state: 'pushing', message: '', unmatched } }));
     pushInFlightRef.current.add(customer);
     try {
@@ -4226,7 +4243,8 @@ function FIMSApp() {
       const queued = pushQueuedRef.current.get(customer);
       if (queued) {
         pushQueuedRef.current.delete(customer);
-        pushCustomerSheetNow(customer, queued.productionRows, queued.dispatchRows, queued.routingOverrides);
+        const mergedOnConfirmed = queued.onConfirmedFns.length ? () => queued.onConfirmedFns.forEach(fn => fn()) : undefined;
+        pushCustomerSheetNow(customer, queued.productionRows, queued.dispatchRows, queued.routingOverrides, mergedOnConfirmed);
       }
     }
   };
