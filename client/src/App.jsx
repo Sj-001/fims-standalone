@@ -268,6 +268,11 @@ const STORAGE_KEYS = {
   // vice versa: changing this string alone, without renaming the actual tab, makes the app start a
   // brand-new empty tab under the new name instead of finding the existing one with its data).
   rawMaterialIn: 'RAW_MATERIAL_IN',
+  // Tukda (leftover) reels — same ALL CAPS treatment as RAW_MATERIAL_IN above and for the same reason,
+  // plus it keeps the two visually paired in the tab strip. Kept as its own tab entirely, not a flag on
+  // rawMaterialIn rows, so original reels and leftover stock are separated at the Sheet level too, not
+  // just in the app.
+  rawMaterialLeftover: 'RAW_MATERIAL_TUKDA',
   consumption: 'fims_consumption',
   production: 'fims_production',
   customerDispatch: 'fims_customer_dispatch',
@@ -916,6 +921,9 @@ const COLUMNS = {
     { key: 'size', label: 'Size' }, { key: 'unit', label: 'Unit' }, { key: 'gsm', label: 'GSM' }, { key: 'bf', label: 'BF' }, { key: 'shade', label: 'Shade' },
     { key: 'weight_kg', label: 'Weight (kg)', type: 'number' }, { key: 'consumed', label: 'Consumed (date)' },
   ],
+  // Same shape as rawMaterialIn — a tukda row is a reel in every way except origin (spawned from a
+  // partial consumption instead of a mill slip), so it's edited/exported/matched-against identically.
+  get rawMaterialLeftover() { return COLUMNS.rawMaterialIn; },
   consumption: [
     { key: 'sl_no', label: 'SL. No.' },
     { key: 'date', label: 'Date' }, { key: 'shade', label: 'Shade' }, { key: 'size', label: 'Size' }, { key: 'gsm', label: 'GSM' },
@@ -1541,6 +1549,7 @@ function FIMSApp() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [loaded, setLoaded] = useState(false);
   const [rawMaterialIn, setRawMaterialIn] = useState([]);
+  const [rawMaterialLeftover, setRawMaterialLeftover] = useState([]);
   const [consumption, setConsumption] = useState([]);
   const [production, setProduction] = useState([]);
   const [customerDispatch, setCustomerDispatch] = useState([]);
@@ -1572,8 +1581,8 @@ function FIMSApp() {
   // happens straight from Pending Review, see pushPendingRows) — kept only because applyReviewEdits/
   // getEditedPayload still read it as a harmless no-op rather than reworking that whole call chain.
   const [reviewEdits, setReviewEdits] = useState({}); // { [customer]: { [variantTitle]: { tabNameOverride, rowEdits: { [rowIndex]: {date,production,dispatch} }, deletedRows: { [rowIndex]: true } } } }
-  const registerState = { rawMaterialIn, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
-  const registerSetters = { rawMaterialIn: setRawMaterialIn, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch, customerSheetsMirror: setCustomerSheetsMirror, customerSheetKnownCounts: setCustomerSheetKnownCounts };
+  const registerState = { rawMaterialIn, rawMaterialLeftover, consumption, production, customerDispatch, daburSpecs, daburPO, daburDispatch };
+  const registerSetters = { rawMaterialIn: setRawMaterialIn, rawMaterialLeftover: setRawMaterialLeftover, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch, customerSheetsMirror: setCustomerSheetsMirror, customerSheetKnownCounts: setCustomerSheetKnownCounts };
   useEffect(() => {
     (async () => {
       const entries = await Promise.all(Object.entries(STORAGE_KEYS).map(async ([k, storageKey]) => [k, await loadRegister(storageKey)]));
@@ -1825,7 +1834,7 @@ function FIMSApp() {
      Training examples are deliberately NOT clearable here — they improve extraction accuracy rather
      than being test data, same reasoning as when this was first done manually. -------- */
   const CLEAR_GROUPS = [
-    { key: 'rawMaterialIn', label: 'Raw Material Register', registerKeys: ['rawMaterialIn'] },
+    { key: 'rawMaterialIn', label: 'Raw Material Register (reels + tukda)', registerKeys: ['rawMaterialIn', 'rawMaterialLeftover'] },
     { key: 'consumption', label: 'Consumption', registerKeys: ['consumption'] },
     { key: 'production', label: 'Production Register', registerKeys: ['production'] },
     { key: 'customerDispatch', label: 'Customer Dispatch Bills', registerKeys: ['customerDispatch'] },
@@ -1871,11 +1880,19 @@ function FIMSApp() {
         // and REMOVES (not un-consumes) every leftover row a cleared row spawned — that row only exists
         // because of the match being undone here, so leaving it behind unconsumed would double-count
         // the same physical material as two separate stock entries once the original reel reappears.
-        const nextRawMaterial = rawMaterialIn
+        // A matched reel or a spawned leftover can now be in EITHER register — a tukda reel is matched
+        // and consumed just like an original one (see the matcher), and a spawned leftover always lands
+        // in rawMaterialLeftover regardless of which register the reel it came from lives in — so this
+        // is applied to both registers uniformly rather than assuming which one a given id belongs to.
+        const revertOneRawMaterialRegister = (rows) => rows
           .filter(r => !leftoverIdsToRemove.has(r.id))
           .map(r => matchedIds.has(r.id) ? { ...r, consumed: '' } : r);
+        const nextRawMaterial = revertOneRawMaterialRegister(rawMaterialIn);
+        const nextLeftover = revertOneRawMaterialRegister(rawMaterialLeftover);
         registerSetters.rawMaterialIn(nextRawMaterial);
+        registerSetters.rawMaterialLeftover(nextLeftover);
         await saveRegister(STORAGE_KEYS.rawMaterialIn, nextRawMaterial);
+        await saveRegister(STORAGE_KEYS.rawMaterialLeftover, nextLeftover);
         if (untraceableLeftoverRows.length) {
           const dates = [...new Set(untraceableLeftoverRows.map(r => r.date))].join(', ');
           untraceableLeftoverNote = ` Note: ${untraceableLeftoverRows.length} of the cleared rows had a leftover (Tukda) amount recorded from before this app could trace which Raw Material row it created — those leftover reels are still sitting in the Raw Material Register and were NOT removed automatically. Check entries dated ${dates} there by hand.`;
@@ -1966,6 +1983,7 @@ function FIMSApp() {
   // still gets caught the next time ANY tab loads, same as before.
   const NORMALIZE_FIELD_REGISTERS = {
     rawMaterialIn: { date: normalizeDateToDots, size: normalizeNumericStr, gsm: normalizeNumericStr, bf: normalizeNumericStr },
+    rawMaterialLeftover: { date: normalizeDateToDots, size: normalizeNumericStr, gsm: normalizeNumericStr, bf: normalizeNumericStr },
     consumption: { date: normalizeDateToDots, size: normalizeNumericStr, gsm: normalizeNumericStr },
     production: { date: normalizeDateToDots },
     customerDispatch: { date: normalizeDateToDots },
@@ -1996,6 +2014,7 @@ function FIMSApp() {
   // and/or one GSM at a time, without summing anything.
   const [rmSizeFilter, setRmSizeFilter] = useState('');
   const [rmGsmFilter, setRmGsmFilter] = useState('');
+  const [rmTypeFilter, setRmTypeFilter] = useState(''); // '' | 'reel' | 'tukda'
   const updateRow = (registerKey) => (id, field, value) => {
     registerSetters[registerKey](prev => {
       const next = prev.map(r => r.id === id ? { ...r, [field]: value } : r);
@@ -2614,7 +2633,13 @@ function FIMSApp() {
   /* -------- raw material balance -------- */
   const balanceRows = (() => {
     const map = {};
-    rawMaterialIn.forEach(r => {
+    // weight_consumed on a consumption row is the REEL'S OWN total weight, not an amount used up — a
+    // partially-used reel counts its FULL weight here, with the un-used remainder re-entering stock as
+    // its own leftover row (below) rather than being subtracted here. So weight_in has to include both
+    // registers too, or a leftover reel's weight would only ever get subtracted (via its source reel
+    // counting as fully consumed) and never added back — this mirrors exactly how it worked before
+    // tukda reels had their own register, when a leftover row was still just another rawMaterialIn row.
+    [...rawMaterialIn, ...rawMaterialLeftover].forEach(r => {
       const key = `${(r.size || '').trim()}|${(r.gsm || '').trim()}`;
       if (!map[key]) map[key] = { id: key, size: r.size, gsm: r.gsm, weight_in: 0, weight_consumed: 0 };
       map[key].weight_in += num(r.weight_kg);
@@ -2628,14 +2653,20 @@ function FIMSApp() {
   })();
   // One group per distinct size, exactly as the physical register book itself is organized (each
   // size gets its own page). Deliberately NOT summed the way balanceRows above is — every individual
-  // mill-slip line item stays its own row; grouping only changes which table it's displayed in, never
-  // the data itself. Row order within a group is left to EditableTable's own date sort (its default),
-  // rather than sorted here too, to avoid sorting the same rows twice. Excludes consumed rows — this
-  // is "what's still in stock," not the full history; the underlying rawMaterialIn array (and the
-  // fims_raw_material_in Sheet tab) still has every row forever, this view just doesn't show them.
+  // mill-slip/leftover line item stays its own row; grouping only changes which table it's displayed
+  // in, never the data itself. Row order within a group is left to EditableTable's own date sort (its
+  // default), rather than sorted here too, to avoid sorting the same rows twice. Excludes consumed
+  // rows — this is "what's still in stock," not the full history; the underlying registers (and their
+  // Sheet tabs) still have every row forever, this view just doesn't show them. Combines both
+  // registers, each row tagged with which one it came from (`_stockType`), so a size's stock always
+  // reads as one pool split by type, not two disconnected views.
   const rawMaterialBySize = (() => {
     const groups = {};
-    rawMaterialIn.filter(r => !r.consumed).forEach(r => {
+    const combined = [
+      ...rawMaterialIn.filter(r => !r.consumed).map(r => ({ ...r, _stockType: 'reel' })),
+      ...rawMaterialLeftover.filter(r => !r.consumed).map(r => ({ ...r, _stockType: 'tukda' })),
+    ];
+    combined.forEach(r => {
       const raw = (r.size || '').trim();
       const n = parseFloat(raw);
       // Collapse an all-zero decimal tail ("62.00" -> "62") so it groups with plain "62" instead of
@@ -2652,20 +2683,35 @@ function FIMSApp() {
         return a.size.localeCompare(b.size, undefined, { numeric: true });
       });
   })();
-  // Distinct GSM values present among UNCONSUMED stock, for the filter dropdown below — sorted
-  // numerically the same way sizes are, so "100" doesn't land before "62" the way a plain string sort
-  // would.
-  const rawMaterialGsmOptions = Array.from(new Set(rawMaterialIn.filter(r => !r.consumed).map(r => (r.gsm || '').trim()).filter(Boolean)))
+  // Distinct GSM values present among UNCONSUMED stock (both registers), for the filter dropdown below
+  // — sorted numerically the same way sizes are, so "100" doesn't land before "62" the way a plain
+  // string sort would.
+  const rawMaterialGsmOptions = Array.from(new Set([
+    ...rawMaterialIn.filter(r => !r.consumed).map(r => (r.gsm || '').trim()),
+    ...rawMaterialLeftover.filter(r => !r.consumed).map(r => (r.gsm || '').trim()),
+  ].filter(Boolean)))
     .sort((a, b) => {
       const na = parseFloat(a), nb = parseFloat(b);
       if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
       return a.localeCompare(b, undefined, { numeric: true });
     });
   // Narrows the per-size tables down to just the selected size and/or GSM, without summing or hiding
-  // anything else.
-  const rawMaterialGroupsFiltered = rawMaterialBySize
+  // anything else. reelCount/tukdaCount are captured here — after size+GSM narrowing but BEFORE the
+  // type filter below — so the group header can always show both counts regardless of which type is
+  // currently filtered to.
+  const rawMaterialGroupsBySizeGsm = rawMaterialBySize
     .filter(g => !rmSizeFilter || g.size === rmSizeFilter)
     .map(g => ({ ...g, rows: rmGsmFilter ? g.rows.filter(r => (r.gsm || '').trim() === rmGsmFilter) : g.rows }))
+    .filter(g => g.rows.length > 0)
+    .map(g => ({
+      ...g,
+      reelCount: g.rows.filter(r => r._stockType === 'reel').length,
+      tukdaCount: g.rows.filter(r => r._stockType === 'tukda').length,
+    }));
+  // Type filter narrows which rows actually list below the header — the header's own counts above
+  // stay unaffected by it, so switching the filter never hides "how many of the other type are here."
+  const rawMaterialGroupsFiltered = rawMaterialGroupsBySizeGsm
+    .map(g => ({ ...g, rows: rmTypeFilter ? g.rows.filter(r => r._stockType === rmTypeFilter) : g.rows }))
     .filter(g => g.rows.length > 0);
   // --- Raw Material In duplicate-reel merge: rowDedupKey (via addRows) only stops a NEW row from
   // being added on top of an identical EXISTING one — it can't undo damage from before a date/number
@@ -2701,28 +2747,33 @@ function FIMSApp() {
     });
     if (mergedAny) persistIfNotStale('rawMaterialIn', rawMaterialIn, next);
   }, [rawMaterialIn]);
-  // Matches each Consumption row against the ONE Raw Material In reel it's about — size + GSM + the
-  // "wajan" weight together, since "wajan" is that reel's own original total weight (a lookup key, not
-  // an amount used up), and an exact weight is effectively unique per physical reel. On a match: dates
-  // that reel's `consumed` field (never removes it from rawMaterialIn — see the Inward Entries filter
-  // below, which is what actually hides it from that view; the Sheet tab keeps every row forever too).
-  // If the same consumption row also carries a leftover_weight (Tukda — remaining after a PARTIAL
-  // consumption), a brand-new Raw Material In row is created for that remainder: same mill/size/gsm/bf/
-  // shade, weight_kg = the leftover, dated to the consumption report's own date, unconsumed — so it
-  // re-enters the trackable pool and a later consumption report can match against IT in turn. A
-  // consumption row with no match gets flagged 'unmatched' (surfaced in the Consumed Material section
-  // below, same "just show it, don't build a picker" treatment as Customer Stock's Unassigned list) —
-  // never silently dropped or guessed. Self-healing like that Unassigned list too: an 'unmatched' row
-  // is retried on every pass, not just once, so it resolves itself automatically the moment a matching
-  // reel becomes available — no manual re-trigger needed. Only rows already 'matched' are skipped for
-  // good (that reel is genuinely spoken for). Re-flagging an already-'unmatched' row as 'unmatched'
-  // again is deliberately NOT written back to state — it's still the same fact, and writing a fresh
-  // object reference for it every pass would retrigger this same effect forever.
+  // Matches each Consumption row against the ONE reel it's about — size + GSM + the "wajan" weight
+  // together, since "wajan" is that reel's own original total weight (a lookup key, not an amount used
+  // up), and an exact weight is effectively unique per physical reel. Searches BOTH rawMaterialIn
+  // (original mill reels) and rawMaterialLeftover (tukda reels) — a tukda reel is consumed exactly like
+  // an original one, since it's the same physical kind of stock, just tracked separately. On a match:
+  // dates whichever register the reel actually came from (never removes it — see the Inward Entries
+  // filter below, which is what actually hides it from that view; the Sheet tab keeps every row
+  // forever too). If the same consumption row also carries a leftover_weight (Tukda — remaining after a
+  // PARTIAL consumption), a brand-new row is created for that remainder ALWAYS in rawMaterialLeftover
+  // (even when the reel consumed was itself already a tukda reel — so leftover-of-a-leftover still ends
+  // up in the tukda register, not back in rawMaterialIn): same mill/size/gsm/bf/shade, weight_kg = the
+  // leftover, dated to the consumption report's own date, unconsumed — so it re-enters the trackable
+  // pool and a later consumption report can match against IT in turn. A consumption row with no match
+  // gets flagged 'unmatched' (surfaced in the Consumed Material section below, same "just show it,
+  // don't build a picker" treatment as Customer Stock's Unassigned list) — never silently dropped or
+  // guessed. Self-healing like that Unassigned list too: an 'unmatched' row is retried on every pass,
+  // not just once, so it resolves itself automatically the moment a matching reel becomes available —
+  // no manual re-trigger needed. Only rows already 'matched' are skipped for good (that reel is
+  // genuinely spoken for). Re-flagging an already-'unmatched' row as 'unmatched' again is deliberately
+  // NOT written back to state — it's still the same fact, and writing a fresh object reference for it
+  // every pass would retrigger this same effect forever.
   useEffect(() => {
     const pending = consumption.filter(r => r.matchStatus !== 'matched');
     if (!pending.length) return;
-    const claimedRawMaterialIds = new Set();
+    const claimedIds = new Set();
     const rawMaterialConsumedDateById = {};
+    const leftoverConsumedDateById = {};
     const leftoverRowsToAdd = [];
     const consumptionUpdateById = {};
     pending.forEach(cRow => {
@@ -2733,15 +2784,18 @@ function FIMSApp() {
       const size = num(cRow.size);
       const gsm = num(cRow.gsm);
       const weight = num(cRow.weight_consumed);
-      const match = rawMaterialIn.find(rRow =>
-        !rRow.consumed && !claimedRawMaterialIds.has(rRow.id) &&
-        num(rRow.size) === size &&
-        num(rRow.gsm) === gsm &&
-        num(rRow.weight_kg) === weight
-      );
+      const findCandidate = (rRow) =>
+        !rRow.consumed && !claimedIds.has(rRow.id) &&
+        num(rRow.size) === size && num(rRow.gsm) === gsm && num(rRow.weight_kg) === weight;
+      // Original reels are searched first purely as a stable tie-break (older stock first) when both
+      // registers happen to have a candidate — either is an equally valid match.
+      const matchInReel = rawMaterialIn.find(findCandidate);
+      const matchInLeftover = matchInReel ? null : rawMaterialLeftover.find(findCandidate);
+      const match = matchInReel || matchInLeftover;
       if (match) {
-        claimedRawMaterialIds.add(match.id);
-        rawMaterialConsumedDateById[match.id] = cRow.date;
+        claimedIds.add(match.id);
+        if (matchInReel) rawMaterialConsumedDateById[match.id] = cRow.date;
+        else leftoverConsumedDateById[match.id] = cRow.date;
         const leftover = num(cRow.leftover_weight);
         // Recorded on the consumption row itself (not just created and forgotten) so a later "clear
         // Consumption, put the reels back" can find and remove exactly this spawned row — without this,
@@ -2768,15 +2822,19 @@ function FIMSApp() {
       const nextConsumption = consumption.map(r => consumptionUpdateById[r.id] ? { ...r, ...consumptionUpdateById[r.id] } : r);
       persistIfNotStale('consumption', consumption, nextConsumption);
     }
-    if (Object.keys(rawMaterialConsumedDateById).length || leftoverRowsToAdd.length) {
-      const nextRawMaterial = [
-        ...rawMaterialIn.map(r => rawMaterialConsumedDateById[r.id] ? { ...r, consumed: rawMaterialConsumedDateById[r.id] } : r),
-        ...leftoverRowsToAdd,
-      ];
+    if (Object.keys(rawMaterialConsumedDateById).length) {
+      const nextRawMaterial = rawMaterialIn.map(r => rawMaterialConsumedDateById[r.id] ? { ...r, consumed: rawMaterialConsumedDateById[r.id] } : r);
       persistIfNotStale('rawMaterialIn', rawMaterialIn, nextRawMaterial);
     }
+    if (Object.keys(leftoverConsumedDateById).length || leftoverRowsToAdd.length) {
+      const nextLeftover = [
+        ...rawMaterialLeftover.map(r => leftoverConsumedDateById[r.id] ? { ...r, consumed: leftoverConsumedDateById[r.id] } : r),
+        ...leftoverRowsToAdd,
+      ];
+      persistIfNotStale('rawMaterialLeftover', rawMaterialLeftover, nextLeftover);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [consumption, rawMaterialIn]);
+  }, [consumption, rawMaterialIn, rawMaterialLeftover]);
   // Manual match: for a consumption row the automatic matcher couldn't resolve, lets a person pick
   // which unconsumed Raw Material In reel it's actually about — same effect as if the automatic match
   // had found it (dates that reel's `consumed`, creates a leftover row if leftover_weight is set), just
@@ -2785,7 +2843,10 @@ function FIMSApp() {
   const [manualMatchPicks, setManualMatchPicks] = useState({});
   const manuallyMatchConsumptionRow = (consumptionRowId, rawMaterialRowId) => {
     const cRow = consumption.find(r => r.id === consumptionRowId);
-    const rRow = rawMaterialIn.find(r => r.id === rawMaterialRowId);
+    // The picked reel can be an original mill reel or a tukda reel — same manual-pick treatment either
+    // way, since a tukda reel is consumed identically to an original one (see the automatic matcher).
+    const inReel = rawMaterialIn.find(r => r.id === rawMaterialRowId);
+    const rRow = inReel || rawMaterialLeftover.find(r => r.id === rawMaterialRowId);
     if (!cRow || !rRow) return;
     // A manual match almost always exists BECAUSE the consumption row's own shade/size/GSM/weight was
     // slightly off (a typo or OCR misread) — that's exactly what made the automatic exact-match miss
@@ -2808,16 +2869,27 @@ function FIMSApp() {
       : r);
     setConsumption(nextConsumption);
     persist('consumption', nextConsumption);
-    const leftoverRows = leftoverRawMaterialId ? [{
-      id: leftoverRawMaterialId, date: cRow.date, mill: rRow.mill, reel_no: rRow.reel_no, size: rRow.size,
-      unit: rRow.unit, gsm: rRow.gsm, bf: rRow.bf, shade: rRow.shade, weight_kg: leftover, consumed: '',
-    }] : [];
-    const nextRawMaterial = [
-      ...rawMaterialIn.map(r => r.id === rawMaterialRowId ? { ...r, consumed: cRow.date } : r),
-      ...leftoverRows,
-    ];
-    setRawMaterialIn(nextRawMaterial);
-    persist('rawMaterialIn', nextRawMaterial);
+    // The picked reel is consumed in whichever register it actually lives in; a spawned leftover always
+    // lands in rawMaterialLeftover (same rule as the automatic matcher), regardless of which register
+    // the consumed reel came from. Each register is written at most once, in a single pass, so a reel
+    // consumed from rawMaterialLeftover that ALSO spawns a new leftover doesn't get two separate,
+    // conflicting writes to the same register.
+    if (inReel) {
+      const nextRawMaterial = rawMaterialIn.map(r => r.id === rawMaterialRowId ? { ...r, consumed: cRow.date } : r);
+      setRawMaterialIn(nextRawMaterial);
+      persist('rawMaterialIn', nextRawMaterial);
+    }
+    if (leftoverRawMaterialId || !inReel) {
+      const nextLeftover = rawMaterialLeftover.map(r => (!inReel && r.id === rawMaterialRowId) ? { ...r, consumed: cRow.date } : r);
+      if (leftoverRawMaterialId) {
+        nextLeftover.push({
+          id: leftoverRawMaterialId, date: cRow.date, mill: rRow.mill, reel_no: rRow.reel_no, size: rRow.size,
+          unit: rRow.unit, gsm: rRow.gsm, bf: rRow.bf, shade: rRow.shade, weight_kg: leftover, consumed: '',
+        });
+      }
+      setRawMaterialLeftover(nextLeftover);
+      persist('rawMaterialLeftover', nextLeftover);
+    }
     setManualMatchPicks(prev => { const next = { ...prev }; delete next[consumptionRowId]; return next; });
   };
   // Net consumption for a set of rows: weight_consumed identifies the reel and its total weight, not
@@ -3393,6 +3465,7 @@ function FIMSApp() {
   // that register's own tab (fix a row right from the search results, no need to go find it by hand).
   const SEARCHABLE_REGISTERS = [
     { key: 'rawMaterialIn', label: 'Raw Material Register', rows: rawMaterialIn, columns: COLUMNS.rawMaterialIn },
+    { key: 'rawMaterialLeftover', label: 'Raw Material Register — Tukda', rows: rawMaterialLeftover, columns: COLUMNS.rawMaterialLeftover },
     { key: 'consumption', label: 'Consumption', rows: consumption, columns: COLUMNS.consumption },
     { key: 'production', label: 'Production Register', rows: production, columns: COLUMNS.production },
     { key: 'customerDispatch', label: 'Customer Dispatch Bills', rows: customerDispatch, columns: COLUMNS.customerDispatch },
@@ -4393,6 +4466,7 @@ function FIMSApp() {
   const exportAll = () => {
     const sheets = [];
     sheets.push({ name: 'Raw Material In', rows: rawMaterialIn, columns: COLUMNS.rawMaterialIn, kind: 'table' });
+    sheets.push({ name: 'Raw Material Tukda', rows: rawMaterialLeftover, columns: COLUMNS.rawMaterialLeftover, kind: 'table' });
     sheets.push({ name: 'Consumption', rows: consumption, columns: COLUMNS.consumption, kind: 'table' });
     sheets.push({
       name: 'RM Balance', kind: 'table', rows: balanceRows, columns: [
@@ -4424,7 +4498,7 @@ function FIMSApp() {
   };
   /* ============================== render ============================== */
   const counts = {
-    rawMaterialIn: rawMaterialIn.length, consumption: consumption.length, production: production.length,
+    rawMaterialIn: rawMaterialIn.length + rawMaterialLeftover.length, consumption: consumption.length, production: production.length,
     customerDispatch: customerDispatch.length, daburSpecs: daburSpecs.length, daburPO: daburPO.length, daburDispatch: daburDispatch.length,
   };
   return (
@@ -4936,10 +5010,13 @@ function FIMSApp() {
             <div>
               <div className="panel">
                 <div className="panel-header">
-                  <div><h2>Inward Entries (from mill slips)</h2><p className="subtitle">One table per size, same as the physical register book. Nothing is summed here — every mill-slip line stays its own row. "Consumed" is left blank for now; it'll be filled in once entries are matched against consumption reports.</p></div>
-                  <button className="btn btn-ghost" onClick={() => exportSheet('Raw_Material_In', rawMaterialIn, COLUMNS.rawMaterialIn)}><Download size={15} /> Export</button>
+                  <div><h2>Inward Entries (reels + tukda)</h2><p className="subtitle">One table per size, same as the physical register book, split into original mill reels and tukda (leftover) reels. Nothing is summed here — every line stays its own row. "Consumed" is left blank for now; it'll be filled in once entries are matched against consumption reports.</p></div>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button className="btn btn-ghost" onClick={() => exportSheet('Raw_Material_In', rawMaterialIn, COLUMNS.rawMaterialIn)}><Download size={15} /> Export reels</button>
+                    <button className="btn btn-ghost" onClick={() => exportSheet('Raw_Material_Tukda', rawMaterialLeftover, COLUMNS.rawMaterialLeftover)}><Download size={15} /> Export tukda</button>
+                  </div>
                 </div>
-                {!!rawMaterialIn.length && (
+                {!!(rawMaterialIn.length || rawMaterialLeftover.length) && (
                   <div className="field-row" style={{ marginBottom: 14 }}>
                     <select className="doc-select" style={{ width: 160, marginBottom: 0 }} value={rmSizeFilter} onChange={e => setRmSizeFilter(e.target.value)}>
                       <option value="">All sizes</option>
@@ -4949,20 +5026,44 @@ function FIMSApp() {
                       <option value="">All GSM</option>
                       {rawMaterialGsmOptions.map(g => <option value={g} key={g}>GSM {g}</option>)}
                     </select>
-                    {(rmSizeFilter || rmGsmFilter) && (
-                      <button className="btn btn-ghost" onClick={() => { setRmSizeFilter(''); setRmGsmFilter(''); }}>Clear filters</button>
+                    <select className="doc-select" style={{ width: 160, marginBottom: 0 }} value={rmTypeFilter} onChange={e => setRmTypeFilter(e.target.value)}>
+                      <option value="">All types</option>
+                      <option value="reel">Reels</option>
+                      <option value="tukda">Tukda</option>
+                    </select>
+                    {(rmSizeFilter || rmGsmFilter || rmTypeFilter) && (
+                      <button className="btn btn-ghost" onClick={() => { setRmSizeFilter(''); setRmGsmFilter(''); setRmTypeFilter(''); }}>Clear filters</button>
                     )}
                   </div>
                 )}
-                {!rawMaterialIn.length && <div className="empty-state">Upload some mill slips to see inward entries here.</div>}
-                {!!rawMaterialIn.length && !rawMaterialGroupsFiltered.length && <div className="empty-state">No entries match that filter.</div>}
-                {rawMaterialGroupsFiltered.map(group => (
-                  <div key={group.size} style={{ marginBottom: 20 }}>
-                    <div style={{ marginBottom: 6 }}><strong>Size {group.size}</strong></div>
-                    <EditableTable columns={RAW_MATERIAL_SIZE_COLUMNS} rows={group.rows}
-                      onUpdate={updateRow('rawMaterialIn')} onDelete={deleteRow('rawMaterialIn')} suppressFlags />
-                  </div>
-                ))}
+                {!(rawMaterialIn.length || rawMaterialLeftover.length) && <div className="empty-state">Upload some mill slips to see inward entries here.</div>}
+                {!!(rawMaterialIn.length || rawMaterialLeftover.length) && !rawMaterialGroupsFiltered.length && <div className="empty-state">No entries match that filter.</div>}
+                {rawMaterialGroupsFiltered.map(group => {
+                  const reelRows = group.rows.filter(r => r._stockType === 'reel');
+                  const tukdaRows = group.rows.filter(r => r._stockType === 'tukda');
+                  return (
+                    <div key={group.size} style={{ marginBottom: 20 }}>
+                      <div style={{ marginBottom: 6 }}>
+                        <strong>Size {group.size}</strong>
+                        <span className="doc-hint" style={{ marginLeft: 8 }}>Reels: {group.reelCount} · Tukda: {group.tukdaCount}</span>
+                      </div>
+                      {!!reelRows.length && (
+                        <div style={{ marginBottom: tukdaRows.length ? 14 : 0 }}>
+                          <div className="section-label">Reels</div>
+                          <EditableTable columns={RAW_MATERIAL_SIZE_COLUMNS} rows={reelRows}
+                            onUpdate={updateRow('rawMaterialIn')} onDelete={deleteRow('rawMaterialIn')} suppressFlags />
+                        </div>
+                      )}
+                      {!!tukdaRows.length && (
+                        <div>
+                          <div className="section-label">Tukda</div>
+                          <EditableTable columns={RAW_MATERIAL_SIZE_COLUMNS} rows={tukdaRows}
+                            onUpdate={updateRow('rawMaterialLeftover')} onDelete={deleteRow('rawMaterialLeftover')} suppressFlags />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}
@@ -5007,7 +5108,10 @@ function FIMSApp() {
                           return String(a.sl_no ?? '').localeCompare(String(b.sl_no ?? ''), undefined, { numeric: true });
                         }).map(row => {
                           const matched = row.matchStatus === 'matched';
-                          const matchedReel = matched ? rawMaterialIn.find(r => r.id === row.matchedRawMaterialId) : null;
+                          // The matched reel can be an original mill reel or a tukda reel — both
+                          // registers are searched by id, which is enough since ids are unique across
+                          // both (genId() doesn't reuse across registers).
+                          const matchedReel = matched ? (rawMaterialIn.find(r => r.id === row.matchedRawMaterialId) || rawMaterialLeftover.find(r => r.id === row.matchedRawMaterialId)) : null;
                           // Candidate reels for a manual pick: unconsumed, same numeric size, same numeric
                           // GSM, and same shade (when both sides actually have one recorded) as this
                           // consumption row — narrows the dropdown to plausible reels instead of listing all
@@ -5019,16 +5123,19 @@ function FIMSApp() {
                           // filtered on — a manual pick exists specifically for rows the automatic exact
                           // matcher (size+GSM+weight) already failed to resolve, and weight is usually the
                           // one field that's off (a misread digit), so filtering on it too would hide the
-                          // very reel this row is actually about.
+                          // very reel this row is actually about. Pulled from both registers — a tukda reel
+                          // is just as valid a manual pick as an original one.
                           const rowShade = String(row.shade || '').trim().toLowerCase();
-                          const candidates = matched ? [] : rawMaterialIn
-                            .filter(r => !r.consumed && num(r.size) === num(row.size) && num(r.gsm) === num(row.gsm))
-                            .filter(r => {
-                              const rShade = String(r.shade || '').trim().toLowerCase();
-                              if (!rowShade || !rShade) return true;
-                              return rShade === rowShade;
-                            })
-                            .sort((a, b) => num(a.weight_kg) - num(b.weight_kg));
+                          const candidateFilter = (r) => {
+                            if (r.consumed || num(r.size) !== num(row.size) || num(r.gsm) !== num(row.gsm)) return false;
+                            const rShade = String(r.shade || '').trim().toLowerCase();
+                            if (!rowShade || !rShade) return true;
+                            return rShade === rowShade;
+                          };
+                          const candidates = matched ? [] : [
+                            ...rawMaterialIn.filter(candidateFilter).map(r => ({ ...r, _stockType: 'reel' })),
+                            ...rawMaterialLeftover.filter(candidateFilter).map(r => ({ ...r, _stockType: 'tukda' })),
+                          ].sort((a, b) => num(a.weight_kg) - num(b.weight_kg));
                           return (
                             <tr key={row.id}>
                               {COLUMNS.consumption.map(c => (
@@ -5051,7 +5158,7 @@ function FIMSApp() {
                                       onChange={(e) => setManualMatchPicks(prev => ({ ...prev, [row.id]: e.target.value }))}>
                                       <option value="">Pick a reel...</option>
                                       {candidates.map(c => (
-                                        <option value={c.id} key={c.id}>{c.size} / {c.gsm}gsm{c.shade ? ` ${c.shade}` : ''} · {c.weight_kg}kg · {c.date}</option>
+                                        <option value={c.id} key={c.id}>{c.size} / {c.gsm}gsm{c.shade ? ` ${c.shade}` : ''} · {c.weight_kg}kg · {c.date}{c._stockType === 'tukda' ? ' · Tukda' : ''}</option>
                                       ))}
                                     </select>
                                     <button className="btn btn-ghost" disabled={!manualMatchPicks[row.id]}
