@@ -5244,18 +5244,6 @@ function FIMSApp() {
                       onConfirmGroup={() => pushPendingRows('production', group.rows)} />
                   ))}
                   {(() => {
-                    // Split so the table always shows exactly "what Push to Sheet would actually send
-                    // right now" first — Unassigned rows never get auto-pushed (see pushPendingRows), so
-                    // mixed in with the rest they just looked like noise in the main list. Unassigned
-                    // ones move to their own section below, clearly separated, instead of interleaved.
-                    // isKnownCustomerGuess treats 'Unassigned' as a "known" guess, so it can't be used
-                    // here directly — check the actual effective customer instead.
-                    const isRowAssigned = (row) => {
-                      const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
-                      return !!effectiveCustomer && effectiveCustomer !== 'Unassigned';
-                    };
-                    const assignedRows = pendingProductionRows.filter(isRowAssigned);
-                    const unassignedRows = pendingProductionRows.filter(r => !isRowAssigned(r));
                     const renderRow = (row) => {
                       const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
                       const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
@@ -5297,28 +5285,12 @@ function FIMSApp() {
                       );
                     };
                     return (
-                      <>
-                        <div className="table-wrap">
-                          <table>
-                            <thead><tr><th>Date</th><th>Description</th><th>Pieces</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
-                            <tbody>{assignedRows.map(renderRow)}</tbody>
-                          </table>
-                        </div>
-                        {unassignedRows.length > 0 && (
-                          <>
-                            <div className="stock-section-divider" style={{ marginTop: 14 }}>
-                              <span className="stock-section-divider-label">Unassigned ({unassignedRows.length})</span>
-                              <span className="doc-hint" style={{ marginLeft: 8 }}>No known customer guessed — pick one above before these can be pushed.</span>
-                            </div>
-                            <div className="table-wrap">
-                              <table>
-                                <thead><tr><th>Date</th><th>Description</th><th>Pieces</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
-                                <tbody>{unassignedRows.map(renderRow)}</tbody>
-                              </table>
-                            </div>
-                          </>
-                        )}
-                      </>
+                      <div className="table-wrap">
+                        <table>
+                          <thead><tr><th>Date</th><th>Description</th><th>Pieces</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
+                          <tbody>{pendingProductionRows.map(renderRow)}</tbody>
+                        </table>
+                      </div>
                     );
                   })()}
                 </div>
@@ -5339,16 +5311,6 @@ function FIMSApp() {
                       onConfirmGroup={() => pushPendingRows('customerDispatch', group.rows)} />
                   ))}
                   {(() => {
-                    // Same split as Pending Production Review — see its comment. Unassigned rows never
-                    // get auto-pushed, so they move to their own section below the ones actually ready.
-                    // isKnownCustomerGuess treats 'Unassigned' as a "known" guess, so it can't be used
-                    // here directly — check the actual effective customer instead.
-                    const isRowAssigned = (row) => {
-                      const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
-                      return !!effectiveCustomer && effectiveCustomer !== 'Unassigned';
-                    };
-                    const assignedRows = pendingDispatchRows.filter(isRowAssigned);
-                    const unassignedRows = pendingDispatchRows.filter(r => !isRowAssigned(r));
                     const renderRow = (row) => {
                       const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
                       const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
@@ -5391,28 +5353,12 @@ function FIMSApp() {
                       );
                     };
                     return (
-                      <>
-                        <div className="table-wrap">
-                          <table>
-                            <thead><tr><th>Date</th><th>Invoice No</th><th>Description</th><th>Quantity</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
-                            <tbody>{assignedRows.map(renderRow)}</tbody>
-                          </table>
-                        </div>
-                        {unassignedRows.length > 0 && (
-                          <>
-                            <div className="stock-section-divider" style={{ marginTop: 14 }}>
-                              <span className="stock-section-divider-label">Unassigned ({unassignedRows.length})</span>
-                              <span className="doc-hint" style={{ marginLeft: 8 }}>No known customer guessed — pick one above before these can be pushed.</span>
-                            </div>
-                            <div className="table-wrap">
-                              <table>
-                                <thead><tr><th>Date</th><th>Invoice No</th><th>Description</th><th>Quantity</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
-                                <tbody>{unassignedRows.map(renderRow)}</tbody>
-                              </table>
-                            </div>
-                          </>
-                        )}
-                      </>
+                      <div className="table-wrap">
+                        <table>
+                          <thead><tr><th>Date</th><th>Invoice No</th><th>Description</th><th>Quantity</th><th>Suggested Customer</th><th>Sheet tab</th><th>Block</th><th className="col-action"></th></tr></thead>
+                          <tbody>{pendingDispatchRows.map(renderRow)}</tbody>
+                        </table>
+                      </div>
                     );
                   })()}
                 </div>
