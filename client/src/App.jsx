@@ -5248,7 +5248,12 @@ function FIMSApp() {
                     // right now" first — Unassigned rows never get auto-pushed (see pushPendingRows), so
                     // mixed in with the rest they just looked like noise in the main list. Unassigned
                     // ones move to their own section below, clearly separated, instead of interleaved.
-                    const isRowAssigned = (row) => !!(row.confirmedCustomer || isKnownCustomerGuess(row));
+                    // isKnownCustomerGuess treats 'Unassigned' as a "known" guess, so it can't be used
+                    // here directly — check the actual effective customer instead.
+                    const isRowAssigned = (row) => {
+                      const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
+                      return !!effectiveCustomer && effectiveCustomer !== 'Unassigned';
+                    };
                     const assignedRows = pendingProductionRows.filter(isRowAssigned);
                     const unassignedRows = pendingProductionRows.filter(r => !isRowAssigned(r));
                     const renderRow = (row) => {
@@ -5336,7 +5341,12 @@ function FIMSApp() {
                   {(() => {
                     // Same split as Pending Production Review — see its comment. Unassigned rows never
                     // get auto-pushed, so they move to their own section below the ones actually ready.
-                    const isRowAssigned = (row) => !!(row.confirmedCustomer || isKnownCustomerGuess(row));
+                    // isKnownCustomerGuess treats 'Unassigned' as a "known" guess, so it can't be used
+                    // here directly — check the actual effective customer instead.
+                    const isRowAssigned = (row) => {
+                      const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
+                      return !!effectiveCustomer && effectiveCustomer !== 'Unassigned';
+                    };
                     const assignedRows = pendingDispatchRows.filter(isRowAssigned);
                     const unassignedRows = pendingDispatchRows.filter(r => !isRowAssigned(r));
                     const renderRow = (row) => {
