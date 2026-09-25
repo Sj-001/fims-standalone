@@ -717,6 +717,16 @@ IMPORTANT:
       // was this actually consumed on?). Flagged here rather than silently let through with a blank
       // date; doesn't overwrite an existing flag reason, just adds this one where there isn't one yet.
       filled.forEach(r => { if (!r.date) { r.flagged = true; r.flagReason = r.flagReason || 'No date found for this row — check the original report and fill in the date before confirming.'; } });
+      // A leftover can never be >= the reel's own total weight — that's not a possible physical
+      // state, it's the signature of a leftover value that drifted onto the wrong row (the prompt
+      // warns against this, but has no code-level backstop until now). Flag instead of silently
+      // accepting it, so it gets a human look before it misidentifies which reel got used up.
+      filled.forEach(r => {
+        if (r.leftover_weight !== '' && Number(r.leftover_weight) >= Number(r.weight_consumed)) {
+          r.flagged = true;
+          r.flagReason = r.flagReason || `Leftover (${r.leftover_weight}) is not less than the reel weight (${r.weight_consumed}) — likely landed on the wrong row. Check the original sheet.`;
+        }
+      });
       return filled;
     },
   },
