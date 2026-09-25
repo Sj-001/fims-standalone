@@ -696,13 +696,14 @@ FINAL COUNT CHECK — MANDATORY BEFORE YOU FINALIZE: count the actual number of 
     hint: 'The handwritten daily sheet workers use to record raw material consumed — columns are usually Shade, GSM, Size, Weight, and Balance Left.',
     register: 'consumption',
     systemPrompt: `You read a handwritten daily raw-material consumption report from a corrugated box factory. The sheet has Hindi column headers. Most rows share one date written once at the top. Return ONLY one JSON object:
-{"date":"as written at the top, DD/MM/YYYY","items":[{"sl_no":"this row's own SL.NO./serial number exactly as printed in that column, as a string — see rules below","shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number — this is the reel's own TOTAL weight (matches what was recorded when it came in), not an amount used up — see rules below","leftover_weight":"the टुकड़ा / Tukda column value, as a number, ONLY if that row actually has one written — omit entirely if the row has nothing there, do not default it to 0","date_override":"only include this if a specific row has a different date than the header, else omit","flag":"only if you couldn't reliably read this row's weight — e.g. a column looks cut off/missing, or there's a crossed-out number and you're unsure which replacement is correct — a short reason why, else omit"}]}
+{"date":"as written at the top, DD/MM/YYYY","items":[{"sl_no":"this row's own SL.NO./serial number exactly as printed in that column, as a string — see rules below","shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number — this is the reel's own TOTAL weight (matches what was recorded when it came in), not an amount used up — see rules below","leftover_weight":"the टुकड़ा / Tukda column value, as a number, ONLY if that row actually has one written — omit entirely if the row has nothing there, do not default it to 0","leftover_sl_no":"REQUIRED whenever leftover_weight is present, else omit entirely — see the LEFTOVER ROW CHECK rule below","date_override":"only include this if a specific row has a different date than the header, else omit","flag":"only if you couldn't reliably read this row's weight — e.g. a column looks cut off/missing, or there's a crossed-out number and you're unsure which replacement is correct — a short reason why, else omit"}]}
 IMPORTANT:
 - SKIP TRULY BLANK LINES. This sheet is pre-ruled with a fixed number of numbered SL.NO. slots/columns, and it is completely normal for a real day's report to only fill in the first several and leave the rest of the printed grid blank. A line that has ONLY a pre-printed SL.NO. with no shade, no GSM, no size, and no weight actually written on it is not a row of data — do not output an item for it. Only extract a line that has genuine handwritten content in it.
 - SL.NO IS YOUR ROW-ALIGNMENT ANCHOR. This sheet's rows are frequently laid out as narrow vertical strips (SL.NO increasing left-to-right or in whatever direction the page actually runs, sometimes numbered right-to-left, e.g. strip "20" on the far left and strip "1" on the far right) with every strip looking nearly identical (same date, same shade, similar GSM) — the kind of layout where it's extremely easy for a value to silently slide into the wrong row, or for an entire strip to get skipped without you noticing. To prevent that: for EACH row, first locate its SL.NO in the image, then read every other field (shade, GSM, size, weight, leftover) from that exact same physical strip/line — never from a neighboring one — before moving to the next SL.NO.
 - FINAL COUNT CHECK — MANDATORY BEFORE YOU FINALIZE: count the actual number of physical strips/lines visible in the image that have genuine handwritten content (not the pre-printed grid — the ones you're actually meant to extract per the "skip truly blank lines" rule above). Your "items" array must contain EXACTLY that many entries, no more and no fewer. The sl_no values you produced should appear once each, in the same order they run on the page, with no duplicates and no unexplained gaps. If your count is off, that means a real row got skipped somewhere in the middle — go find it and insert it in the right place; do NOT compensate by inventing an extra row at the end, and do NOT pad the count by duplicating a row you already extracted. Every single item in your output must correspond to one real, physically-located strip you can point to in the image — never a row assembled by guessing at a plausible-looking combination of values.
 - WEIGHT vs. LEFTOVER — these are two DIFFERENT numbers with two different meanings, never the same value: "weight_consumed" (वजन) is the reel's own original total weight, exactly as it was recorded when that reel first arrived — it identifies WHICH reel this row is about, it is not how much was used today. "leftover_weight" (टुकड़ा) is how much of that reel is left over/remaining after this — genuinely optional, only present when the row actually has a value written in that column (a reel that got fully used up has nothing written there).
-- LEFTOVER/TUKDA IS THE COLUMN MOST LIKELY TO DRIFT BETWEEN ROWS — it's usually blank for most rows and only has a handwritten value here and there, which makes it easy to accidentally attach the one value you DO see to the wrong nearby row instead of leaving the blank ones blank. Before including a leftover_weight for a row, re-confirm it is physically written on THAT row's own strip/line, at THAT row's SL.NO, not just "somewhere near it" or "the closest number below it." If you are not fully certain which row a leftover figure belongs to, omit leftover_weight for that row entirely rather than guessing — an omitted value is far less harmful than one attached to the wrong reel, which would misidentify which physical reel gets marked as used up.
+- LEFTOVER/TUKDA IS THE COLUMN MOST LIKELY TO DRIFT BETWEEN ROWS — it's usually blank for most rows and only has a handwritten value here and there, which makes it easy to accidentally attach the one value you DO see to the wrong nearby row (the one just above or just below it) instead of leaving the blank ones blank. Before including a leftover_weight for a row, re-confirm it is physically written on THAT row's own strip/line, at THAT row's SL.NO, not just "somewhere near it" or "the closest number below it." If you are not fully certain which row a leftover figure belongs to, omit leftover_weight for that row entirely rather than guessing — an omitted value is far less harmful than one attached to the wrong reel, which would misidentify which physical reel gets marked as used up.
+- LEFTOVER ROW CHECK — MANDATORY SECOND READ, whenever you include a leftover_weight: after you've filled in the row's sl_no and leftover_weight, go back and independently re-locate that SAME leftover figure on the page a second time, as if you had not already decided which row it belongs to — trace your eye along its physical strip/line all the way over to that strip's own SL.NO., ignoring what you already wrote down. Put THAT freshly re-read SL.NO. into "leftover_sl_no". This is a genuine independent re-check, not a copy of "sl_no" — if your first read had already slid the value onto the wrong strip, blindly repeating "sl_no" here would hide the mistake instead of catching it. It is fine, and expected sometimes, for leftover_sl_no to disagree with sl_no — when that happens it means the figure is actually harder to place confidently than it first looked, which is exactly what this second read is for.
 - The column that looks like it's labeled "S/K" is actually the SHADE column, not a party name or code. Decode its handwritten values: "S.K" or "SK" means shade NS (Sada Kraft / natural shade). "G.Y" or "GY" means shade GY (Golden Yellow). If you see a different value you don't recognize, copy it as written rather than forcing it into NS or GY.
 - There is no BF field on this document — do not invent one. What might look like a stray extra column is the Size column.
 - CROSSED-OUT / CORRECTED VALUES: this is a real working register — a number is sometimes struck through with the corrected number written right next to it in that same row. Use only the number that is NOT crossed out; ignore the struck-through one entirely. This stays within one row — never borrow a number from the row above or below because a cell looks messy.
@@ -714,6 +715,9 @@ IMPORTANT:
         id: genId(), sl_no: it.sl_no != null ? String(it.sl_no) : '', date: normalizeDateToDots(it.date_override || raw.date || ''), shade: it.shade || '', size: normalizeNumericStr(it.size), gsm: normalizeNumericStr(it.gsm),
         weight_consumed: num(it.weight_consumed),
         leftover_weight: it.leftover_weight === '' || it.leftover_weight == null ? '' : num(it.leftover_weight),
+        // Only used below (LEFTOVER ROW CHECK), then stripped before the rows are returned — it's a
+        // verification artifact, not a real column this register keeps.
+        leftover_sl_no: it.leftover_sl_no != null ? String(it.leftover_sl_no) : '',
         flagged: !!(it.flag && String(it.flag).trim()), flagReason: (it.flag || '').trim(),
       }));
       const filled = fillDittoDates(rows);
@@ -732,7 +736,18 @@ IMPORTANT:
           r.flagReason = r.flagReason || `Leftover (${r.leftover_weight}) is not less than the reel weight (${r.weight_consumed}) — likely landed on the wrong row. Check the original sheet.`;
         }
       });
-      return filled;
+      // LEFTOVER ROW CHECK: the model re-reads which SL.NO a leftover figure actually sits on,
+      // independently of the row it initially attached it to (see the prompt rule of the same name).
+      // When the two disagree, the model's own two reads couldn't agree on which row this belongs to
+      // — flagged for a human look rather than silently trusting whichever read happened to land in
+      // the row object.
+      filled.forEach(r => {
+        if (r.leftover_weight !== '' && r.leftover_sl_no && r.leftover_sl_no.trim() !== (r.sl_no || '').trim()) {
+          r.flagged = true;
+          r.flagReason = r.flagReason || `Leftover (${r.leftover_weight}) was re-read as belonging to SL.NO ${r.leftover_sl_no}, but this row is SL.NO ${r.sl_no} — check which row it actually belongs to on the original sheet.`;
+        }
+      });
+      return filled.map(({ leftover_sl_no, ...row }) => row);
     },
   },
   {
@@ -2747,6 +2762,24 @@ function FIMSApp() {
     });
     if (mergedAny) persistIfNotStale('rawMaterialIn', rawMaterialIn, next);
   }, [rawMaterialIn]);
+  // One-time migration for every leftover row spawned BEFORE rawMaterialLeftover existed as its own
+  // register: back then, a spawned leftover just re-entered rawMaterialIn indistinguishable from a
+  // real mill reel — but it's still traceable, because the consumption row that spawned it recorded
+  // the spawned row's id as leftoverRawMaterialId (see the matcher below). Moves any rawMaterialIn row
+  // whose id shows up as SOME consumption row's leftoverRawMaterialId into rawMaterialLeftover,
+  // preserving it exactly (including its own `consumed` status, if it's since been used up itself).
+  // Self-healing like the merge above: converges to a no-op once nothing is left to move, so it's safe
+  // to leave running rather than gating it to run only once.
+  useEffect(() => {
+    const leftoverIds = new Set(consumption.map(r => r.leftoverRawMaterialId).filter(Boolean));
+    if (!leftoverIds.size) return;
+    const toMove = rawMaterialIn.filter(r => leftoverIds.has(r.id));
+    if (!toMove.length) return;
+    const nextRawMaterial = rawMaterialIn.filter(r => !leftoverIds.has(r.id));
+    const nextLeftover = [...rawMaterialLeftover, ...toMove];
+    persistIfNotStale('rawMaterialIn', rawMaterialIn, nextRawMaterial);
+    persistIfNotStale('rawMaterialLeftover', rawMaterialLeftover, nextLeftover);
+  }, [consumption, rawMaterialIn, rawMaterialLeftover]);
   // Matches each Consumption row against the ONE reel it's about — size + GSM + the "wajan" weight
   // together, since "wajan" is that reel's own original total weight (a lookup key, not an amount used
   // up), and an exact weight is effectively unique per physical reel. Searches BOTH rawMaterialIn
