@@ -919,7 +919,7 @@ const COLUMNS = {
   consumption: [
     { key: 'sl_no', label: 'SL. No.' },
     { key: 'date', label: 'Date' }, { key: 'shade', label: 'Shade' }, { key: 'size', label: 'Size' }, { key: 'gsm', label: 'GSM' },
-    { key: 'weight_consumed', label: 'Weight Consumed', type: 'number' }, { key: 'leftover_weight', label: 'Leftover (Tukda)', type: 'number' },
+    { key: 'weight_consumed', label: 'Weight', type: 'number' }, { key: 'leftover_weight', label: 'Leftover (Tukda)', type: 'number' },
   ],
   production: [
     { key: 'date', label: 'Date' }, { key: 'party', label: 'Party (if noted)' }, { key: 'description', label: 'Description (as written)' },
