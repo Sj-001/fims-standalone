@@ -2902,6 +2902,33 @@ function FIMSApp() {
   })();
   const todaysConsumption = netConsumption(consumption.filter(r => dateSortKey(r.date) === todayKey));
   const thisMonthsConsumption = netConsumption(consumption.filter(r => dateSortKey(r.date).startsWith(todayKey.slice(0, 7))));
+  // Consumption Entries grouped by date, oldest first, for the collapsible table below. A group whose
+  // every row is already 'matched' defaults to collapsed (nothing left to act on there); a group with
+  // even one unmatched row defaults open, since that's exactly what needs attention. Explicit
+  // expand/collapse clicks are tracked separately (consumptionGroupOverrides) and always win over that
+  // default — a person's own choice shouldn't silently flip back just because a row inside it gets
+  // matched a moment later.
+  const [consumptionGroupOverrides, setConsumptionGroupOverrides] = useState({});
+  const consumptionByDate = (() => {
+    const groups = {};
+    consumption.forEach(r => {
+      const d = r.date || '(no date)';
+      (groups[d] = groups[d] || []).push(r);
+    });
+    return Object.entries(groups)
+      .map(([date, rows]) => ({
+        date,
+        rows: [...rows].sort((a, b) => {
+          const na = parseFloat(a.sl_no), nb = parseFloat(b.sl_no);
+          if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+          return String(a.sl_no ?? '').localeCompare(String(b.sl_no ?? ''), undefined, { numeric: true });
+        }),
+        allMatched: rows.every(r => r.matchStatus === 'matched'),
+        netWeight: netConsumption(rows),
+      }))
+      .sort((a, b) => dateSortKey(a.date).localeCompare(dateSortKey(b.date)));
+  })();
+  const isConsumptionGroupOpen = (group) => consumptionGroupOverrides[group.date] !== undefined ? consumptionGroupOverrides[group.date] : !group.allMatched;
   /* -------- dabur PO pending calc -------- */
   const PO_TOLERANCE = 0.10; // ±10% — a PO counts as fulfilled once dispatched qty reaches 90% of ordered qty
   const daburPOWithPending = daburPO.map(po => {
@@ -4707,6 +4734,9 @@ function FIMSApp() {
         .stock-section-divider-label { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink); }
         .spin { animation: fims-spin 1s linear infinite; }
         @keyframes fims-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        .consumption-date-row { cursor: pointer; background: var(--paper); }
+        .consumption-date-row td { padding: 8px 10px; }
+        .consumption-date-row:hover { background: var(--rule); }
       `}</style>
       <div className="sidebar-rail">
         <aside
@@ -5099,14 +5129,9 @@ function FIMSApp() {
                           <th className="col-action"></th>
                         </tr>
                       </thead>
-                      <tbody>
-                        {[...consumption].sort((a, b) => {
-                          const dateCmp = dateSortKey(a.date).localeCompare(dateSortKey(b.date));
-                          if (dateCmp !== 0) return dateCmp;
-                          const na = parseFloat(a.sl_no), nb = parseFloat(b.sl_no);
-                          if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
-                          return String(a.sl_no ?? '').localeCompare(String(b.sl_no ?? ''), undefined, { numeric: true });
-                        }).map(row => {
+                      {consumptionByDate.map(group => {
+                        const isOpen = isConsumptionGroupOpen(group);
+                        const renderRow = (row) => {
                           const matched = row.matchStatus === 'matched';
                           // The matched reel can be an original mill reel or a tukda reel — both
                           // registers are searched by id, which is enough since ids are unique across
@@ -5173,8 +5198,21 @@ function FIMSApp() {
                               </td>
                             </tr>
                           );
-                        })}
-                      </tbody>
+                        };
+                        return (
+                          <tbody key={group.date}>
+                            <tr className="consumption-date-row" onClick={() => setConsumptionGroupOverrides(prev => ({ ...prev, [group.date]: !isOpen }))}>
+                              <td colSpan={COLUMNS.consumption.length + 2}>
+                                <span style={{ display: 'inline-block', width: 14 }}>{isOpen ? '▾' : '▸'}</span>
+                                <strong>{group.date}</strong>
+                                <span className="doc-hint" style={{ marginLeft: 8 }}>{group.rows.length} entr{group.rows.length === 1 ? 'y' : 'ies'} · Net consumed: {group.netWeight.toLocaleString('en-IN')} kg</span>
+                                {!group.allMatched && <span className="pill pill-warn" style={{ marginLeft: 8 }}>Unmatched entries</span>}
+                              </td>
+                            </tr>
+                            {isOpen && group.rows.map(renderRow)}
+                          </tbody>
+                        );
+                      })}
                     </table>
                   </div>
                 )}
