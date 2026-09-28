@@ -2780,6 +2780,39 @@ function FIMSApp() {
     persistIfNotStale('rawMaterialIn', rawMaterialIn, nextRawMaterial);
     persistIfNotStale('rawMaterialLeftover', rawMaterialLeftover, nextLeftover);
   }, [consumption, rawMaterialIn, rawMaterialLeftover]);
+  // Content-based dedup for rawMaterialLeftover, same pattern as the rawMaterialIn merge above —
+  // needed because the migration effect right above this one isn't the only thing that writes
+  // rawMaterialIn: the auto-matcher below computes ITS OWN nextRawMaterial as
+  // `rawMaterialIn.map(...)` off whatever closure IT captured, which still includes any row the
+  // migration effect is concurrently removing. If that write lands on the server after the
+  // migration's removal, it silently restores the "removed" row — so next time this migration
+  // effect's condition re-checks (a later reload, a different tab), it finds that same legacy row
+  // still sitting in rawMaterialIn and moves it again, under a brand-new id. Confirmed as the actual
+  // cause of the duplicate tukda rows reported directly (two batches of identical data, different ids,
+  // Date.now()-based id prefixes days apart — one per app load where the race re-triggered).
+  // Keyed by an EXPLICIT field list (DEDUP_FIELDS.rawMaterialIn), NOT Object.keys(r) like the
+  // rawMaterialIn merge above still does — learned from the real Production Register dedup bug this
+  // session: two rows representing the same real entry aren't guaranteed to carry the same set of
+  // keys (a spawned leftover row never gets a `flagged`/`flagReason` key at all, unlike an
+  // extraction-shaped row), so a dynamic key comparison here would silently miss the very duplicates
+  // this exists to catch.
+  useEffect(() => {
+    if (rawMaterialLeftover.length < 2) return;
+    const groups = new Map();
+    rawMaterialLeftover.forEach(r => {
+      const key = rowDedupKey(DEDUP_FIELDS.rawMaterialIn, r);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    });
+    let mergedAny = false;
+    const next = [];
+    groups.forEach(rowsInGroup => {
+      if (rowsInGroup.length === 1) { next.push(rowsInGroup[0]); return; }
+      mergedAny = true;
+      next.push(rowsInGroup.find(r => r.consumed) || rowsInGroup[0]);
+    });
+    if (mergedAny) persistIfNotStale('rawMaterialLeftover', rawMaterialLeftover, next);
+  }, [rawMaterialLeftover]);
   // Matches each Consumption row against the ONE reel it's about — size + GSM + the "wajan" weight
   // together, since "wajan" is that reel's own original total weight (a lookup key, not an amount used
   // up), and an exact weight is effectively unique per physical reel. Searches BOTH rawMaterialIn
