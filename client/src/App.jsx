@@ -2862,6 +2862,24 @@ function FIMSApp() {
       const size = num(cRow.size);
       const gsm = num(cRow.gsm);
       const weight = num(cRow.weight_consumed);
+      // Checked BEFORE ever claiming a fresh unconsumed reel: if this row already has an orphaned
+      // match sitting unclaimed (same date/size/GSM/weight, already consumed, no matched consumption
+      // row pointing at it), that's almost certainly THIS row's own match that lost the other half of
+      // its write on an earlier pass — not a brand-new row. Claiming a fresh reel first, the way this
+      // used to work, let a retry grab a SECOND, different physical reel of the same weight instead of
+      // reconnecting to the one it already used — confirmed directly as the actual cause of two
+      // same-weight reels both ending up marked consumed from what was really only one real event (see
+      // the cleanup effect below for repairing the reels this already happened to).
+      const reconciled = consumedPool.find(rRow =>
+        !alreadyClaimedIds.has(rRow.id) &&
+        rRow.consumed === cRow.date &&
+        num(rRow.size) === size && num(rRow.gsm) === gsm && num(rRow.weight_kg) === weight
+      );
+      if (reconciled) {
+        alreadyClaimedIds.add(reconciled.id);
+        consumptionUpdateById[cRow.id] = { matchStatus: 'matched', matchedRawMaterialId: reconciled.id };
+        return;
+      }
       const findCandidate = (rRow) =>
         !rRow.consumed && !claimedIds.has(rRow.id) &&
         num(rRow.size) === size && num(rRow.gsm) === gsm && num(rRow.weight_kg) === weight;
@@ -2892,24 +2910,8 @@ function FIMSApp() {
           matchStatus: 'matched', matchedRawMaterialId: match.id,
           ...(leftoverRawMaterialId ? { leftoverRawMaterialId } : {}),
         };
-      } else {
-        // No unconsumed reel matches this row the normal way — before giving up, check whether a
-        // reel already shows consumed on EXACTLY this row's date with matching size/GSM/weight, and
-        // isn't already claimed by some OTHER matched consumption row. If so, that's almost certainly
-        // the real match that lost its other half of the write; repair the link instead of leaving it
-        // orphaned (it would otherwise never self-heal — once a reel is consumed, the normal
-        // candidate search above permanently excludes it from ever being offered again).
-        const reconciled = consumedPool.find(rRow =>
-          !alreadyClaimedIds.has(rRow.id) &&
-          rRow.consumed === cRow.date &&
-          num(rRow.size) === size && num(rRow.gsm) === gsm && num(rRow.weight_kg) === weight
-        );
-        if (reconciled) {
-          alreadyClaimedIds.add(reconciled.id);
-          consumptionUpdateById[cRow.id] = { matchStatus: 'matched', matchedRawMaterialId: reconciled.id };
-        } else if (cRow.matchStatus !== 'unmatched') {
-          consumptionUpdateById[cRow.id] = { matchStatus: 'unmatched' };
-        }
+      } else if (cRow.matchStatus !== 'unmatched') {
+        consumptionUpdateById[cRow.id] = { matchStatus: 'unmatched' };
       }
     });
     if (Object.keys(consumptionUpdateById).length) {
@@ -2928,6 +2930,61 @@ function FIMSApp() {
       persistIfNotStale('rawMaterialLeftover', rawMaterialLeftover, nextLeftover);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [consumption, rawMaterialIn, rawMaterialLeftover]);
+  // Cleanup for the damage the pre-reordering matcher already did: before the fix above, a retry on an
+  // orphaned consumption row (its match write lost, see above) would claim a FRESH unconsumed reel
+  // instead of reconnecting to the one it already used — and when a second reel of the exact same
+  // weight/size/GSM happened to exist, that left BOTH marked consumed from what was really only one
+  // real consumption event, each with its own spawned leftover. Confirmed directly: two reels at
+  // 988kg, both dated consumed 1.10.26, only one consumption row at that weight/date. Detects this by
+  // counting, per (consumed date, size, GSM, weight) profile: how many reels are marked consumed vs.
+  // how many actual consumption rows share that exact profile. More consumed reels than consumption
+  // rows means the excess is provably wrong — reverts the unclaimed excess back to unconsumed (never
+  // touches a reel a matched consumption row is actually pointing at — which specific unclaimed one
+  // gets reverted doesn't matter, they're indistinguishable by the data itself), and removes the
+  // leftover row each reverted reel spawned, found by mill+reel_no+date — a spawn always copies those
+  // from its parent reel, so this stays reliable even without leftoverRawMaterialId, which these lost
+  // writes never got to record. Self-healing: converges to a no-op once nothing is left to revert.
+  useEffect(() => {
+    const consumedReels = [...rawMaterialIn, ...rawMaterialLeftover].filter(r => r.consumed);
+    if (consumedReels.length < 2) return;
+    const claimedIds = new Set(consumption.filter(r => r.matchStatus === 'matched' && r.matchedRawMaterialId).map(r => r.matchedRawMaterialId));
+    const groups = new Map();
+    consumedReels.forEach(r => {
+      const key = `${r.consumed}|${num(r.size)}|${num(r.gsm)}|${num(r.weight_kg)}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    });
+    const toRevertIds = new Set();
+    groups.forEach((reels, key) => {
+      if (reels.length < 2) return;
+      const [date, size, gsm, weight] = key.split('|');
+      const consumptionRowsForProfile = consumption.filter(c =>
+        c.date === date && num(c.size) === Number(size) && num(c.gsm) === Number(gsm) && num(c.weight_consumed) === Number(weight)
+      ).length;
+      const excessCount = reels.length - consumptionRowsForProfile;
+      if (excessCount <= 0) return;
+      reels.filter(r => !claimedIds.has(r.id)).slice(0, excessCount).forEach(r => toRevertIds.add(r.id));
+    });
+    if (!toRevertIds.size) return;
+    const revertedReels = consumedReels.filter(r => toRevertIds.has(r.id));
+    const leftoverIdsToRemove = new Set();
+    rawMaterialLeftover.forEach(lr => {
+      if (lr.consumed) return;
+      if (revertedReels.some(r => r.mill === lr.mill && r.reel_no === lr.reel_no && r.consumed === lr.date)) {
+        leftoverIdsToRemove.add(lr.id);
+      }
+    });
+    if (rawMaterialIn.some(r => toRevertIds.has(r.id))) {
+      const nextRawMaterial = rawMaterialIn.map(r => toRevertIds.has(r.id) ? { ...r, consumed: '' } : r);
+      persistIfNotStale('rawMaterialIn', rawMaterialIn, nextRawMaterial);
+    }
+    if (rawMaterialLeftover.some(r => toRevertIds.has(r.id) || leftoverIdsToRemove.has(r.id))) {
+      const nextLeftover = rawMaterialLeftover
+        .filter(r => !leftoverIdsToRemove.has(r.id))
+        .map(r => toRevertIds.has(r.id) ? { ...r, consumed: '' } : r);
+      persistIfNotStale('rawMaterialLeftover', rawMaterialLeftover, nextLeftover);
+    }
   }, [consumption, rawMaterialIn, rawMaterialLeftover]);
   // Manual match: for a consumption row the automatic matcher couldn't resolve, lets a person pick
   // which unconsumed Raw Material In reel it's actually about — same effect as if the automatic match
