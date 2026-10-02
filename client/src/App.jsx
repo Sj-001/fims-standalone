@@ -2842,6 +2842,18 @@ function FIMSApp() {
     const leftoverConsumedDateById = {};
     const leftoverRowsToAdd = [];
     const consumptionUpdateById = {};
+    // Reconciliation for a split-write failure: this effect writes matchStatus (to consumption) and
+    // the reel's consumed date (to rawMaterialIn/rawMaterialLeftover) as two separate persistIfNotStale
+    // calls — one can succeed while the other gets dropped by its own staleness check, leaving a
+    // consumption row stuck "Unmatched" even though the reel it was actually about already shows
+    // consumed. This used to be a SEPARATE effect, but a separate effect means a SEPARATE independent
+    // write to `consumption` — and since this main effect ALSO writes the full consumption array
+    // (preserving every row it didn't mean to touch, from whatever stale closure IT captured) whenever
+    // even one unrelated row needs an update, whichever effect's write lands second would silently
+    // undo the other's fix. Folded in here instead, so there's only ever ONE decision per pass about
+    // what every row's matchStatus should be, from ONE consistent closure.
+    const alreadyClaimedIds = new Set(consumption.filter(r => r.matchStatus === 'matched' && r.matchedRawMaterialId).map(r => r.matchedRawMaterialId));
+    const consumedPool = [...rawMaterialIn, ...rawMaterialLeftover].filter(r => r.consumed);
     pending.forEach(cRow => {
       // Numeric comparison for ALL THREE fields, not just weight — "59.5" (consumption) and "59.50"
       // (raw material, or vice versa) are the exact same size but different STRINGS, so a strict
@@ -2880,8 +2892,24 @@ function FIMSApp() {
           matchStatus: 'matched', matchedRawMaterialId: match.id,
           ...(leftoverRawMaterialId ? { leftoverRawMaterialId } : {}),
         };
-      } else if (cRow.matchStatus !== 'unmatched') {
-        consumptionUpdateById[cRow.id] = { matchStatus: 'unmatched' };
+      } else {
+        // No unconsumed reel matches this row the normal way — before giving up, check whether a
+        // reel already shows consumed on EXACTLY this row's date with matching size/GSM/weight, and
+        // isn't already claimed by some OTHER matched consumption row. If so, that's almost certainly
+        // the real match that lost its other half of the write; repair the link instead of leaving it
+        // orphaned (it would otherwise never self-heal — once a reel is consumed, the normal
+        // candidate search above permanently excludes it from ever being offered again).
+        const reconciled = consumedPool.find(rRow =>
+          !alreadyClaimedIds.has(rRow.id) &&
+          rRow.consumed === cRow.date &&
+          num(rRow.size) === size && num(rRow.gsm) === gsm && num(rRow.weight_kg) === weight
+        );
+        if (reconciled) {
+          alreadyClaimedIds.add(reconciled.id);
+          consumptionUpdateById[cRow.id] = { matchStatus: 'matched', matchedRawMaterialId: reconciled.id };
+        } else if (cRow.matchStatus !== 'unmatched') {
+          consumptionUpdateById[cRow.id] = { matchStatus: 'unmatched' };
+        }
       }
     });
     if (Object.keys(consumptionUpdateById).length) {
@@ -2900,48 +2928,6 @@ function FIMSApp() {
       persistIfNotStale('rawMaterialLeftover', rawMaterialLeftover, nextLeftover);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [consumption, rawMaterialIn, rawMaterialLeftover]);
-  // Reconciliation for a split-write failure in the matcher above: it writes matchStatus (to
-  // consumption) and the reel's consumed date (to rawMaterialIn/rawMaterialLeftover) as two SEPARATE
-  // persistIfNotStale calls from the same pass — not atomic. One can succeed while the other gets
-  // silently dropped by its own staleness check, leaving a consumption row stuck showing "Unmatched"
-  // forever even though the reel it was actually about already shows `consumed` — confirmed directly
-  // as a real, reproducible case (the Sheet had the consumed date; the app kept showing Unmatched even
-  // after a reload). It stays stuck because once a reel is marked consumed, the matcher's own
-  // candidate search (`!rRow.consumed`) permanently excludes it, so the row can never be re-offered a
-  // match the normal way. This re-links it instead: for every still-unmatched consumption row, look
-  // for a reel (either register) already consumed on EXACTLY that row's date with matching
-  // size/GSM/weight, not already claimed by some OTHER matched consumption row — if found, that's
-  // almost certainly the real match that lost its other half of the write, so repair the link directly
-  // rather than leaving it orphaned. Self-healing like the migration/dedup effects above: converges to
-  // a no-op once nothing is left to reconcile, so it also catches any future recurrence of the same
-  // race automatically. Deliberately doesn't attempt to recover leftoverRawMaterialId for a leftover
-  // that was spawned by the same lost write — that already degrades gracefully to the existing
-  // "untraceable leftover" warning in runClearSelected rather than failing silently.
-  useEffect(() => {
-    const stillUnmatched = consumption.filter(r => r.matchStatus !== 'matched');
-    if (!stillUnmatched.length) return;
-    const claimedIds = new Set(consumption.filter(r => r.matchStatus === 'matched' && r.matchedRawMaterialId).map(r => r.matchedRawMaterialId));
-    const consumedPool = [...rawMaterialIn, ...rawMaterialLeftover].filter(r => r.consumed);
-    const consumptionUpdateById = {};
-    stillUnmatched.forEach(cRow => {
-      const size = num(cRow.size);
-      const gsm = num(cRow.gsm);
-      const weight = num(cRow.weight_consumed);
-      const match = consumedPool.find(rRow =>
-        !claimedIds.has(rRow.id) &&
-        rRow.consumed === cRow.date &&
-        num(rRow.size) === size && num(rRow.gsm) === gsm && num(rRow.weight_kg) === weight
-      );
-      if (match) {
-        claimedIds.add(match.id);
-        consumptionUpdateById[cRow.id] = { matchStatus: 'matched', matchedRawMaterialId: match.id };
-      }
-    });
-    if (Object.keys(consumptionUpdateById).length) {
-      const nextConsumption = consumption.map(r => consumptionUpdateById[r.id] ? { ...r, ...consumptionUpdateById[r.id] } : r);
-      persistIfNotStale('consumption', consumption, nextConsumption);
-    }
   }, [consumption, rawMaterialIn, rawMaterialLeftover]);
   // Manual match: for a consumption row the automatic matcher couldn't resolve, lets a person pick
   // which unconsumed Raw Material In reel it's actually about — same effect as if the automatic match
