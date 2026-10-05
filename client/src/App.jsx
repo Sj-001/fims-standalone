@@ -4675,19 +4675,14 @@ function FIMSApp() {
       setSyncStatus(prev => ({ ...prev, [customer]: { state: 'error', message: e.message || 'Network error — could not reach the server.' } }));
     }
   };
-  // Verifies outstanding rows against the real Sheet automatically on every load, for every customer
-  // with a linked Sheet ID — reuses syncFromSheet itself (the exact same live read "Sync entries"
-  // already does by hand), just triggered once automatically instead of waiting for a manual click.
-  // Runs once per load (autoSyncedRef), not on every render.
-  const autoSyncedRef = useRef(false);
-  useEffect(() => {
-    if (!loaded || autoSyncedRef.current || !allCustomerTabNames.length) return;
-    autoSyncedRef.current = true;
-    allCustomerTabNames.forEach(customer => {
-      if (getCustomerSheetId(customer).trim()) syncFromSheet(customer);
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loaded, allCustomerTabNames]);
+  // NOTE: this used to also auto-trigger syncFromSheet (a live re-fetch) for every customer on every
+  // load. Reverted — it fired syncFromSheet repeatedly in quick succession across customers, and
+  // syncFromSheet has its own pre-existing fragility: if a block's known-row-count baseline is even
+  // slightly stale, it mistakes a row THIS APP ITSELF just pushed for one "added by hand" and re-pulls
+  // it in as a duplicate local row. Confirmed directly as a real, visible symptom (outstanding counts
+  // flickering between values right after load). The reconciliation below still runs, but only ever
+  // against customerSheetsMirror as it already stands (from a push or a manual Sync) — never triggers
+  // a fresh network read on its own.
   // Reconciles a row that's genuinely already in the real Sheet but still shows outstanding locally —
   // confirmed directly as a real case (a push's Sheet write landed, but the separate local
   // pushedToSheet write that was supposed to follow it got lost, same class of split-write issue fixed

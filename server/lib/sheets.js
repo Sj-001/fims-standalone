@@ -590,38 +590,6 @@ const forceTextValue = (v) => `'${v === undefined || v === null ? '' : v}`;
 // that needs writing (title/header/data are separate ranges for a new block; just data for an
 // existing one). The caller turns each into an A1 range and, separately, a highlight request — same
 // structured data drives both, so there's no risk of the two ever disagreeing about what's "new".
-// Finds an empty, unused gap between two existing blocks wide enough for a new block to reuse, instead
-// of always appending at the tab's rightmost edge and running it out of columns — confirmed directly
-// as a real problem (a push rejected with "exceeds grid limits" on a tab that had a wide genuinely-
-// empty gap sitting unused between two real blocks). A gap only qualifies if EVERY cell in every row of
-// the existing grid, across the exact columns a new block would occupy, is genuinely blank — title row,
-// header row, and every data row, checked directly against the real grid content rather than trusting
-// the gap "looks" empty from the parsed block list alone. Any single non-blank cell in that range
-// disqualifies it entirely: this must never land on top of real content, even a stray note or a block
-// that technically failed to parse as a recognized block (e.g. a missing/renamed "Date" header) but
-// still has real data sitting in it. Returns the gap's 0-indexed start column, or null if none
-// qualifies — callers fall back to appending at the tab's rightmost edge exactly as before.
-function findReusableGapCol(existingGrid, blocks, neededWidth) {
-  const sorted = [...blocks].sort((a, b) => a.startCol - b.startCol);
-  const isColumnRangeBlank = (startCol0, endCol0Exclusive) => {
-    for (let r = 0; r < existingGrid.length; r++) {
-      const row = existingGrid[r] || [];
-      for (let c = startCol0; c < endCol0Exclusive; c++) {
-        if (normalizeCellStr(row[c])) return false;
-      }
-    }
-    return true;
-  };
-  for (let i = 0; i < sorted.length - 1; i++) {
-    const gapStart = sorted[i].startCol + sorted[i].width;
-    const gapEnd = sorted[i + 1].startCol;
-    if (gapEnd - gapStart >= neededWidth && isColumnRangeBlank(gapStart, gapStart + neededWidth)) {
-      return gapStart;
-    }
-  }
-  return null;
-}
-
 function computeMergePatches(existingGrid, variants) {
   const { headerRowIdx, blocks } = parseExistingBlocks(existingGrid);
   const usedHeaderRowIdx = headerRowIdx === -1 ? 1 : headerRowIdx; // title row 0, header row 1 by default
@@ -791,11 +759,13 @@ function computeMergePatches(existingGrid, variants) {
     if (rematch) { processBlockGroup(rematch, [{ v, incomingRows }]); return; }
     {
       const width = Math.max(header.length, ...incomingRows.map(r => (r || []).length), 1);
-      // Prefer an existing, verified-blank gap between two real blocks over extending the tab further
-      // right — see findReusableGapCol. Only tried when at least one real block already exists; a
-      // completely blank tab has no gaps to find anyway.
-      const reusableGapCol = blocks.length > 1 ? findReusableGapCol(existingGrid, blocks, width) : null;
-      const startCol = reusableGapCol !== null ? reusableGapCol : (rightmostCol === -1 ? 0 : rightmostCol + 1);
+      // Always appends at the tab's rightmost edge — a previous version of this reused a verified-blank
+      // gap between two existing blocks instead, but a gap can be a deliberate narrow visual spacer
+      // (its own column widths were never fetched or checked), not real unused space. Confirmed
+      // directly: a reused gap left a new block's title/header text visually cramped against its
+      // neighbor. The tab running out of columns for a rightmost append is handled separately, by
+      // expanding the grid before writing (see pushCustomerSheet).
+      const startCol = rightmostCol === -1 ? 0 : rightmostCol + 1;
       const openingCol = colLetter(startCol + 1);
       const prodCol = colLetter(startCol + 2);
       const dispCol = colLetter(startCol + 3);
