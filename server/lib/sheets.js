@@ -590,6 +590,38 @@ const forceTextValue = (v) => `'${v === undefined || v === null ? '' : v}`;
 // that needs writing (title/header/data are separate ranges for a new block; just data for an
 // existing one). The caller turns each into an A1 range and, separately, a highlight request — same
 // structured data drives both, so there's no risk of the two ever disagreeing about what's "new".
+// Finds an empty, unused gap between two existing blocks wide enough for a new block to reuse, instead
+// of always appending at the tab's rightmost edge and running it out of columns — confirmed directly
+// as a real problem (a push rejected with "exceeds grid limits" on a tab that had a wide genuinely-
+// empty gap sitting unused between two real blocks). A gap only qualifies if EVERY cell in every row of
+// the existing grid, across the exact columns a new block would occupy, is genuinely blank — title row,
+// header row, and every data row, checked directly against the real grid content rather than trusting
+// the gap "looks" empty from the parsed block list alone. Any single non-blank cell in that range
+// disqualifies it entirely: this must never land on top of real content, even a stray note or a block
+// that technically failed to parse as a recognized block (e.g. a missing/renamed "Date" header) but
+// still has real data sitting in it. Returns the gap's 0-indexed start column, or null if none
+// qualifies — callers fall back to appending at the tab's rightmost edge exactly as before.
+function findReusableGapCol(existingGrid, blocks, neededWidth) {
+  const sorted = [...blocks].sort((a, b) => a.startCol - b.startCol);
+  const isColumnRangeBlank = (startCol0, endCol0Exclusive) => {
+    for (let r = 0; r < existingGrid.length; r++) {
+      const row = existingGrid[r] || [];
+      for (let c = startCol0; c < endCol0Exclusive; c++) {
+        if (normalizeCellStr(row[c])) return false;
+      }
+    }
+    return true;
+  };
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const gapStart = sorted[i].startCol + sorted[i].width;
+    const gapEnd = sorted[i + 1].startCol;
+    if (gapEnd - gapStart >= neededWidth && isColumnRangeBlank(gapStart, gapStart + neededWidth)) {
+      return gapStart;
+    }
+  }
+  return null;
+}
+
 function computeMergePatches(existingGrid, variants) {
   const { headerRowIdx, blocks } = parseExistingBlocks(existingGrid);
   const usedHeaderRowIdx = headerRowIdx === -1 ? 1 : headerRowIdx; // title row 0, header row 1 by default
@@ -758,8 +790,12 @@ function computeMergePatches(existingGrid, variants) {
     const rematch = blocks.find(b => normalizeTabKey(b.title) === key);
     if (rematch) { processBlockGroup(rematch, [{ v, incomingRows }]); return; }
     {
-      const startCol = rightmostCol === -1 ? 0 : rightmostCol + 1;
       const width = Math.max(header.length, ...incomingRows.map(r => (r || []).length), 1);
+      // Prefer an existing, verified-blank gap between two real blocks over extending the tab further
+      // right — see findReusableGapCol. Only tried when at least one real block already exists; a
+      // completely blank tab has no gaps to find anyway.
+      const reusableGapCol = blocks.length > 1 ? findReusableGapCol(existingGrid, blocks, width) : null;
+      const startCol = reusableGapCol !== null ? reusableGapCol : (rightmostCol === -1 ? 0 : rightmostCol + 1);
       const openingCol = colLetter(startCol + 1);
       const prodCol = colLetter(startCol + 2);
       const dispCol = colLetter(startCol + 3);
@@ -784,7 +820,12 @@ function computeMergePatches(existingGrid, variants) {
       });
       if (values.length) patches.push({ startRow0: dataStartRow0, startCol0: startCol, values, isNewRow: true });
       placements.push({ title: v.title, startCol0: startCol, width, lastWrittenRow1: dataStartRow0 + values.length });
-      rightmostCol = startCol + width;
+      // Math.max, never a plain assignment: when startCol came from a reused gap, it can land well
+      // BEFORE the tab's actual rightmost block — a plain assignment here would wrongly shrink
+      // rightmostCol, and the NEXT new block placed later in this same push (if no further gap fits
+      // it) would then compute its own append position relative to that shrunk value and land right on
+      // top of whatever real block is still further right.
+      rightmostCol = Math.max(rightmostCol, startCol + width);
       const newExistingRows = incomingRows.map((r, i) => ({
         rowIdx: dataStartRow0 + i, dateKey: canonicalDateKey((r || [])[0]),
         production: Number((r || [])[2]) || 0, dispatch: Number((r || [])[3]) || 0, opening: 0, closing: 0,
@@ -1044,10 +1085,40 @@ async function pushCustomerSheet(spreadsheetId, itemGroups) {
   const dataUpdates = [];
   const patchesByTab = {};
   const structuralInsertRequests = [];
+  // A tab's grid (rowCount/columnCount) is a fixed allocation Google Sheets enforces on every write —
+  // it does NOT auto-grow for a values.batchUpdate the way a person typing past the edge in the UI
+  // would get it to. Confirmed directly as a real push failure ("exceeds grid limits... max columns:
+  // 36") on a tab that simply never had its columns expanded to fit everything side-by-side on it.
+  // Computed per tab from what THIS push's own patches/inserts actually need to reach, so it only ever
+  // grows a tab exactly as much as this push requires — never a guessed buffer.
+  const gridExpansionRequests = [];
   for (const plan of tabPlans) {
     const previousGrid = previousValuesByTab[plan.tabName] || [];
     const { patches, placements, insertRequests } = computeMergePatches(previousGrid, plan.variants);
     patchesByTab[plan.tabName] = patches;
+    const meta = existingMeta[plan.tabName];
+    if (meta) {
+      let neededCols = meta.columnCount;
+      let neededRows = meta.rowCount;
+      patches.forEach(p => {
+        const width = Math.max(0, ...p.values.map(r => r.length));
+        neededCols = Math.max(neededCols, p.startCol0 + width);
+        neededRows = Math.max(neededRows, p.startRow0 + p.values.length);
+      });
+      (insertRequests || []).forEach(ir => {
+        neededCols = Math.max(neededCols, ir.startCol0 + ir.width);
+      });
+      if (neededCols > meta.columnCount || neededRows > meta.rowCount) {
+        gridExpansionRequests.push({
+          updateSheetProperties: {
+            properties: { sheetId: meta.sheetId, gridProperties: { rowCount: neededRows, columnCount: neededCols } },
+            fields: 'gridProperties.rowCount,gridProperties.columnCount',
+          },
+        });
+        meta.rowCount = neededRows;
+        meta.columnCount = neededCols;
+      }
+    }
     // Real "make room" requests — inserting blank rows so a chronologically-earlier new date lands
     // BEFORE whatever's already physically below it, instead of always after. Must happen (and finish)
     // before any values get written, since every row target in `patches` already assumes these inserts
@@ -1078,6 +1149,14 @@ async function pushCustomerSheet(spreadsheetId, itemGroups) {
     // real writes but not new rows, and conflating them is exactly what made this number confusing before.
     const newRows = patches.filter(p => p.isNewRow).reduce((s, p) => s + p.values.length, 0);
     results.push({ tab: plan.tabName, ok: true, newRows, placements });
+  }
+  if (gridExpansionRequests.length) {
+    try {
+      await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: gridExpansionRequests } });
+    } catch (e) {
+      const msg = friendlyGoogleError(e);
+      return tabPlans.map(plan => ({ tab: plan.tabName, ok: false, error: msg }));
+    }
   }
   if (structuralInsertRequests.length) {
     try {
