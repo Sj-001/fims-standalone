@@ -3,7 +3,7 @@ import * as XLSX from 'xlsx';
 import {
   Upload, Image as ImageIcon, Package, Boxes, Search, Truck, ClipboardList,
   FileSpreadsheet, Download, CheckCircle2, XCircle, Trash2, Loader2,
-  AlertCircle, LayoutDashboard, FileText, Archive, ListChecks, Plus, RefreshCw, Link2, Info, Check,
+  AlertCircle, LayoutDashboard, FileText, Archive, ListChecks, Plus, RefreshCw, Link2, Info, Check, RotateCcw,
 } from 'lucide-react';
 /* ============================== helpers ============================== */
 const num = (v) => {
@@ -1312,7 +1312,7 @@ function BatchFillRow({ columns, rows, onUpdate, selectedIds, onClearSelection }
     </tr>
   );
 }
-function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow, sortByDate = true, showBatchFill = false }) {
+function EditableTable({ columns, rows, onUpdate, onDelete, onUnpush, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow, sortByDate = true, showBatchFill = false }) {
   // Row selection (also showBatchFill-only, see BatchFillRow's "Apply to selected"): a plain click
   // TOGGLES just that row's checkbox without touching any other row's selection — matches the literal
   // checkbox rendered in the gutter (Gmail-style: click one, click another, both end up checked),
@@ -1438,6 +1438,11 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
                   </td>
                 ))}
                 <td className="col-action">
+                  {onUnpush && row.pushedToSheet && (
+                    <button className="icon-btn" title="Mark as not yet pushed — shows this back up as outstanding, for a row marked pushed by mistake" onClick={() => onUnpush(row.id)}>
+                      <RotateCcw size={15} />
+                    </button>
+                  )}
                   <button className="icon-btn danger" title="Delete row" onClick={() => onDelete(row.id)}>
                     <Trash2 size={15} />
                   </button>
@@ -1450,7 +1455,7 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
     </div>
   );
 }
-function RegisterPanel({ title, subtitle, columns, rows, onUpdate, onDelete, onExport, extra, suppressFlags = false, highlightRow }) {
+function RegisterPanel({ title, subtitle, columns, rows, onUpdate, onDelete, onUnpush, onExport, extra, suppressFlags = false, highlightRow }) {
   return (
     <div className="panel">
       <div className="panel-header">
@@ -1461,7 +1466,7 @@ function RegisterPanel({ title, subtitle, columns, rows, onUpdate, onDelete, onE
         <button className="btn btn-ghost" onClick={onExport}><Download size={15} /> Export this table</button>
       </div>
       {extra}
-      <EditableTable columns={columns} rows={rows} onUpdate={onUpdate} onDelete={onDelete} suppressFlags={suppressFlags} highlightRow={highlightRow} />
+      <EditableTable columns={columns} rows={rows} onUpdate={onUpdate} onDelete={onDelete} onUnpush={onUnpush} suppressFlags={suppressFlags} highlightRow={highlightRow} />
     </div>
   );
 }
@@ -2040,6 +2045,17 @@ function FIMSApp() {
   const deleteRow = (registerKey) => (id) => {
     registerSetters[registerKey](prev => {
       const next = prev.filter(r => r.id !== id);
+      persist(registerKey, next);
+      return next;
+    });
+  };
+  // Manual escape hatch for a row wrongly marked pushedToSheet — a row the app only ever considers
+  // "outstanding" while this is false, with no other way to flip it back once set (confirmed directly
+  // as a real need: a genuinely outstanding row got auto-marked pushed by mistake and stopped showing
+  // up anywhere to catch it). Only touches this one flag; nothing else about the row changes.
+  const unpushRow = (registerKey) => (id) => {
+    registerSetters[registerKey](prev => {
+      const next = prev.map(r => r.id === id ? { ...r, pushedToSheet: false } : r);
       persist(registerKey, next);
       return next;
     });
@@ -5412,11 +5428,11 @@ function FIMSApp() {
           )}
           {loaded && activeTab === 'production' && (
             <RegisterPanel title="Production Register" subtitle="From handwritten daily production sheets — covers both the shade/size/GSM style and the product-description style. Rows from the description style also feed the Customer Stock tab. Dispatch bills do NOT land here — see the Customer Dispatch Bills tab." columns={COLUMNS.production} rows={production}
-              onUpdate={updateRow('production')} onDelete={deleteRow('production')} onExport={() => exportSheet('Production_Register', production, COLUMNS.production)} suppressFlags highlightRow={needsCustomerHighlight} />
+              onUpdate={updateRow('production')} onDelete={deleteRow('production')} onUnpush={unpushRow('production')} onExport={() => exportSheet('Production_Register', production, COLUMNS.production)} suppressFlags highlightRow={needsCustomerHighlight} />
           )}
           {loaded && activeTab === 'customerDispatch' && (
             <RegisterPanel title="Customer Dispatch Bills" subtitle="From dispatch bills / tax invoices sent to customers (Bindal, Diamond, Anmol, or otherwise) — kept separate from the Production Register. Once confirmed on the Customer Stock tab, these reduce that customer's balance there." columns={COLUMNS.customerDispatch} rows={customerDispatch}
-              onUpdate={updateRow('customerDispatch')} onDelete={deleteRow('customerDispatch')} onExport={() => exportSheet('Customer_Dispatch_Bills', customerDispatch, COLUMNS.customerDispatch)} highlightRow={needsCustomerHighlight} />
+              onUpdate={updateRow('customerDispatch')} onDelete={deleteRow('customerDispatch')} onUnpush={unpushRow('customerDispatch')} onExport={() => exportSheet('Customer_Dispatch_Bills', customerDispatch, COLUMNS.customerDispatch)} highlightRow={needsCustomerHighlight} />
           )}
           {loaded && activeTab === 'search' && (
             <div>
