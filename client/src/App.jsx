@@ -4561,59 +4561,6 @@ function FIMSApp() {
       });
     }
   };
-  // Self-healing reconciliation for a row that's genuinely already in the real Sheet but still shows
-  // as outstanding locally — confirmed directly as a real case (a push's Sheet write landed, but the
-  // separate local pushedToSheet write that was supposed to follow it got lost, the same class of
-  // split-write issue seen elsewhere in this app; the row then sits "outstanding" forever, since
-  // nothing ever retries marking it). Rather than requiring a manual check, this compares every
-  // customer's currently-outstanding rows against customerSheetsMirror — the locally-held copy of what
-  // each customer's real Sheet actually contains, refreshed by Sync/Import/Push — and marks a row
-  // pushedToSheet the moment a matching real entry is found there (same tab, same block, same date,
-  // same production/dispatch numbers). Each mirror row can satisfy at most one local row
-  // (claimedMirrorIds) specifically so that several outstanding rows which happen to share the exact
-  // same date/quantity for the same item can't all get marked off a single real Sheet row — only as
-  // many of them as the Sheet actually, verifiably has. Runs whenever the mirror refreshes or the
-  // outstanding set changes; a row with nothing matching in the mirror is untouched and stays
-  // genuinely outstanding.
-  useEffect(() => {
-    if (!customerSheetsMirror.length || !allCustomerTabNames.length) return;
-    const claimedMirrorIds = new Set();
-    const productionIdsToMark = new Set();
-    const dispatchIdsToMark = new Set();
-    allCustomerTabNames.forEach(customer => {
-      const mirrorForCustomer = customerSheetsMirror.filter(m => m.customer === customer);
-      if (!mirrorForCustomer.length) return;
-      const { itemGroups } = buildCustomerSheetPayload(customer);
-      itemGroups.forEach(g => {
-        g.variants.forEach(v => {
-          const blockTitle = v.blockTitleOverride || v.title;
-          (v.rows || []).forEach((row, ri) => {
-            const [date, , production, dispatch] = row;
-            const match = mirrorForCustomer.find(m =>
-              !claimedMirrorIds.has(m.id) &&
-              m.sheetTab === g.tabName && m.block === blockTitle && m.date === date &&
-              num(m.production) === num(production) && num(m.dispatch) === num(dispatch)
-            );
-            if (match) {
-              claimedMirrorIds.add(match.id);
-              const src = (v.rowSourceIds && v.rowSourceIds[ri]) || {};
-              (src.productionIds || []).forEach(id => productionIdsToMark.add(id));
-              (src.dispatchIds || []).forEach(id => dispatchIdsToMark.add(id));
-            }
-          });
-        });
-      });
-    });
-    if (productionIdsToMark.size) {
-      const nextProduction = production.map(r => productionIdsToMark.has(r.id) ? { ...r, pushedToSheet: true } : r);
-      persistIfNotStale('production', production, nextProduction);
-    }
-    if (dispatchIdsToMark.size) {
-      const nextDispatch = customerDispatch.map(r => dispatchIdsToMark.has(r.id) ? { ...r, pushedToSheet: true } : r);
-      persistIfNotStale('customerDispatch', customerDispatch, nextDispatch);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [confirmedProductionRows, confirmedDispatchRows, customerSheetsMirror, productCatalog, customerMapping, allCustomerTabNames]);
   // Toggles the inline "Preview outstanding" breakdown per customer — closed by default so the panel
   // stays compact, since most of the time nobody needs to look.
   const [outstandingPreviewOpen, setOutstandingPreviewOpen] = useState({});
