@@ -3855,11 +3855,14 @@ function FIMSApp() {
   };
   // Display-only view of everything still outstanding (confirmed, not yet pushed) for a customer —
   // used purely to show counts/diffs on screen. Never used to decide what a push actually sends; see
-  // buildCustomerSheetPayloadFromRows above.
+  // buildCustomerSheetPayloadFromRows above. excludedFromPush rows are left out entirely — set when a
+  // person deletes a stale entry from the "Preview outstanding" list: the underlying register row is
+  // NEVER touched or removed, it just permanently stops counting as outstanding, rather than coming
+  // back the next time this is computed (which a one-push-only skip would have let happen).
   const buildCustomerSheetPayload = (customer) => buildCustomerSheetPayloadFromRows(
     customer,
-    confirmedProductionRows.filter(row => !row.pushedToSheet),
-    confirmedDispatchRows.filter(row => !row.pushedToSheet),
+    confirmedProductionRows.filter(row => !row.pushedToSheet && !row.excludedFromPush),
+    confirmedDispatchRows.filter(row => !row.pushedToSheet && !row.excludedFromPush),
   );
   // reviewEdits[customer] is always empty now (see its declaration) — kept as a harmless no-op pass-
   // through rather than reworking every call site that still asks for the "edited" payload.
@@ -4422,7 +4425,7 @@ function FIMSApp() {
     // no-touching-old-entries rule) — marking them pushed is what keeps the next push from resending
     // (duplicating) them, so this has to run for every tab the response actually confirms as ok, even
     // when the overall push is reported as a partial failure.
-    const markPushedForIndexes = (indexes) => {
+    const idsForIndexes = (indexes) => {
       const productionIds = new Set();
       const dispatchIds = new Set();
       indexes.forEach(i => {
@@ -4431,6 +4434,19 @@ function FIMSApp() {
         ids.production.forEach(id => productionIds.add(id));
         ids.customerDispatch.forEach(id => dispatchIds.add(id));
       });
+      return { productionIds, dispatchIds };
+    };
+    // Still-outstanding count after this push, surfaced alongside the done/error message so it's never
+    // just "sent" or "failed" with no sense of what's left — reads confirmedProductionRows/
+    // confirmedDispatchRows (this function's outer closure, snapshotted at call time) directly, minus
+    // whichever ids THIS push just marked pushed, rather than waiting for the setProduction/
+    // setCustomerDispatch state updates above to actually flush (those are async; this needs the answer
+    // for the SAME pushStatus update being set right after).
+    const countStillOutstanding = (justPushedProductionIds, justPushedDispatchIds) =>
+      confirmedProductionRows.filter(r => !r.pushedToSheet && !justPushedProductionIds.has(r.id) && (r.confirmedCustomer || '').trim() === customer).length +
+      confirmedDispatchRows.filter(r => !r.pushedToSheet && !justPushedDispatchIds.has(r.id) && (r.confirmedCustomer || '').trim() === customer).length;
+    const markPushedForIndexes = (indexes) => {
+      const { productionIds, dispatchIds } = idsForIndexes(indexes);
       if (productionIds.size) {
         setProduction(prev => {
           const next = prev.map(r => productionIds.has(r.id) ? { ...r, pushedToSheet: true } : r);
@@ -4463,12 +4479,14 @@ function FIMSApp() {
       // failure appends AFTER every real per-tab result — never a stand-in for an actual itemGroups
       // entry, so it must never be looked up by index either.
       const okIndexes = (data.results || []).reduce((acc, r, i) => { if (r.ok && i < wireItemGroups.length) acc.push(i); return acc; }, []);
+      const { productionIds: justPushedProductionIds, dispatchIds: justPushedDispatchIds } = idsForIndexes(okIndexes);
       if (okIndexes.length) markPushedForIndexes(okIndexes);
+      const stillOutstanding = countStillOutstanding(justPushedProductionIds, justPushedDispatchIds);
       if (!(res.ok && data.ok)) {
         const failedTabs = (data.results || []).filter(r => !r.ok).map(r => `${r.tab}: ${r.error}`).join(' · ');
         const partialRows = (data.results || []).filter(r => r.ok).reduce((s, r) => s + (r.newRows || 0), 0);
         const partialNote = partialRows ? ` ${partialRows} item${partialRows === 1 ? '' : 's'} still sent.` : '';
-        setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: (failedTabs || data.error || `Push failed (HTTP ${res.status}).`) + partialNote, unmatched } }));
+        setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: (failedTabs || data.error || `Push failed (HTTP ${res.status}).`) + partialNote, unmatched, stillOutstanding } }));
         // Even on an overall-failed push, whatever DID land in the Sheet (the tabs in okIndexes) is real —
         // still worth reflecting in the mirror, re-baselining known counts, and re-diffing the review,
         // same as a full success would.
@@ -4480,7 +4498,7 @@ function FIMSApp() {
         return;
       }
       const rowsWritten = (data.results || []).reduce((s, r) => s + (r.newRows || 0), 0);
-      setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Sent ${rowsWritten} item${rowsWritten === 1 ? '' : 's'} to ${customer}.`, unmatched } }));
+      setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Sent ${rowsWritten} item${rowsWritten === 1 ? '' : 's'} to ${customer}.`, unmatched, stillOutstanding } }));
       patchCustomerSheetEntry(customer, { sheetId, lastPushedAt: new Date().toISOString() });
       // Refreshes this customer's slice of the Customer Sheets Mirror with what's really in the Sheet
       // post-push (the server re-reads it fresh — see pushCustomerSheetHandler) so search reflects the
@@ -4495,7 +4513,7 @@ function FIMSApp() {
       setReviewEdits(prev => { const next = { ...prev }; delete next[customer]; return next; });
       refreshReview(customer);
     } catch (e) {
-      setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: e.message || 'Network error — could not reach the server.', unmatched } }));
+      setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: e.message || 'Network error — could not reach the server.', unmatched, stillOutstanding: countStillOutstanding(new Set(), new Set()) } }));
     } finally {
       pushInFlightRef.current.delete(customer);
       // Anything that tried to push this same customer while this one was running gets its turn now,
@@ -4520,9 +4538,28 @@ function FIMSApp() {
   const pushOutstandingForCustomer = (customer) => {
     pushCustomerSheetNow(
       customer,
-      confirmedProductionRows.filter(r => !r.pushedToSheet && (r.confirmedCustomer || '').trim() === customer),
-      confirmedDispatchRows.filter(r => !r.pushedToSheet && (r.confirmedCustomer || '').trim() === customer),
+      confirmedProductionRows.filter(r => !r.pushedToSheet && !r.excludedFromPush && (r.confirmedCustomer || '').trim() === customer),
+      confirmedDispatchRows.filter(r => !r.pushedToSheet && !r.excludedFromPush && (r.confirmedCustomer || '').trim() === customer),
     );
+  };
+  // Permanently removes an entry from "outstanding" without touching the underlying Production/Dispatch
+  // register row at all — set from the Preview outstanding list, for stale/irrelevant entries that
+  // shouldn't keep showing up as something to push, ever again, not just skipped this one time.
+  const excludeFromOutstanding = (productionIds, dispatchIds) => {
+    if ((productionIds || []).length) {
+      setProduction(prev => {
+        const next = prev.map(r => productionIds.includes(r.id) ? { ...r, excludedFromPush: true } : r);
+        persist('production', next);
+        return next;
+      });
+    }
+    if ((dispatchIds || []).length) {
+      setCustomerDispatch(prev => {
+        const next = prev.map(r => dispatchIds.includes(r.id) ? { ...r, excludedFromPush: true } : r);
+        persist('customerDispatch', next);
+        return next;
+      });
+    }
   };
   // Toggles the inline "Preview outstanding" breakdown per customer — closed by default so the panel
   // stays compact, since most of the time nobody needs to look.
@@ -6085,6 +6122,13 @@ function FIMSApp() {
                     {pushStatus[customer]?.state === 'pushing' && <div className="doc-hint" style={{ marginTop: 6 }}><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle', marginRight: 4 }} />pushing…</div>}
                     {pushStatus[customer]?.state === 'done' && <div className="doc-hint" style={{ marginTop: 6, color: 'var(--ok)' }}>✓ {pushStatus[customer].message}</div>}
                     {pushStatus[customer]?.state === 'error' && <div style={{ marginTop: 6, color: 'var(--ledger-red)', fontSize: 12.5 }}>{pushStatus[customer].message}</div>}
+                    {(pushStatus[customer]?.state === 'done' || pushStatus[customer]?.state === 'error') && typeof pushStatus[customer].stillOutstanding === 'number' && (
+                      pushStatus[customer].stillOutstanding > 0 ? (
+                        <div className="doc-hint" style={{ marginTop: 2, color: 'var(--ledger-red)' }}>⚠ {pushStatus[customer].stillOutstanding} entr{pushStatus[customer].stillOutstanding === 1 ? 'y' : 'ies'} still outstanding for {customer} after this push.</div>
+                      ) : (
+                        <div className="doc-hint" style={{ marginTop: 2 }}>Nothing left outstanding for {customer}.</div>
+                      )
+                    )}
                     {pushStatus[customer]?.unmatched?.length > 0 && (
                       <div style={{ marginTop: 2, color: 'var(--ledger-red)', fontSize: 12.5 }}>
                         ⚠ Not sent — no Sheet Tab mapped yet for: {pushStatus[customer].unmatched.join(', ')}. Map {pushStatus[customer].unmatched.length === 1 ? 'it' : 'them'} in the Known Product Catalog, then push again.
@@ -6101,10 +6145,21 @@ function FIMSApp() {
                                 <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4 }}>{v.title}{v.blockTitleOverride && v.blockTitleOverride !== v.title ? ` → block "${v.blockTitleOverride}"` : ''}</div>
                                 <div className="table-wrap">
                                   <table>
-                                    <thead><tr>{v.header.map(h => <th key={h}>{h}</th>)}</tr></thead>
+                                    <thead><tr>{v.header.map(h => <th key={h}>{h}</th>)}<th className="col-action"></th></tr></thead>
                                     <tbody>
                                       {v.rows.map((row, ri) => (
-                                        <tr key={ri}>{row.map((cell, ci) => <td key={ci} style={{ padding: '6px 10px' }}>{cell ?? ''}</td>)}</tr>
+                                        <tr key={ri}>
+                                          {row.map((cell, ci) => <td key={ci} style={{ padding: '6px 10px' }}>{cell ?? ''}</td>)}
+                                          <td className="col-action">
+                                            <button className="icon-btn danger" title="Remove from outstanding — keeps the entry in the register, just stops it being pushed"
+                                              onClick={() => {
+                                                const src = (v.rowSourceIds && v.rowSourceIds[ri]) || {};
+                                                excludeFromOutstanding(src.productionIds, src.dispatchIds);
+                                              }}>
+                                              <Trash2 size={15} />
+                                            </button>
+                                          </td>
+                                        </tr>
                                       ))}
                                     </tbody>
                                   </table>
