@@ -4524,6 +4524,9 @@ function FIMSApp() {
       confirmedDispatchRows.filter(r => !r.pushedToSheet && (r.confirmedCustomer || '').trim() === customer),
     );
   };
+  // Toggles the inline "Preview outstanding" breakdown per customer — closed by default so the panel
+  // stays compact, since most of the time nobody needs to look.
+  const [outstandingPreviewOpen, setOutstandingPreviewOpen] = useState({});
   const [syncStatus, setSyncStatus] = useState({}); // { [customer]: { state: 'syncing'|'done'|'error', message } }
   // Finds the item name this app would normally use for a real block, so a row pulled in from the Sheet
   // groups correctly with everything else already tracked for that item instead of starting a stray
@@ -6062,9 +6065,14 @@ function FIMSApp() {
                       </div>
                       <div style={{ display: 'flex', gap: 8 }}>
                         {outstandingRowCount > 0 && (
-                          <button className="btn btn-primary" onClick={() => pushOutstandingForCustomer(customer)} disabled={!sheetId.trim()} title="Push everything already confirmed for this customer that hasn't reached the Sheet yet — e.g. a row confirmed here but never actually sent">
-                            <FileSpreadsheet size={15} /> Push outstanding ({outstandingRowCount})
-                          </button>
+                          <>
+                            <button className="btn btn-ghost" onClick={() => setOutstandingPreviewOpen(prev => ({ ...prev, [customer]: !prev[customer] }))}>
+                              {outstandingPreviewOpen[customer] ? 'Hide preview' : 'Preview outstanding'}
+                            </button>
+                            <button className="btn btn-primary" onClick={() => pushOutstandingForCustomer(customer)} disabled={!sheetId.trim()} title="Push everything already confirmed for this customer that hasn't reached the Sheet yet — e.g. a row confirmed here but never actually sent">
+                              <FileSpreadsheet size={15} /> Push outstanding ({outstandingRowCount})
+                            </button>
+                          </>
                         )}
                         <button className="btn btn-ghost" onClick={() => syncFromSheet(customer)} disabled={syncStatus[customer]?.state === 'syncing' || !sheetId.trim()} title="Read this customer's Sheet and pull in any rows added directly there by hand — never writes anything to the Sheet itself">
                           <Download size={15} /> Sync entries
@@ -6080,6 +6088,31 @@ function FIMSApp() {
                     {pushStatus[customer]?.unmatched?.length > 0 && (
                       <div style={{ marginTop: 2, color: 'var(--ledger-red)', fontSize: 12.5 }}>
                         ⚠ Not sent — no Sheet Tab mapped yet for: {pushStatus[customer].unmatched.join(', ')}. Map {pushStatus[customer].unmatched.length === 1 ? 'it' : 'them'} in the Known Product Catalog, then push again.
+                      </div>
+                    )}
+                    {outstandingPreviewOpen[customer] && (
+                      <div style={{ marginTop: 10, border: '1px solid var(--rule)', borderRadius: 6, padding: '10px 14px' }}>
+                        <p className="doc-hint" style={{ marginBottom: 8 }}>Exactly what "Push outstanding" would send right now — {outstandingRowCount} row{outstandingRowCount === 1 ? '' : 's'} across {variantCount} item{variantCount === 1 ? '' : 's'}.</p>
+                        {itemGroups.map(g => (
+                          <div key={g.tabName} style={{ marginBottom: 14 }}>
+                            <div className="section-label">Sheet tab: {g.tabName}</div>
+                            {g.variants.map((v, vi) => (
+                              <div key={vi} style={{ marginBottom: 10 }}>
+                                <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4 }}>{v.title}{v.blockTitleOverride && v.blockTitleOverride !== v.title ? ` → block "${v.blockTitleOverride}"` : ''}</div>
+                                <div className="table-wrap">
+                                  <table>
+                                    <thead><tr>{v.header.map(h => <th key={h}>{h}</th>)}</tr></thead>
+                                    <tbody>
+                                      {v.rows.map((row, ri) => (
+                                        <tr key={ri}>{row.map((cell, ci) => <td key={ci} style={{ padding: '6px 10px' }}>{cell ?? ''}</td>)}</tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ))}
                       </div>
                     )}
                     {syncStatus[customer]?.state === 'syncing' && <div className="doc-hint" style={{ marginTop: 6 }}><Loader2 size={12} className="spin" style={{ verticalAlign: 'middle', marginRight: 4 }} />syncing…</div>}
