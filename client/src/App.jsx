@@ -4675,88 +4675,23 @@ function FIMSApp() {
       setSyncStatus(prev => ({ ...prev, [customer]: { state: 'error', message: e.message || 'Network error — could not reach the server.' } }));
     }
   };
-  // NOTE: this used to also auto-trigger syncFromSheet (a live re-fetch) for every customer on every
-  // load. Reverted — it fired syncFromSheet repeatedly in quick succession across customers, and
-  // syncFromSheet has its own pre-existing fragility: if a block's known-row-count baseline is even
-  // slightly stale, it mistakes a row THIS APP ITSELF just pushed for one "added by hand" and re-pulls
-  // it in as a duplicate local row. Confirmed directly as a real, visible symptom (outstanding counts
-  // flickering between values right after load). The reconciliation below still runs, but only ever
-  // against customerSheetsMirror as it already stands (from a push or a manual Sync) — never triggers
-  // a fresh network read on its own.
-  // Reconciles a row that's genuinely already in the real Sheet but still shows outstanding locally —
-  // confirmed directly as a real case (a push's Sheet write landed, but the separate local
-  // pushedToSheet write that was supposed to follow it got lost, same class of split-write issue fixed
-  // for the consumption matcher earlier). An EARLIER version of this matched by comparing a row's own
-  // date/quantity against the mirror's content — reverted after it wrongly matched a genuinely
-  // outstanding row against an unrelated real entry that happened to share a coincidental value. This
-  // version never compares content at all: for each item, it compares how many real rows the Sheet
-  // actually has for that item's (tab, block) — from customerSheetsMirror, refreshed by the auto-sync
-  // above, Sync, or a push — against how many of this app's own rows for it are ALREADY marked
-  // pushedToSheet. Nothing else ever adds a row to a block except a push from this app or someone
-  // typing directly into the Sheet (and Sync's own separate new-row-pull already accounts for that by
-  // raising the mirror's count the moment it sees it) — so if the real count is higher than what this
-  // app believes it already sent, the shortfall can only be rows an earlier push actually delivered
-  // whose own bookkeeping write got lost. Promotes exactly that many of the EARLIEST still-outstanding
-  // entries for that item, in chronological order — a count, never a content guess. An entry with any
-  // excludedFromPush id is skipped entirely, never auto-promoted.
+  // Syncs every customer with a linked Sheet exactly once per page load — nothing more. An earlier,
+  // more elaborate version of this ALSO ran a separate count-based reconciliation effect on every
+  // render (keyed off confirmedProductionRows/confirmedDispatchRows/allCustomerTabNames, none of which
+  // are memoized, so it re-ran constantly) and that combination visibly flickered outstanding counts.
+  // Removed entirely rather than debugged further — this single, strictly-once sync (syncFromSheet
+  // already handles pulling in / reconciling whatever it finds) is what was actually asked for.
+  // autoSyncedRef guarantees the one-time firing even though its own dependency array changes identity
+  // on every render.
+  const autoSyncedRef = useRef(false);
   useEffect(() => {
-    if (!customerSheetsMirror.length || !allCustomerTabNames.length) return;
-    const productionIdsToMark = new Set();
-    const dispatchIdsToMark = new Set();
+    if (!loaded || autoSyncedRef.current || !allCustomerTabNames.length) return;
+    autoSyncedRef.current = true;
     allCustomerTabNames.forEach(customer => {
-      const mirrorForCustomer = customerSheetsMirror.filter(m => m.customer === customer);
-      if (!mirrorForCustomer.length) return;
-      const mirrorCountByBlock = new Map();
-      mirrorForCustomer.forEach(m => {
-        const key = `${m.sheetTab}||${m.block}`;
-        mirrorCountByBlock.set(key, (mirrorCountByBlock.get(key) || 0) + 1);
-      });
-      const sheetGroupByItem = {};
-      const blockByItem = {};
-      productCatalog.filter(c => c.customer === customer).forEach(c => {
-        const k = normalizeForCatalogMatch(c.item);
-        sheetGroupByItem[k] = (c.sheetGroup || c.item || '').trim();
-        if (c.block && c.block.trim()) blockByItem[k] = c.block.trim();
-      });
-      const prodForCustomer = confirmedProductionRows.filter(r => (r.confirmedCustomer || '').trim() === customer);
-      const dispForCustomer = confirmedDispatchRows.filter(r => (r.confirmedCustomer || '').trim() === customer);
-      const idRowById = {};
-      prodForCustomer.forEach(r => { idRowById[r.id] = r; });
-      dispForCustomer.forEach(r => { idRowById[r.id] = r; });
-      buildStockGroupsFrom(prodForCustomer, dispForCustomer).forEach(group => {
-        const key = normalizeForCatalogMatch(group.description);
-        const tabName = sheetGroupByItem[key];
-        if (!tabName) return; // unmapped item — nothing in the Sheet to verify against
-        const blockTitle = blockByItem[key] || group.description;
-        const realCount = mirrorCountByBlock.get(`${tabName}||${blockTitle}`) || 0;
-        if (!realCount) return;
-        const allIdsFor = (entry) => [...entry.productionIds, ...entry.dispatchIds];
-        const isExcluded = (entry) => allIdsFor(entry).some(id => idRowById[id] && idRowById[id].excludedFromPush);
-        const isPushed = (entry) => {
-          const ids = allIdsFor(entry);
-          return ids.length > 0 && ids.every(id => idRowById[id] && idRowById[id].pushedToSheet);
-        };
-        const eligible = group.ledger.filter(e => !isExcluded(e)); // already chronological
-        const pushedCount = eligible.filter(isPushed).length;
-        const outstanding = eligible.filter(e => !isPushed(e));
-        const excess = Math.min(realCount - pushedCount, outstanding.length);
-        if (excess <= 0) return;
-        outstanding.slice(0, excess).forEach(entry => {
-          entry.productionIds.forEach(id => productionIdsToMark.add(id));
-          entry.dispatchIds.forEach(id => dispatchIdsToMark.add(id));
-        });
-      });
+      if (getCustomerSheetId(customer).trim()) syncFromSheet(customer);
     });
-    if (productionIdsToMark.size) {
-      const nextProduction = production.map(r => productionIdsToMark.has(r.id) ? { ...r, pushedToSheet: true } : r);
-      persistIfNotStale('production', production, nextProduction);
-    }
-    if (dispatchIdsToMark.size) {
-      const nextDispatch = customerDispatch.map(r => dispatchIdsToMark.has(r.id) ? { ...r, pushedToSheet: true } : r);
-      persistIfNotStale('customerDispatch', customerDispatch, nextDispatch);
-    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [confirmedProductionRows, confirmedDispatchRows, customerSheetsMirror, productCatalog, allCustomerTabNames]);
+  }, [loaded, allCustomerTabNames]);
   /* -------- export --------
      Every export button below just packages the relevant rows/columns into a { title, sheets } object
      and hands it to the CopyExportModal — it does NOT build an .xlsx workbook or trigger a download
