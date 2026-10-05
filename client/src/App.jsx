@@ -1806,6 +1806,21 @@ function FIMSApp() {
     return true;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [persist]);
+  // One-time correction for a specific row the (now-reverted) mirror-reconciliation effect wrongly
+  // marked pushedToSheet — reported directly: 2.10.26, "Cream Burst 30g x144 Packet (new)", 3254
+  // pieces, genuinely still outstanding, incorrectly hidden by that bug. Self-terminating: once the
+  // flag flips back to false the condition below no longer matches, so this becomes a permanent no-op
+  // the moment it's done its one job — nothing to remember to remove later.
+  useEffect(() => {
+    const target = production.find(r =>
+      r.pushedToSheet && String(r.date || '').trim() === '2.10.26' &&
+      String(r.description || '').trim() === 'Cream Burst 30g x144 Packet (new)' &&
+      Number(r.pieces) === 3254
+    );
+    if (!target) return;
+    const next = production.map(r => r.id === target.id ? { ...r, pushedToSheet: false } : r);
+    persistIfNotStale('production', production, next);
+  }, [production, persistIfNotStale]);
   // Full-resync semantics for ONE customer's slice of the Customer Sheets Mirror: replaces every row
   // this customer already had with the fresh set just read from their real Sheet (at import or push
   // time — see confirmSheetImport/pushCustomerSheetNow), so a block/row renamed or removed for real
