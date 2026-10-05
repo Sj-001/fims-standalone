@@ -600,6 +600,11 @@ function computeMergePatches(existingGrid, variants) {
   // caller building a summary-tab formula reference (generateCustomerSheetStructure) point at a precise
   // cell without re-deriving this same column/row math itself.
   const placements = [];
+  // Subset of placements that are genuinely BRAND NEW blocks (not existing ones that just got more
+  // rows appended) — the title/header row range for each, so a caller can copy an existing block's
+  // formatting onto them to match (Sheets writes a new block with no formatting at all otherwise;
+  // requested directly after a freshly-pushed block visibly looked unstyled next to its neighbors).
+  const newBlockPlacements = [];
   // Real "insert N blank rows before row X" structural requests — one per contiguous group of new rows
   // that has to land somewhere other than the very end of the block, so the block stays in TRUE
   // chronological order instead of new dates always landing after whatever's already there regardless
@@ -790,6 +795,7 @@ function computeMergePatches(existingGrid, variants) {
       });
       if (values.length) patches.push({ startRow0: dataStartRow0, startCol0: startCol, values, isNewRow: true });
       placements.push({ title: v.title, startCol0: startCol, width, lastWrittenRow1: dataStartRow0 + values.length });
+      newBlockPlacements.push({ titleRow0: usedHeaderRowIdx - 1, headerRow0: usedHeaderRowIdx, startCol0: startCol, width });
       // Math.max, never a plain assignment: when startCol came from a reused gap, it can land well
       // BEFORE the tab's actual rightmost block — a plain assignment here would wrongly shrink
       // rightmostCol, and the NEXT new block placed later in this same push (if no further gap fits
@@ -803,7 +809,7 @@ function computeMergePatches(existingGrid, variants) {
       blocks.push({ title: blockTitle, startCol, width, nextRowIdx: dataStartRow0 + values.length, existingRowsOrdered: newExistingRows });
     }
   });
-  return { patches, placements, insertRequests };
+  return { patches, placements, insertRequests, newBlockPlacements, usedHeaderRowIdx };
 }
 
 // Highlight color for the "what's new since last push" formatting below — a warm tint matching this
@@ -1062,10 +1068,40 @@ async function pushCustomerSheet(spreadsheetId, itemGroups) {
   // Computed per tab from what THIS push's own patches/inserts actually need to reach, so it only ever
   // grows a tab exactly as much as this push requires — never a guessed buffer.
   const gridExpansionRequests = [];
+  // A brand-new block is written with NO formatting at all otherwise — confirmed directly as a visible
+  // problem (a freshly-pushed block looked plainly different from its neighbors). Copies the tab's
+  // first pre-existing block's own title+header formatting onto every new block via copyPaste
+  // (PASTE_FORMAT, not PASTE_NORMAL — never touches cell VALUES, only how they look), so a new block
+  // always matches whatever styling is already established in that tab, whatever it actually is,
+  // rather than this app guessing at or hardcoding a look of its own.
+  const formatCopyRequests = [];
   for (const plan of tabPlans) {
     const previousGrid = previousValuesByTab[plan.tabName] || [];
-    const { patches, placements, insertRequests } = computeMergePatches(previousGrid, plan.variants);
+    const { patches, placements, insertRequests, newBlockPlacements } = computeMergePatches(previousGrid, plan.variants);
     patchesByTab[plan.tabName] = patches;
+    if (newBlockPlacements.length) {
+      const { headerRowIdx: srcHeaderRowIdx, blocks: existingBlocksBefore } = parseExistingBlocks(previousGrid);
+      if (existingBlocksBefore.length) {
+        const sourceBlock = existingBlocksBefore[0];
+        const sheetIdForFormat = existingMeta[plan.tabName] && existingMeta[plan.tabName].sheetId;
+        const srcTitleRow0 = srcHeaderRowIdx - 1;
+        newBlockPlacements.forEach(nb => {
+          formatCopyRequests.push({
+            copyPaste: {
+              source: {
+                sheetId: sheetIdForFormat, startRowIndex: srcTitleRow0, endRowIndex: srcHeaderRowIdx + 1,
+                startColumnIndex: sourceBlock.startCol, endColumnIndex: sourceBlock.startCol + sourceBlock.width,
+              },
+              destination: {
+                sheetId: sheetIdForFormat, startRowIndex: nb.titleRow0, endRowIndex: nb.headerRow0 + 1,
+                startColumnIndex: nb.startCol0, endColumnIndex: nb.startCol0 + nb.width,
+              },
+              pasteType: 'PASTE_FORMAT',
+            },
+          });
+        });
+      }
+    }
     const meta = existingMeta[plan.tabName];
     if (meta) {
       let neededCols = meta.columnCount;
@@ -1158,6 +1194,9 @@ async function pushCustomerSheet(spreadsheetId, itemGroups) {
   } catch (e) {
     console.error('Customer sheet pre-push highlight read failed — skipping un-highlight this push:', e);
   }
+  // formatCopyRequests go FIRST — they establish the new block's base look; the highlight requests
+  // below then apply the "new since last push" tint on top of that, same as for any other new cell.
+  formatRequests.push(...formatCopyRequests);
   tabPlans.forEach(plan => {
     const sheetId = existingMeta[plan.tabName] && existingMeta[plan.tabName].sheetId;
     formatRequests.push(...buildUnhighlightRequests(sheetId, highlightedCellsByTab[plan.tabName]));
