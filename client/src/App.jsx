@@ -3792,6 +3792,22 @@ function FIMSApp() {
     const key = normalizeForCatalogMatch(description || '');
     return productCatalog.find(c => c.customer === customer && normalizeForCatalogMatch(c.item) === key) || null;
   };
+  // Whether a catalog entry's resolved block (or, when block is blank, the item's own description —
+  // see "blank = same as item name" on the Known Product Catalog) actually corresponds to a REAL block
+  // already in that customer's real Sheet tab. A catalog entry existing at all used to be treated as
+  // "this item is fully routed, no picker needed" — but a catalog entry can point at a block that
+  // doesn't actually exist (a typo, or — the real case this was confirmed against — a punctuation
+  // mismatch like "(new)" vs "new"), and nothing ever caught that: the row sailed through Pending
+  // Review with no picker shown, then silently got a brand-new duplicate block on push instead of
+  // being flagged for a person to look at. Only checked against a tab that already HAS real blocks —
+  // a brand-new tab with nothing in it yet has nothing ambiguous to be confused with, so this returns
+  // true (no picker needed) for a genuinely first-ever block.
+  const isCatalogEntryBlockReal = (customer, catalogEntry, description) => {
+    if (!catalogEntry) return true; // irrelevant — the caller already treats a missing entry as needing the picker
+    const effectiveBlockTitle = (catalogEntry.block && catalogEntry.block.trim()) || description || '';
+    const realBlocks = getRealBlocksForTab(customer, catalogEntry.sheetGroup);
+    return !realBlocks.length || realBlocks.some(rb => normalizeForCatalogMatch(rb) === normalizeForCatalogMatch(effectiveBlockTitle));
+  };
   // Every real customer Sheet writes dates as dot-separated D.M.YY ("5.1.24", "26.1.24") — never with
   // Rows land in the ledger already dot-formatted now (normalizeDateToDots runs at extraction time,
   // see DOCUMENT_TYPES above) — this second call right before push is a safety net for anything that
@@ -3836,12 +3852,28 @@ function FIMSApp() {
       // deliberately mapped in the Known Product Catalog with the exact wording that customer's own
       // Sheet uses for that variant's shared tab.
       if (!sheetGroup) { unmatched.push(g.description || '(blank description)'); return; }
-      if (!tabsMap[sheetGroup]) tabsMap[sheetGroup] = [];
       // blockTitleOverride from the catalog's stored alias->block mapping (see registerAliases) — set
       // automatically here so a wording once routed by hand through the block picker never needs to be
       // re-picked on a later push; an explicit reviewEdits override (picked fresh in the review UI)
       // still wins over this, see applyReviewEdits.
       const catalogBlock = blockByItem[key];
+      // A tab that already has real blocks, but none of them match this item's resolved block title,
+      // is exactly as unsafe to silently create a new block for as having no tab mapping at all —
+      // confirmed directly as the actual cause of a real duplicate block ("T 50 32G * 120 PKT (new)"
+      // vs "...new" looked like two different items purely from a punctuation mismatch, and the second
+      // silently got its own new block instead of being flagged for a person to look at). Skipped when
+      // this item was JUST explicitly routed in THIS SAME action (routingOverrides) — that's a
+      // deliberate, confirmed choice, not an automatic fallback, and skipped when the tab has no real
+      // blocks at all yet — a brand-new tab's first block has nothing ambiguous to be confused with.
+      if (!Object.prototype.hasOwnProperty.call(routingOverrides, key)) {
+        const effectiveBlockTitle = catalogBlock || g.description || 'Item';
+        const realBlocks = getRealBlocksForTab(customer, sheetGroup);
+        if (realBlocks.length > 0 && !realBlocks.some(rb => normalizeForCatalogMatch(rb) === normalizeForCatalogMatch(effectiveBlockTitle))) {
+          unmatched.push(g.description || '(blank description)');
+          return;
+        }
+      }
+      if (!tabsMap[sheetGroup]) tabsMap[sheetGroup] = [];
       tabsMap[sheetGroup].push({
         title: g.description || 'Item',
         header: ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
@@ -5625,7 +5657,7 @@ function FIMSApp() {
                     const renderRow = (row) => {
                       const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
                       const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
-                      const needsTabBlock = effectiveCustomer && !catalogEntry;
+                      const needsTabBlock = effectiveCustomer && (!catalogEntry || !isCatalogEntryBlockReal(effectiveCustomer, catalogEntry, row.description));
                       const draft = pendingTabBlockForms[row.id];
                       const tabBlockUnresolved = needsTabBlock && (!((draft && draft.sheetGroup) || '').trim() || !((draft && draft.block) || '').trim());
                       return (
@@ -5692,7 +5724,7 @@ function FIMSApp() {
                     const renderRow = (row) => {
                       const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
                       const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
-                      const needsTabBlock = effectiveCustomer && !catalogEntry;
+                      const needsTabBlock = effectiveCustomer && (!catalogEntry || !isCatalogEntryBlockReal(effectiveCustomer, catalogEntry, row.description));
                       const draft = pendingTabBlockForms[row.id];
                       const tabBlockUnresolved = needsTabBlock && (!((draft && draft.sheetGroup) || '').trim() || !((draft && draft.block) || '').trim());
                       return (
