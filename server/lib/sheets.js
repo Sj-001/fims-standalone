@@ -1004,6 +1004,13 @@ const normalizeTabKey = (name) => {
   s = s.replace(/p+kts?\.?/gi, '');
   // Collapse all remaining whitespace so "64 g" and "64g" compare equal.
   s = s.replace(/\s+/g, '');
+  // Strip any remaining punctuation (parentheses, periods, commas, etc.) — confirmed directly as a real
+  // gap: "T 50 32G * 120 PKT (new)" and "T 50 32G * 120 PKT new" normalized to DIFFERENT keys purely
+  // because of the parentheses, so the second was treated as a brand-new item and got its own
+  // redundant duplicate block instead of matching the real existing "(new)" one. Mirrors the client's
+  // own normalizeForCatalogMatch, which already does this exact blanket strip for catalog-item
+  // matching — this just brings block-title matching up to the same standard.
+  s = s.replace(/[^a-z0-9]/g, '');
   return s;
 };
 
