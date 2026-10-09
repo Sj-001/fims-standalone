@@ -2092,12 +2092,12 @@ function FIMSApp() {
     let toAdd = rows;
     let skipped = 0;
     if (DEDUP_REGISTERS.has(registerKey)) {
-      const existingKeys = new Set((registerState[registerKey] || []).map(r => dedupKeyForRow(registerKey, r)));
-      const seenInBatch = new Set();
+      const existing = registerState[registerKey] || [];
+      const seenInBatch = [];
       toAdd = rows.filter(r => {
-        const key = dedupKeyForRow(registerKey, r);
-        if (existingKeys.has(key) || seenInBatch.has(key)) { skipped++; return false; }
-        seenInBatch.add(key);
+        const isDup = existing.some(e => rowsMatchForDedup(registerKey, e, r)) || seenInBatch.some(e => rowsMatchForDedup(registerKey, e, r));
+        if (isDup) { skipped++; return false; }
+        seenInBatch.push(r);
         return true;
       });
     }
@@ -3217,6 +3217,38 @@ function FIMSApp() {
     const r = (row && row.description) ? { ...row, description: applyAbbreviations(String(row.description)) } : row;
     return rowDedupKey(fields, r);
   };
+  // DEDUP_FIELDS entries where neither side being blank should count as a disagreement — see
+  // rowsMatchForDedup. Scoped to Production's party/customerHint only: confirmed directly against a
+  // real re-upload of the exact same physical page, where a bracketed note next to an item read as
+  // blank the first time and "Vijyant" the second — these two specifically are NOT reliably
+  // deterministic the way every other DEDUP_FIELDS field is, so a blank reading means "the model
+  // wasn't confident it saw anything," not "there's genuinely nothing there." Treating that as a real
+  // disagreement forced an already-correct, already-confirmed row to get flagged for review on every
+  // re-upload, forever, for no reason — exactly the friction this exists to avoid. Two DIFFERENT
+  // non-blank values (e.g. "Vijyant" vs "Suresh") still count as a real disagreement and still flag;
+  // only a blank-vs-populated difference is tolerated. Not extended to any other register — a
+  // customerDispatch row's "party" is the actual Buyer name off a printed invoice, not a sometimes-
+  // caught bracketed note, and silently tolerating a blank mismatch there risks hiding a genuinely
+  // different buyer's order instead of just reducing noise.
+  const BLANK_WILDCARD_DEDUP_FIELDS = { production: new Set(['party', 'customerHint']) };
+  // Same real-world-identity check as dedupKeyForRow (same fields, same description normalization),
+  // but tolerant of BLANK_WILDCARD_DEDUP_FIELDS — used everywhere "is this actually the same confirmed
+  // row" needs to survive that specific kind of noise instead of either silently creating a duplicate
+  // (if treated as a plain new row) or forcing a person to re-confirm something that was never
+  // genuinely in question (if flagged every time).
+  const rowsMatchForDedup = (registerKey, a, b) => {
+    const fields = DEDUP_FIELDS[registerKey];
+    const wildcard = BLANK_WILDCARD_DEDUP_FIELDS[registerKey] || new Set();
+    const norm = (row) => (row && row.description) ? { ...row, description: applyAbbreviations(String(row.description)) } : row;
+    const ra = norm(a);
+    const rb = norm(b);
+    return fields.every(f => {
+      const av = typeof ra[f] === 'number' ? ra[f] : String(ra[f] ?? '').trim().toLowerCase();
+      const bv = typeof rb[f] === 'number' ? rb[f] : String(rb[f] ?? '').trim().toLowerCase();
+      if (wildcard.has(f) && (av === '' || bv === '')) return true;
+      return av === bv;
+    });
+  };
   // date + normalized description ONLY — deliberately ignores every numeric field, unlike
   // dedupKeyForRow. This is what lets flagLikelyReReadDuplicates (below) recognize "same real row" even
   // when a number was misread, which an exact/near-exact dedup key never can (the numbers genuinely
@@ -3282,7 +3314,7 @@ function FIMSApp() {
       if (isDescriptionBased && !r.description) return r;
       const loose = looseKeyOf(r);
       const match = existing.find(e => (isDescriptionBased ? !!e.description : true) && looseKeyOf(e) === loose);
-      if (!match || dedupKeyForRow(registerKey, match) === dedupKeyForRow(registerKey, r)) return r;
+      if (!match || rowsMatchForDedup(registerKey, match, r)) return r;
       const reason = isDescriptionBased
         ? `Looks like the same entry as an existing confirmed row from ${match.date} ("${match.description}") — but the numbers on this reading don't match that entry. Check the original document before confirming; this may be a misread re-extraction of a row already in the register.`
         : registerKey === 'rawMaterialIn'
@@ -3307,8 +3339,7 @@ function FIMSApp() {
   const dropAlreadyConfirmedDuplicates = (registerKey, rows, extraExisting = []) => {
     const existing = [...(registerState[registerKey] || []), ...extraExisting];
     if (!existing.length) return rows;
-    const existingKeys = new Set(existing.map(r => dedupKeyForRow(registerKey, r)));
-    return rows.filter(r => r.flagged || !existingKeys.has(dedupKeyForRow(registerKey, r)));
+    return rows.filter(r => r.flagged || !existing.some(e => rowsMatchForDedup(registerKey, e, r)));
   };
   /* -------- product catalog (editable; populated via Customer Sheets tab's Sheet-ID import) -------- */
   const persistCatalog = (next) => {

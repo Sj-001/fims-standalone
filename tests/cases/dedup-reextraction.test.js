@@ -27,6 +27,8 @@ function loadDedupFunctions(registerState, abbreviations = []) {
     ".replace(/[^a-z0-9]/g, '');"
   );
   const dedupKeyForRowBlock = extractBlock(APP_JSX, 'const dedupKeyForRow = (registerKey, row) => {', (l) => l.trim() === '};');
+  const blankWildcardFieldsBlock = extractLine(APP_JSX, 'const BLANK_WILDCARD_DEDUP_FIELDS = {');
+  const rowsMatchForDedupBlock = extractBlock(APP_JSX, 'const rowsMatchForDedup = (registerKey, a, b) => {', (l) => l.trim() === '};');
   const looseDateDescKeyBlock = extractLine(APP_JSX, 'const looseDateDescKey = (row) =>');
   const structuredLooseFieldsBlock = extractBlock(APP_JSX, 'const STRUCTURED_LOOSE_KEY_FIELDS = {', (l) => l.trim() === '};');
   const structuredLooseKeyBlock = extractBlock(
@@ -47,10 +49,12 @@ function loadDedupFunctions(registerState, abbreviations = []) {
 
   const blocks = [
     dedupFieldsBlock, rowDedupKeyBlock, applyAbbreviationsBlock, normalizeForCatalogMatchBlock,
-    dedupKeyForRowBlock, looseDateDescKeyBlock, structuredLooseFieldsBlock, structuredLooseKeyBlock,
+    dedupKeyForRowBlock, blankWildcardFieldsBlock, rowsMatchForDedupBlock,
+    looseDateDescKeyBlock, structuredLooseFieldsBlock, structuredLooseKeyBlock,
   ];
 
   const dedupKeyForRow = buildFromSource(blocks, 'dedupKeyForRow', ['abbreviations'], [abbreviations]);
+  const rowsMatchForDedup = buildFromSource(blocks, 'rowsMatchForDedup', ['abbreviations'], [abbreviations]);
   const looseDateDescKey = buildFromSource(blocks, 'looseDateDescKey', ['abbreviations'], [abbreviations]);
   const flagLikelyReReadDuplicates = buildFromSource(
     [...blocks, flagLikelyReReadDuplicatesBlock],
@@ -64,7 +68,7 @@ function loadDedupFunctions(registerState, abbreviations = []) {
     ['abbreviations', 'registerState'],
     [abbreviations, registerState],
   );
-  return { dedupKeyForRow, looseDateDescKey, flagLikelyReReadDuplicates, dropAlreadyConfirmedDuplicates };
+  return { dedupKeyForRow, rowsMatchForDedup, looseDateDescKey, flagLikelyReReadDuplicates, dropAlreadyConfirmedDuplicates };
 }
 
 const t = makeRecorder('dedup-reextraction');
@@ -145,6 +149,57 @@ const t = makeRecorder('dedup-reextraction');
   const misreadReelNo = [{ id: 'r2', date: '1.10.26', mill: 'Ashoka', reel_no: '19', size: '34', unit: 'Inch', gsm: '180', bf: '18', shade: 'NS', weight_kg: 450 }];
   const result = flagLikelyReReadDuplicates('rawMaterialIn', misreadReelNo);
   t.assertTrue(result[0].flagged, 'REGRESSION: structured-register loose match (reel_no disagreement) still flags as before');
+}
+
+/* ===== 7. THE EXACT LIVE CASE: blank party (confirmed) vs a stray party reading (re-extraction) of an
+   otherwise-identical row must NOT be flagged, and must be silently dropped from the preview -- not a
+   new duplicate, not something needing a person's attention. Confirmed live: 2026-10-09, Production
+   Register, "Butter Bake 130g x30 Packet" 3.10.26/4000 pieces, re-upload read a bracketed note as
+   "Vijyant" that the original confirmed row never had. ===== */
+{
+  const confirmed = [{
+    id: 'old1', date: '3.10.26', party: '', description: 'Butter Bake 130g x30 Packet',
+    customerHint: '', pieces: 4000, dispatch: 0, stockConfirmed: true, confirmedCustomer: 'anmol stock 01.08.26',
+  }];
+  const { flagLikelyReReadDuplicates, dropAlreadyConfirmedDuplicates, dedupKeyForRow } = loadDedupFunctions({ production: confirmed });
+  const reExtracted = [{ id: 'new1', date: '3.10.26', party: 'Vijyant', description: 'Butter Bake 130g x30 Packet', customerHint: '', pieces: 4000, dispatch: 0 }];
+  t.assertNotEqual(
+    dedupKeyForRow('production', confirmed[0]), dedupKeyForRow('production', reExtracted[0]),
+    'sanity: the byte-exact key genuinely disagrees here (party blank vs "Vijyant"), so this is actually exercising the new tolerance, not accidentally matching anyway'
+  );
+  const flagged = flagLikelyReReadDuplicates('production', reExtracted);
+  t.assertTrue(!flagged[0].flagged, 'LIVE CASE: blank-vs-populated party on an otherwise-identical row is NOT flagged');
+  const dropped = dropAlreadyConfirmedDuplicates('production', flagged);
+  t.assertEqual(dropped.length, 0, 'LIVE CASE: silently dropped from the preview, same as a byte-exact re-upload');
+}
+
+/* ===== 8. SAFETY: two DIFFERENT non-blank party/customerHint values must still flag -- the tolerance
+   is for "nothing seen" vs "something seen", never for "something" vs "something else". Without this,
+   a second customer's genuinely separate same-day/same-item/same-quantity order would silently vanish
+   instead of surfacing for a person to notice. ===== */
+{
+  const confirmed = [{
+    id: 'old1', date: '3.10.26', party: 'Vijyant', description: 'Butter Bake 130g x30 Packet',
+    customerHint: '', pieces: 4000, dispatch: 0, stockConfirmed: true, confirmedCustomer: 'anmol stock 01.08.26',
+  }];
+  const { flagLikelyReReadDuplicates } = loadDedupFunctions({ production: confirmed });
+  const differentParty = [{ id: 'new1', date: '3.10.26', party: 'Suresh', description: 'Butter Bake 130g x30 Packet', customerHint: '', pieces: 4000, dispatch: 0 }];
+  const result = flagLikelyReReadDuplicates('production', differentParty);
+  t.assertTrue(result[0].flagged, 'SAFETY: two different non-blank party values still flag, not silently tolerated');
+}
+
+/* ===== 9. SAFETY: the blank-wildcard tolerance is scoped to production only, not customerDispatch --
+   a Buyer name off a printed invoice is real financial data, not a sometimes-missed bracketed note, so
+   a blank-vs-populated party there must still flag like every other field. ===== */
+{
+  const confirmed = [{
+    id: 'old1', date: '9.10.26', invoice_no: 'INV-1', party: '', buyer_order_no: '',
+    description: 'IT 500 Jumbo Container', quantity: 500, rate: 10, amount: 5000,
+  }];
+  const { flagLikelyReReadDuplicates } = loadDedupFunctions({ customerDispatch: confirmed });
+  const reExtracted = [{ id: 'new1', date: '9.10.26', invoice_no: 'INV-1', party: 'Some Buyer Ltd', buyer_order_no: '', description: 'IT 500 Jumbo Container', quantity: 500, rate: 10, amount: 5000 }];
+  const result = flagLikelyReReadDuplicates('customerDispatch', reExtracted);
+  t.assertTrue(result[0].flagged, 'SAFETY: customerDispatch party is NOT given the blank-wildcard tolerance -- still flags');
 }
 
 module.exports = t.summary();
