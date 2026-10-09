@@ -3220,7 +3220,20 @@ function FIMSApp() {
   // dedupKeyForRow. This is what lets flagLikelyReReadDuplicates (below) recognize "same real row" even
   // when a number was misread, which an exact/near-exact dedup key never can (the numbers genuinely
   // differ, so no dedup key built from them will ever match).
-  const looseDateDescKey = (row) => `${String(row.date || '').trim().toLowerCase()}||${applyAbbreviations(String(row.description || '')).trim().toLowerCase()}`;
+  // Uses normalizeForCatalogMatch (defined below — safe to reference here, see persist's identical note
+  // further up: this closure doesn't actually run until long after the whole component body has
+  // executed), not just applyAbbreviations+trim+lowercase as this used to. A re-extraction of the same
+  // physical row routinely comes back with cosmetically different punctuation/spacing/pack-count
+  // notation even when the model's catalog-matching converges on the same item (confirmed directly: the
+  // SAME already-confirmed row re-read as "Butter Plus 28gm x 140 Pkt" one time and "BUTTER PLUS
+  // 28G*140PKT" — its own catalog-exact spelling — another). The old plain-lowercase key treated those
+  // as two totally unrelated rows, so this flag path — the one thing standing between a stray
+  // re-extraction and a silent, unflagged duplicate — never even triggered. normalizeForCatalogMatch
+  // already strips exactly this kind of surface noise (pkt, trailing pack-count, gm/g, punctuation) for
+  // the same reason elsewhere in this file, so reusing it here closes the gap instead of inventing a new
+  // one. Only loosens the FLAG-for-review path — dedupKeyForRow/dropAlreadyConfirmedDuplicates (the
+  // silent-drop path) stay deliberately exact, unchanged.
+  const looseDateDescKey = (row) => `${String(row.date || '').trim().toLowerCase()}||${normalizeForCatalogMatch(row.description || '')}`;
   // The structured-register counterpart of looseDateDescKey, for the two registers that have no
   // free-text description to match on — a mill slip (Raw Material In) and a consumption report both
   // get re-uploaded the same way a production register page does (new reels/strips added below

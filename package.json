@@ -5,6 +5,7 @@
   "description": "FIMS factory inventory/production app — Node/Express backend (Anthropic extraction proxy + Google Sheets storage) serving a React frontend. Deploy as a single Render web service.",
   "scripts": {
     "build": "npm install --prefix client && npm run build --prefix client && npm install --prefix server",
-    "start": "npm start --prefix server"
+    "start": "npm start --prefix server",
+    "test": "node tests/run-all.js"
   }
 }
