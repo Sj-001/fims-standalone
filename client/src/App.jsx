@@ -3236,6 +3236,17 @@ function FIMSApp() {
   // row" needs to survive that specific kind of noise instead of either silently creating a duplicate
   // (if treated as a plain new row) or forcing a person to re-confirm something that was never
   // genuinely in question (if flagged every time).
+  // Always coerces to a STRING before comparing, even when the field is already typeof 'number' --
+  // unlike a plain `typeof row[f] === 'number' ? row[f] : String(...)` branch (what this looked like
+  // before), which left a genuine number un-coerced on one side while the other side got stringified,
+  // so `1490 === "1490"` (strict, cross-type) silently came back false. Confirmed directly as a real
+  // bug: a row already in the register (pieces loaded back from the Sheet as a string) compared against
+  // a freshly-extracted row (pieces as an actual JS number) never matched on ANY numeric field, no
+  // matter how identical the real values were -- quietly defeating the whole blank-wildcard tolerance
+  // this function exists for, for every row with at least one numeric field. rowDedupKey/rowDedupKey's
+  // template-literal interpolation never had this bug (interpolation always coerces to string), which
+  // is exactly why it went unnoticed until this function was added.
+  const dedupFieldValue = (row, f) => (typeof row[f] === 'number' ? String(row[f]) : String(row[f] ?? '').trim().toLowerCase());
   const rowsMatchForDedup = (registerKey, a, b) => {
     const fields = DEDUP_FIELDS[registerKey];
     const wildcard = BLANK_WILDCARD_DEDUP_FIELDS[registerKey] || new Set();
@@ -3243,8 +3254,8 @@ function FIMSApp() {
     const ra = norm(a);
     const rb = norm(b);
     return fields.every(f => {
-      const av = typeof ra[f] === 'number' ? ra[f] : String(ra[f] ?? '').trim().toLowerCase();
-      const bv = typeof rb[f] === 'number' ? rb[f] : String(rb[f] ?? '').trim().toLowerCase();
+      const av = dedupFieldValue(ra, f);
+      const bv = dedupFieldValue(rb, f);
       if (wildcard.has(f) && (av === '' || bv === '')) return true;
       return av === bv;
     });

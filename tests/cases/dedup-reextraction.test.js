@@ -28,6 +28,7 @@ function loadDedupFunctions(registerState, abbreviations = []) {
   );
   const dedupKeyForRowBlock = extractBlock(APP_JSX, 'const dedupKeyForRow = (registerKey, row) => {', (l) => l.trim() === '};');
   const blankWildcardFieldsBlock = extractLine(APP_JSX, 'const BLANK_WILDCARD_DEDUP_FIELDS = {');
+  const dedupFieldValueBlock = extractLine(APP_JSX, 'const dedupFieldValue = (row, f) =>');
   const rowsMatchForDedupBlock = extractBlock(APP_JSX, 'const rowsMatchForDedup = (registerKey, a, b) => {', (l) => l.trim() === '};');
   const looseDateDescKeyBlock = extractLine(APP_JSX, 'const looseDateDescKey = (row) =>');
   const structuredLooseFieldsBlock = extractBlock(APP_JSX, 'const STRUCTURED_LOOSE_KEY_FIELDS = {', (l) => l.trim() === '};');
@@ -49,7 +50,7 @@ function loadDedupFunctions(registerState, abbreviations = []) {
 
   const blocks = [
     dedupFieldsBlock, rowDedupKeyBlock, applyAbbreviationsBlock, normalizeForCatalogMatchBlock,
-    dedupKeyForRowBlock, blankWildcardFieldsBlock, rowsMatchForDedupBlock,
+    dedupKeyForRowBlock, blankWildcardFieldsBlock, dedupFieldValueBlock, rowsMatchForDedupBlock,
     looseDateDescKeyBlock, structuredLooseFieldsBlock, structuredLooseKeyBlock,
   ];
 
@@ -186,6 +187,26 @@ const t = makeRecorder('dedup-reextraction');
   const differentParty = [{ id: 'new1', date: '3.10.26', party: 'Suresh', description: 'Butter Bake 130g x30 Packet', customerHint: '', pieces: 4000, dispatch: 0 }];
   const result = flagLikelyReReadDuplicates('production', differentParty);
   t.assertTrue(result[0].flagged, 'SAFETY: two different non-blank party values still flag, not silently tolerated');
+}
+
+/* ===== 9b. THE REAL FAILURE MODE: a confirmed row loaded back from the register/Sheet has its numeric
+   fields as STRINGS ("1490"), while a freshly-extracted row has them as real JS numbers (1490) -- test
+   7 above used a number literal on both sides and could never have caught this. Confirmed live:
+   2026-10-10, Production Register, "IT 500 Container" 8.10.26/1490 pieces, blank party vs "सिलाई" --
+   this exact row stayed flagged live even after the party-tolerance fix shipped, because `1490 ===
+   "1490"` is false under strict equality, so the pieces field alone was reported as a disagreement no
+   matter what the party tolerance did. ===== */
+{
+  const confirmed = [{
+    id: 'old1', date: '8.10.26', party: '', description: 'IT 500 Container',
+    customerHint: '', pieces: '1490', dispatch: '0', stockConfirmed: true, confirmedCustomer: 'BINDAL STOCK 1.08.26',
+  }];
+  const { flagLikelyReReadDuplicates, dropAlreadyConfirmedDuplicates } = loadDedupFunctions({ production: confirmed });
+  const reExtracted = [{ id: 'new1', date: '8.10.26', party: 'सिलाई', description: 'IT 500 Container', customerHint: '', pieces: 1490, dispatch: 0 }];
+  const flagged = flagLikelyReReadDuplicates('production', reExtracted);
+  t.assertTrue(!flagged[0].flagged, 'LIVE BUG: string "1490" (register) vs number 1490 (fresh extraction) is recognized as the same value, not flagged');
+  const dropped = dropAlreadyConfirmedDuplicates('production', flagged);
+  t.assertEqual(dropped.length, 0, 'LIVE BUG: silently dropped from the preview once the type mismatch no longer masks the match');
 }
 
 /* ===== 9. SAFETY: the blank-wildcard tolerance is scoped to production only, not customerDispatch --
