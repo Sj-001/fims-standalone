@@ -424,12 +424,24 @@ window.storage = {
     await window.storage.set(key, '[]');
   },
 };
-async function loadRegister(key) {
+// A transient read failure (Render cold-start, a dropped request, a momentary Sheets API hiccup) used
+// to be swallowed here and silently treated as "this register has no rows" — indistinguishable from a
+// genuinely empty register. Confirmed directly as the real cause of a severe data-loss incident: one
+// bad read of fims_customer_dispatch on page load silently seeded React state with [] instead of its
+// real multi-week history; the very next confirm/push then persisted that near-empty state, overwriting
+// the real Sheet's full history with just the one new row. Retries first (most transient failures clear
+// within a couple seconds), and if every attempt still fails, THROWS instead of returning [] — the
+// caller (the main load effect) must never treat "couldn't read this register" the same as "read it,
+// it's empty," since persisting the former back is exactly how real history gets destroyed.
+async function loadRegister(key, attempt = 0) {
   try {
     const r = await window.storage.get(key, false);
     if (r && r.value) return JSON.parse(r.value);
     return [];
-  } catch (e) { return []; }
+  } catch (e) {
+    if (attempt < 2) { await sleep(600 * (attempt + 1)); return loadRegister(key, attempt + 1); }
+    throw e;
+  }
 }
 // Deliberately does NOT swallow its own errors — a confirmed row already shows in the app's local
 // state the instant it's confirmed, completely independent of whether this save actually reaches the
@@ -1564,6 +1576,13 @@ function ImageZoomModal({ src, onClose }) {
 function FIMSApp() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [loaded, setLoaded] = useState(false);
+  // Set only when the initial register load fails even after loadRegister's own retries -- see its
+  // comment. The app must never fall through to its normal "loaded" state in this case: every register
+  // not yet seeded with its REAL data would sit at its useState([]) default, and the very next confirm/
+  // push would persist that empty default back, permanently overwriting real history with nothing.
+  // Rendered as a hard blocking screen (see below) instead of the normal UI -- the only way out is an
+  // actual reload, never a silent continue.
+  const [loadFailed, setLoadFailed] = useState(false);
   const [rawMaterialIn, setRawMaterialIn] = useState([]);
   const [rawMaterialLeftover, setRawMaterialLeftover] = useState([]);
   const [consumption, setConsumption] = useState([]);
@@ -1601,7 +1620,16 @@ function FIMSApp() {
   const registerSetters = { rawMaterialIn: setRawMaterialIn, rawMaterialLeftover: setRawMaterialLeftover, consumption: setConsumption, production: setProduction, customerDispatch: setCustomerDispatch, daburSpecs: setDaburSpecs, daburPO: setDaburPO, daburDispatch: setDaburDispatch, customerSheetsMirror: setCustomerSheetsMirror, customerSheetKnownCounts: setCustomerSheetKnownCounts };
   useEffect(() => {
     (async () => {
-      const entries = await Promise.all(Object.entries(STORAGE_KEYS).map(async ([k, storageKey]) => [k, await loadRegister(storageKey)]));
+      let entries;
+      try {
+        entries = await Promise.all(Object.entries(STORAGE_KEYS).map(async ([k, storageKey]) => [k, await loadRegister(storageKey)]));
+      } catch (e) {
+        // loadRegister already retried internally -- this is a real, persistent failure, not a blip.
+        // Stop here: never seed registerState with their useState([]) defaults and call that "loaded."
+        console.error('Initial register load failed after retries:', e);
+        setLoadFailed(true);
+        return;
+      }
       const loadedMap = Object.fromEntries(entries);
       // A row typed straight into the Google Sheet by hand (rather than extracted/confirmed through
       // the app) has no way to get the internal "id" every row is otherwise keyed by — nothing in the
@@ -5107,7 +5135,20 @@ function FIMSApp() {
               </div>
             </div>
           )}
-          {!loaded && <div className="empty-state">Loading your registers…</div>}
+          {loadFailed && (
+            <div className="empty-state" style={{ borderColor: 'var(--ledger-red)', color: 'var(--ledger-red)' }}>
+              <strong>Couldn't load your data after several tries.</strong>
+              <div style={{ marginTop: 8, color: 'var(--text)' }}>
+                Nothing on this screen is safe to act on right now — no rows have been changed, but
+                confirming or pushing anything from here could overwrite real data with an incomplete
+                copy. Check your connection and reload the page before doing anything else.
+              </div>
+              <button className="btn btn-primary" style={{ marginTop: 12 }} onClick={() => window.location.reload()}>
+                <RefreshCw size={15} /> Reload
+              </button>
+            </div>
+          )}
+          {!loaded && !loadFailed && <div className="empty-state">Loading your registers…</div>}
           {loaded && activeTab === 'dashboard' && (
             <div>
               <div className="panel">
