@@ -3623,7 +3623,11 @@ function FIMSApp() {
       if (!byCustomer.has(customer)) byCustomer.set(customer, { rows: [], routingOverrides: {}, commits: [] });
       const bucket = byCustomer.get(customer);
       bucket.rows.push({ ...r, confirmedCustomer: customer, stockConfirmed: true });
-      bucket.commits.push(() => confirmStockRow(registerKey, r, customer));
+      // Carries its own description (not just a bare commit fn) so commitAll can withhold exactly the
+      // rows whose item turns out NOT to really match a real Sheet block (see onConfirmed below) — a
+      // row must never get silently confirmed/removed from Pending Review for an item that didn't
+      // actually get sent, even though the dialog the user accepted said it would be.
+      bucket.commits.push({ description: r.description || '', run: () => confirmStockRow(registerKey, r, customer) });
       // Read now, not inside the deferred commit — pendingTabBlockForms[r.id] only exists while the row
       // is genuinely still pending; confirmStockRow itself clears it once it actually runs.
       const tabBlockDraft = pendingTabBlockForms[r.id];
@@ -3635,7 +3639,14 @@ function FIMSApp() {
     });
     if (skipped > 0) window.alert(`Skipped ${skipped} row${skipped === 1 ? '' : 's'} whose customer couldn't be matched automatically — pick a customer in the dropdown for ${skipped === 1 ? 'it' : 'them'}, then push again.`);
     byCustomer.forEach(({ rows: confirmedRows, routingOverrides, commits }, customer) => {
-      const commitAll = () => commits.forEach(commit => commit());
+      // Called with pushCustomerSheetNow's own `unmatched` list (description strings) once the user has
+      // accepted the confirm() dialog — any row whose description is in that list did NOT actually get
+      // sent (its block didn't check out against the real Sheet, fresh), so it must stay exactly as it
+      // was: still pending, still visible, still showing the Tab/Block picker, never silently confirmed.
+      const commitAll = (unmatchedDescriptions = []) => {
+        const skip = new Set((unmatchedDescriptions || []).map(d => normalizeForCatalogMatch(d)));
+        commits.forEach(({ description, run }) => { if (!skip.has(normalizeForCatalogMatch(description))) run(); });
+      };
       // No Sheet linked yet — nothing to push to, so there's no confirm() dialog to gate on; commit
       // straight away, exactly like before. Only the "there IS a Sheet, and a push dialog is about to
       // ask" path needs the defer-until-accepted treatment.
@@ -4581,6 +4592,12 @@ function FIMSApp() {
     const exemptBlockTitles = new Set(Object.values(routingOverrides).map(o => normalizeForCatalogMatch(o.block || '')).filter(Boolean));
     const { safeItemGroups: itemGroups, newlyUnmatched } = await verifyAgainstFreshBlocks(customer, syncItemGroups, exemptBlockTitles);
     const unmatched = Array.from(new Set([...syncUnmatched, ...newlyUnmatched]));
+    // newlyUnmatched means the cached reviewByCustomer data (what made Pending Review show this item as
+    // already matched, no picker) disagreed with the real Sheet just now — i.e. that cache was wrong.
+    // Re-fetch it right away (not awaited — this is a correction for the NEXT render, not something this
+    // push needs to wait on) so Pending Review stops showing the same stale "matched" lie the moment this
+    // row goes back to being genuinely pending below.
+    if (newlyUnmatched.length) refreshReview(customer);
     // "Items" in this message means individual dated entries, not products/variants — confirmed
     // directly as confusing wording once before: counting itemGroups (products) instead of entries made
     // "Sent 8 items" read as if only 8 things total existed, when it actually meant "8 different
@@ -4669,8 +4686,16 @@ function FIMSApp() {
         });
       }
     };
-    if (!window.confirm(`Send ${totalRowsToSend} item${totalRowsToSend === 1 ? '' : 's'} to ${customer}?`)) return;
-    if (onConfirmed) onConfirmed();
+    // If anything is unmatched, say so IN the dialog, before the user commits to anything — never let
+    // them accept "Send N items" believing that covers everything, then find out afterward that one of
+    // them silently didn't go and got left pending anyway. They decide with full information, right here.
+    const confirmMessage = unmatched.length
+      ? `Send ${totalRowsToSend} item${totalRowsToSend === 1 ? '' : 's'} to ${customer}?\n\n${unmatched.length} item${unmatched.length === 1 ? '' : 's'} will NOT be sent — no matching Sheet block found — and will stay in Pending Review for you to match: ${unmatched.join(', ')}.`
+      : `Send ${totalRowsToSend} item${totalRowsToSend === 1 ? '' : 's'} to ${customer}?`;
+    if (!window.confirm(confirmMessage)) return;
+    // Rows whose item is in `unmatched` must NOT be committed — they stay exactly as they were, still
+    // pending, still visible, still offering the Tab/Block picker (see pushPendingRows' commitAll).
+    if (onConfirmed) onConfirmed(unmatched);
     setPushStatus(prev => ({ ...prev, [customer]: { state: 'pushing', message: '', unmatched } }));
     pushInFlightRef.current.add(customer);
     try {
@@ -4729,7 +4754,7 @@ function FIMSApp() {
       const queued = pushQueuedRef.current.get(customer);
       if (queued) {
         pushQueuedRef.current.delete(customer);
-        const mergedOnConfirmed = queued.onConfirmedFns.length ? () => queued.onConfirmedFns.forEach(fn => fn()) : undefined;
+        const mergedOnConfirmed = queued.onConfirmedFns.length ? (unmatchedDescriptions) => queued.onConfirmedFns.forEach(fn => fn(unmatchedDescriptions)) : undefined;
         pushCustomerSheetNow(customer, queued.productionRows, queued.dispatchRows, queued.routingOverrides, mergedOnConfirmed);
       }
     }

@@ -1,0 +1,136 @@
+// Real user complaint, 2026-10-12: "why does it show matched correctly, when its not matched while
+// pushing... why do I have to first push thinking its all matched correctly and then you tell me its not
+// matched". Root cause: pushCustomerSheetNow's own fresh pre-write check (verifyAgainstFreshBlocks) could
+// already tell a row's catalog-resolved block wasn't real, and correctly excluded it from what actually
+// got WRITTEN to the Sheet (`unmatched`) -- but pushPendingRows' `onConfirmed`/commitAll callback still
+// confirmed EVERY row regardless, including ones whose item ended up in `unmatched`. So the row vanished
+// from Pending Review (marked stockConfirmed) even though it was never actually sent, with the only trace
+// being a push-status message the user had to separately notice and act on later via "Push outstanding".
+// That's a silent bait-and-switch: the user accepts "Send N items", and one of those N quietly didn't
+// happen and got hidden from the queue they could still fix it in.
+//
+// Fixed two ways, both tested here:
+//   1. pushPendingRows: commits are now tracked WITH their row's description, and commitAll takes the
+//      `unmatched` list pushCustomerSheetNow passes back, skipping confirmStockRow for exactly those rows
+//      -- they stay pending, stay visible, still offer the Tab/Block picker (needsTabBlock reads
+//      isCatalogEntryBlockReal off the now-corrected reviewByCustomer cache -- see test 3 below).
+//   2. pushCustomerSheetNow: the confirm() dialog itself now says which items won't be sent BEFORE the
+//      user accepts, instead of only reporting it after the fact.
+const path = require('path');
+const { extractBlock, extractLine, buildFromSource } = require('../lib/extract');
+const { makeRecorder } = require('../lib/assert');
+
+const APP_JSX = path.join(__dirname, '..', '..', 'client', 'src', 'App.jsx');
+const normalizeForCatalogMatch = (s) => String(s || '')
+  .toLowerCase()
+  .replace(/pkt\.?/g, '')
+  .replace(/\s*[x×*]\s*\d+\s*$/i, '')
+  .replace(/(\d)\s*gm\b/g, '$1g')
+  .replace(/\bcont\.?\b/g, 'container')
+  .replace(/[^a-z0-9]/g, '');
+
+const t = makeRecorder('push-unmatched-not-committed');
+
+/* ===== 1 & 2. pushPendingRows: commitAll only confirms rows NOT in the unmatched list ===== */
+{
+  const block = extractBlock(
+    APP_JSX,
+    'const pushPendingRows = (registerKey, rows) => {',
+    'const updatePendingCustomer = (registerKey) => (id, value) => {',
+    { endExclusive: true },
+  );
+
+  function run({ rows, unmatchedOnPush = [] }) {
+    const confirmed = [];
+    const pushCalls = [];
+    const confirmStockRow = (registerKey, row, customer) => confirmed.push(row.id);
+    const isKnownCustomerGuess = () => true;
+    const matchCustomer = (r) => r.confirmedCustomer || 'DIAMOND';
+    const getCustomerSheetId = () => 'sheet-id-123';
+    // Stands in for the real async pushCustomerSheetNow: synchronously invokes onConfirmed with
+    // whatever this test configured as "what the fresh check would have rejected" -- exactly mirroring
+    // what the real function does after its own confirm()/verifyAgainstFreshBlocks resolve.
+    const pushCustomerSheetNow = (customer, productionRows, dispatchRows, routingOverrides, onConfirmed) => {
+      pushCalls.push({ customer, productionRows, routingOverrides });
+      if (onConfirmed) onConfirmed(unmatchedOnPush);
+    };
+    const fn = buildFromSource(
+      block, 'pushPendingRows',
+      ['isKnownCustomerGuess', 'matchCustomer', 'pendingTabBlockForms', 'normalizeForCatalogMatch', 'confirmStockRow', 'getCustomerSheetId', 'pushCustomerSheetNow', 'window'],
+      [isKnownCustomerGuess, matchCustomer, {}, normalizeForCatalogMatch, confirmStockRow, getCustomerSheetId, pushCustomerSheetNow, { alert: () => {} }],
+    );
+    fn('production', rows);
+    return { confirmed, pushCalls };
+  }
+
+  // THE LIVE CASE: three rows pushed together, one of them resolves to an item the fresh check rejects.
+  {
+    const rows = [
+      { id: 'r1', description: 'TOOTI FRUTI 28G * 120 PKT', confirmedCustomer: 'DIAMOND' },
+      { id: 'r2', description: 'Butter Bake 130g x30 Packet', confirmedCustomer: 'DIAMOND' },
+      { id: 'r3', description: 'Jeera Dhamal 32g x144 Packet', confirmedCustomer: 'DIAMOND' },
+    ];
+    const { confirmed } = run({ rows, unmatchedOnPush: ['TOOTI FRUTI 28G * 120 PKT'] });
+    t.assertEqual(confirmed.sort(), ['r2', 'r3'], 'LIVE CASE: the unmatched row is never confirmed, the genuinely-sent ones are');
+  }
+
+  // Nothing unmatched: every row gets confirmed, same as before this fix.
+  {
+    const rows = [
+      { id: 'r1', description: 'Butter Bake 130g x30 Packet', confirmedCustomer: 'DIAMOND' },
+      { id: 'r2', description: 'Jeera Dhamal 32g x144 Packet', confirmedCustomer: 'DIAMOND' },
+    ];
+    const { confirmed } = run({ rows, unmatchedOnPush: [] });
+    t.assertEqual(confirmed.sort(), ['r1', 'r2'], 'NORMAL: nothing unmatched means everything gets confirmed as usual');
+  }
+
+  // Punctuation-only difference between the row's own description and the unmatched entry must still
+  // match (unmatched descriptions come from itemGroups' aggregated description, not always byte-identical
+  // to the row's raw text) -- uses the same normalizeForCatalogMatch both sides use everywhere else.
+  {
+    const rows = [{ id: 'r1', description: 'T 50 32G*120PKT', confirmedCustomer: 'DIAMOND' }];
+    const { confirmed } = run({ rows, unmatchedOnPush: ['T 50 32G * 120 PKT'] });
+    t.assertEqual(confirmed, [], 'PUNCTUATION: a cosmetically-different but equivalent description still withholds the commit');
+  }
+}
+
+/* ===== 3. pushCustomerSheetNow: confirm() dialog states unmatched items up front, onConfirmed gets the
+   unmatched list (not called bare) ===== */
+{
+  const dialogLine = extractLine(APP_JSX, 'const confirmMessage = unmatched.length');
+  const block = extractBlock(APP_JSX, (l) => l === dialogLine, "if (!window.confirm(confirmMessage)) return;");
+  const onConfirmedLine = extractLine(APP_JSX, 'if (onConfirmed) onConfirmed(unmatched);');
+
+  function run({ totalRowsToSend, customer, unmatched, confirmReturns = true }) {
+    let shownMessage = null;
+    let onConfirmedCalled = false;
+    let onConfirmedArg;
+    const windowMock = { confirm: (msg) => { shownMessage = msg; return confirmReturns; } };
+    const onConfirmed = (arg) => { onConfirmedCalled = true; onConfirmedArg = arg; };
+    const body = `${block}\n${onConfirmedLine}`;
+    const fn = new Function('totalRowsToSend', 'customer', 'unmatched', 'window', 'onConfirmed', body);
+    fn(totalRowsToSend, customer, unmatched, windowMock, onConfirmed);
+    return { shownMessage, onConfirmedCalled, onConfirmedArg };
+  }
+
+  {
+    const { shownMessage, onConfirmedCalled, onConfirmedArg } = run({
+      totalRowsToSend: 5, customer: 'DIAMOND', unmatched: ['TOOTI FRUTI 28G * 120 PKT'],
+    });
+    t.assertTrue(shownMessage.includes('will NOT be sent'), 'DIALOG: warns about the unmatched item before the user accepts');
+    t.assertTrue(shownMessage.includes('TOOTI FRUTI 28G * 120 PKT'), 'DIALOG: names the specific unmatched item');
+    t.assertTrue(onConfirmedCalled, 'onConfirmed still runs once the dialog is accepted');
+    t.assertEqual(onConfirmedArg, ['TOOTI FRUTI 28G * 120 PKT'], 'onConfirmed receives the unmatched list, not called bare');
+  }
+  {
+    const { shownMessage, onConfirmedArg } = run({ totalRowsToSend: 3, customer: 'DIAMOND', unmatched: [] });
+    t.assertTrue(!shownMessage.includes('will NOT be sent'), 'NORMAL: no unmatched warning when everything matches');
+    t.assertEqual(onConfirmedArg, [], 'NORMAL: onConfirmed still receives the (empty) unmatched list');
+  }
+  {
+    const { onConfirmedCalled } = run({ totalRowsToSend: 3, customer: 'DIAMOND', unmatched: [], confirmReturns: false });
+    t.assertTrue(!onConfirmedCalled, 'CANCEL: declining the dialog never calls onConfirmed at all — nothing gets confirmed');
+  }
+}
+
+module.exports = t.summary();
