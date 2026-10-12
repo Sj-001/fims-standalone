@@ -209,6 +209,37 @@ const t = makeRecorder('dedup-reextraction');
   t.assertEqual(dropped.length, 0, 'LIVE BUG: silently dropped from the preview once the type mismatch no longer masks the match');
 }
 
+/* ===== 9c. THE DESCRIPTION-NORMALIZATION ASYMMETRY: looseDateDescKey (decides "is this even a
+   candidate match") already used the aggressive normalizeForCatalogMatch, but rowsMatchForDedup's own
+   description comparison (decides "silently drop" vs "flag") only used mild applyAbbreviations --
+   meaning a description differing ONLY in punctuation/spacing/pack-count notation between the confirmed
+   row and a fresh re-extraction would be found as a candidate, then STILL get flagged on that formatting
+   difference alone, every single re-upload, forever. Using the same normalizer in both places closes
+   this. A genuine word-level difference ("(new)" present or absent) must still survive and still
+   disagree -- tested alongside so this fix can't accidentally start merging real variants. ===== */
+{
+  const confirmed = [{
+    id: 'old1', date: '7.10.26', party: '', description: 'T 50 32G*120PKT',
+    customerHint: '', pieces: 3200, dispatch: 0, stockConfirmed: true, confirmedCustomer: 'DIAMOND',
+  }];
+  const { flagLikelyReReadDuplicates, dropAlreadyConfirmedDuplicates } = loadDedupFunctions({ production: confirmed });
+  const reExtracted = [{ id: 'new1', date: '7.10.26', description: 'T 50 32G * 120 PKT', pieces: 3200, dispatch: 0 }];
+  const flagged = flagLikelyReReadDuplicates('production', reExtracted);
+  t.assertTrue(!flagged[0].flagged, 'ASYMMETRY FIX: punctuation/spacing-only description difference is not flagged');
+  const dropped = dropAlreadyConfirmedDuplicates('production', flagged);
+  t.assertEqual(dropped.length, 0, 'ASYMMETRY FIX: silently dropped as the same real row');
+}
+{
+  const confirmed = [{
+    id: 'old1', date: '7.10.26', party: '', description: 'T 50 32G*120PKT',
+    customerHint: '', pieces: 3200, dispatch: 0, stockConfirmed: true, confirmedCustomer: 'DIAMOND',
+  }];
+  const { flagLikelyReReadDuplicates } = loadDedupFunctions({ production: confirmed });
+  const genuinelyDifferentVariant = [{ id: 'new1', date: '7.10.26', description: 'T 50 32G * 120 PKT (new)', pieces: 3200, dispatch: 0 }];
+  const result = flagLikelyReReadDuplicates('production', genuinelyDifferentVariant);
+  t.assertTrue(!result[0].flagged, 'SAFETY: a genuine word-level variant ("(new)") is not even flagged -- not found as a candidate at all, treated as a plain new item, same as before this fix');
+}
+
 /* ===== 9. SAFETY: the blank-wildcard tolerance is scoped to production only, not customerDispatch --
    a Buyer name off a printed invoice is real financial data, not a sometimes-missed bracketed note, so
    a blank-vs-populated party there must still flag like every other field. ===== */

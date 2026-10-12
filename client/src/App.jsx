@@ -3275,10 +3275,21 @@ function FIMSApp() {
   // template-literal interpolation never had this bug (interpolation always coerces to string), which
   // is exactly why it went unnoticed until this function was added.
   const dedupFieldValue = (row, f) => (typeof row[f] === 'number' ? String(row[f]) : String(row[f] ?? '').trim().toLowerCase());
+  // description went through only applyAbbreviations here (mild: taught shorthand only) while
+  // looseDateDescKey -- the check that decides whether a row is even a CANDIDATE match in the first
+  // place -- already used normalizeForCatalogMatch (aggressive: also strips punctuation, "pkt",
+  // trailing pack-count notation, gm/g). That asymmetry meant a row could pass the loose candidate
+  // check (found as a plausible match) but then fail THIS comparison purely on formatting -- e.g. the
+  // same real description re-extracted as "T 50 32G*120PKT" one time and "T 50 32G * 120 PKT" another
+  // -- getting flagged for a person to check instead of silently recognized as the same real row, pure
+  // re-upload noise every time it happened. Using the same aggressive normalizer here closes that gap:
+  // a genuine word-level difference ("(new)" present or absent) still survives normalization and still
+  // disagrees; only punctuation/spacing/wording-convention noise is now tolerated, consistently with
+  // every other normalization decision already made in this file.
   const rowsMatchForDedup = (registerKey, a, b) => {
     const fields = DEDUP_FIELDS[registerKey];
     const wildcard = BLANK_WILDCARD_DEDUP_FIELDS[registerKey] || new Set();
-    const norm = (row) => (row && row.description) ? { ...row, description: applyAbbreviations(String(row.description)) } : row;
+    const norm = (row) => (row && row.description) ? { ...row, description: normalizeForCatalogMatch(String(row.description)) } : row;
     const ra = norm(a);
     const rb = norm(b);
     return fields.every(f => {
@@ -4467,6 +4478,53 @@ function FIMSApp() {
   // a push starts, so a second call arriving before the next render can still see it. A state update
   // wouldn't be visible until React re-renders, which is exactly the same kind of gap that let a row
   // get pushed twice in the first place — see the comment inside pushCustomerSheetNow.
+  // The synchronous safety check inside buildCustomerSheetPayloadFromRows (see its own comment) compares
+  // against getRealBlocksForTab, which reads whatever refreshReview's separate, DEBOUNCED background
+  // effect last happened to fetch into reviewByCustomer — not a guarantee it has fetched anything for
+  // THIS tab at all yet. Confirmed directly as a real duplicate block ("TOOTI FRUTI 28G * 120 PKT",
+  // created fresh, right alongside the real "...PKT (new)" block the catalog should have matched): the
+  // push fired before reviewByCustomer had ever been populated for that tab, so getRealBlocksForTab
+  // returned [] — indistinguishable from "this tab genuinely has no blocks yet" — and the synchronous
+  // check waved it through. Narrowing the window (e.g. awaiting refreshReview first) doesn't close it,
+  // since reviewByCustomer only updates via a state setter the CURRENT closure can't see until a later
+  // render — same class of bug as loadRegister silently treating "haven't read this yet" as "confirmed
+  // empty." This instead repeats the real-vs-resolved-block comparison a second time, synchronously
+  // scoped to this one push, against a response fetched right now — closing the race instead of
+  // narrowing it. A variant whose block was just explicitly picked in THIS SAME action (routingOverrides)
+  // is still exempt, same as the synchronous check. If the verification call itself fails (network blip,
+  // server hiccup), this falls back to the synchronous check's own decision rather than blocking the
+  // whole push on an unrelated failure — strictly safer than before (a real extra check now runs most of
+  // the time) even though it isn't a 100%-always guarantee.
+  const verifyAgainstFreshBlocks = async (customer, itemGroups, exemptBlockTitles) => {
+    const sheetId = getCustomerSheetId(customer).trim();
+    if (!sheetId || !itemGroups.length) return { safeItemGroups: itemGroups, newlyUnmatched: [] };
+    try {
+      const res = await fetch('/api/customer-sheets/preview', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+        body: JSON.stringify({ spreadsheetId: sheetId, itemGroups }),
+      });
+      if (!res.ok) return { safeItemGroups: itemGroups, newlyUnmatched: [] };
+      const data = await res.json().catch(() => ({}));
+      if (!data.ok || !Array.isArray(data.tabs)) return { safeItemGroups: itemGroups, newlyUnmatched: [] };
+      const newlyUnmatched = [];
+      const safeItemGroups = itemGroups.map((g, gi) => {
+        const freshRealBlocks = (data.tabs[gi] && data.tabs[gi].existingBlockTitles) || [];
+        if (!freshRealBlocks.length) return g; // genuinely nothing real there yet -- a first block is fine
+        const safeVariants = (g.variants || []).filter(v => {
+          const effectiveTitle = v.blockTitleOverride || v.title || '';
+          const normalizedTitle = normalizeForCatalogMatch(effectiveTitle);
+          if (exemptBlockTitles.has(normalizedTitle)) return true;
+          const isSafe = freshRealBlocks.some(rb => normalizeForCatalogMatch(rb) === normalizedTitle);
+          if (!isSafe) newlyUnmatched.push(v.title || '(blank description)');
+          return isSafe;
+        });
+        return { ...g, variants: safeVariants };
+      }).filter(g => (g.variants || []).length > 0);
+      return { safeItemGroups, newlyUnmatched };
+    } catch (e) {
+      return { safeItemGroups: itemGroups, newlyUnmatched: [] };
+    }
+  };
   const pushInFlightRef = useRef(new Set());
   const pushQueuedRef = useRef(new Map()); // customer -> { productionRows, dispatchRows, routingOverrides, onConfirmedFns } waiting their turn
   // Pushes EXACTLY productionRows/dispatchRows — the specific rows the caller was just handed, nothing
@@ -4504,7 +4562,13 @@ function FIMSApp() {
     // Always the CURRENT edited payload (review edits — value changes, deletions, moves, added rows —
     // applied on top of exactly the rows this call was given), so what gets written always matches
     // exactly what was just confirmed — never anything else outstanding for this customer.
-    const { itemGroups, unmatched } = getEditedPayloadFromRows(customer, productionRows, dispatchRows, routingOverrides);
+    const { itemGroups: syncItemGroups, unmatched: syncUnmatched } = getEditedPayloadFromRows(customer, productionRows, dispatchRows, routingOverrides);
+    // See verifyAgainstFreshBlocks' own comment -- a second, synchronously-fresh pass of the same real-
+    // vs-resolved-block check, right before anything is actually written, closing the race window the
+    // first (necessarily cache-dependent) pass above can't close on its own.
+    const exemptBlockTitles = new Set(Object.values(routingOverrides).map(o => normalizeForCatalogMatch(o.block || '')).filter(Boolean));
+    const { safeItemGroups: itemGroups, newlyUnmatched } = await verifyAgainstFreshBlocks(customer, syncItemGroups, exemptBlockTitles);
+    const unmatched = Array.from(new Set([...syncUnmatched, ...newlyUnmatched]));
     // "Items" in this message means individual dated entries, not products/variants — confirmed
     // directly as confusing wording once before: counting itemGroups (products) instead of entries made
     // "Sent 8 items" read as if only 8 things total existed, when it actually meant "8 different
