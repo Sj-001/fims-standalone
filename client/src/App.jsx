@@ -3894,14 +3894,22 @@ function FIMSApp() {
   // doesn't actually exist (a typo, or — the real case this was confirmed against — a punctuation
   // mismatch like "(new)" vs "new"), and nothing ever caught that: the row sailed through Pending
   // Review with no picker shown, then silently got a brand-new duplicate block on push instead of
-  // being flagged for a person to look at. Only checked against a tab that already HAS real blocks —
-  // a brand-new tab with nothing in it yet has nothing ambiguous to be confused with, so this returns
-  // true (no picker needed) for a genuinely first-ever block.
+  // being flagged for a person to look at.
+  // Deliberately does NOT special-case "the tab has zero real blocks yet" as automatically fine
+  // anymore — per explicit instruction: a new block is never created unless a person deliberately
+  // assigned it, full stop, including a genuinely first-ever block for a brand-new tab. That used to
+  // return true here (nothing to be ambiguous with yet), which silently created a real duplicate block
+  // ("TOOTI FRUTI 28G * 120 PKT", right alongside the real "...PKT (new)" block the catalog should
+  // have matched) — getRealBlocksForTab reads a separate, debounced background fetch that may simply
+  // not have populated yet for this tab, which is indistinguishable from "genuinely empty" and was
+  // being treated as permission to proceed. Now every unmatched case shows the picker and waits for an
+  // actual person to look at it, whether that's because the tab is genuinely new or because its real
+  // blocks just haven't loaded into this check yet — never a silent assumption either way.
   const isCatalogEntryBlockReal = (customer, catalogEntry, description) => {
     if (!catalogEntry) return true; // irrelevant — the caller already treats a missing entry as needing the picker
     const effectiveBlockTitle = (catalogEntry.block && catalogEntry.block.trim()) || description || '';
     const realBlocks = getRealBlocksForTab(customer, catalogEntry.sheetGroup);
-    return !realBlocks.length || realBlocks.some(rb => normalizeForCatalogMatch(rb) === normalizeForCatalogMatch(effectiveBlockTitle));
+    return realBlocks.some(rb => normalizeForCatalogMatch(rb) === normalizeForCatalogMatch(effectiveBlockTitle));
   };
   // Every real customer Sheet writes dates as dot-separated D.M.YY ("5.1.24", "26.1.24") — never with
   // Rows land in the ledger already dot-formatted now (normalizeDateToDots runs at extraction time,
@@ -3952,18 +3960,18 @@ function FIMSApp() {
       // re-picked on a later push; an explicit reviewEdits override (picked fresh in the review UI)
       // still wins over this, see applyReviewEdits.
       const catalogBlock = blockByItem[key];
-      // A tab that already has real blocks, but none of them match this item's resolved block title,
-      // is exactly as unsafe to silently create a new block for as having no tab mapping at all —
-      // confirmed directly as the actual cause of a real duplicate block ("T 50 32G * 120 PKT (new)"
-      // vs "...new" looked like two different items purely from a punctuation mismatch, and the second
-      // silently got its own new block instead of being flagged for a person to look at). Skipped when
-      // this item was JUST explicitly routed in THIS SAME action (routingOverrides) — that's a
-      // deliberate, confirmed choice, not an automatic fallback, and skipped when the tab has no real
-      // blocks at all yet — a brand-new tab's first block has nothing ambiguous to be confused with.
+      // A resolved block that doesn't match any real block in the tab is unsafe to silently create —
+      // confirmed directly as the actual cause of two separate real duplicate blocks now ("T 50 32G *
+      // 120 PKT (new)" vs "...new", purely a punctuation mismatch; "TOOTI FRUTI 28G * 120 PKT" created
+      // fresh right alongside the real "...PKT (new)" block the catalog should have matched). Per
+      // explicit instruction, this is never auto-created even for a tab with zero real blocks yet — a
+      // new block is created ONLY when a person deliberately assigns it, no exception for "nothing to
+      // be ambiguous with yet". Skipped ONLY when this item was JUST explicitly routed in THIS SAME
+      // action (routingOverrides) — that's the deliberate, confirmed choice this check defers to.
       if (!Object.prototype.hasOwnProperty.call(routingOverrides, key)) {
         const effectiveBlockTitle = catalogBlock || g.description || 'Item';
         const realBlocks = getRealBlocksForTab(customer, sheetGroup);
-        if (realBlocks.length > 0 && !realBlocks.some(rb => normalizeForCatalogMatch(rb) === normalizeForCatalogMatch(effectiveBlockTitle))) {
+        if (!realBlocks.some(rb => normalizeForCatalogMatch(rb) === normalizeForCatalogMatch(effectiveBlockTitle))) {
           unmatched.push(g.description || '(blank description)');
           return;
         }
@@ -4490,8 +4498,10 @@ function FIMSApp() {
   // render — same class of bug as loadRegister silently treating "haven't read this yet" as "confirmed
   // empty." This instead repeats the real-vs-resolved-block comparison a second time, synchronously
   // scoped to this one push, against a response fetched right now — closing the race instead of
-  // narrowing it. A variant whose block was just explicitly picked in THIS SAME action (routingOverrides)
-  // is still exempt, same as the synchronous check. If the verification call itself fails (network blip,
+  // narrowing it. Per explicit instruction, a new block is NEVER created automatically — not even for a
+  // tab with zero real blocks yet — only when a person deliberately assigned it; a variant whose block
+  // was just explicitly picked in THIS SAME action (routingOverrides) is the one and only exemption,
+  // same as the synchronous check. If the verification call itself fails (network blip,
   // server hiccup), this falls back to the synchronous check's own decision rather than blocking the
   // whole push on an unrelated failure — strictly safer than before (a real extra check now runs most of
   // the time) even though it isn't a 100%-always guarantee.
@@ -4507,9 +4517,11 @@ function FIMSApp() {
       const data = await res.json().catch(() => ({}));
       if (!data.ok || !Array.isArray(data.tabs)) return { safeItemGroups: itemGroups, newlyUnmatched: [] };
       const newlyUnmatched = [];
+      // No "tab has zero real blocks yet, so a first block is fine" exception here either — per
+      // explicit instruction, a new block is only ever created when a person deliberately assigned it
+      // (routingOverrides/exemptBlockTitles), never as an automatic fallback for a genuinely empty tab.
       const safeItemGroups = itemGroups.map((g, gi) => {
         const freshRealBlocks = (data.tabs[gi] && data.tabs[gi].existingBlockTitles) || [];
-        if (!freshRealBlocks.length) return g; // genuinely nothing real there yet -- a first block is fine
         const safeVariants = (g.variants || []).filter(v => {
           const effectiveTitle = v.blockTitleOverride || v.title || '';
           const normalizedTitle = normalizeForCatalogMatch(effectiveTitle);

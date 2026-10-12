@@ -3,9 +3,14 @@
 // used to check that, so the row sailed through Pending Review with no picker and silently got a
 // brand-new duplicate block on push. Two-part fix, both covered here:
 //   - isCatalogEntryBlockReal: extends needsTabBlock in Pending Review to force the picker when a
-//     catalog entry's block matches nothing real in a tab that already has real blocks.
+//     catalog entry's block matches nothing real.
 //   - the push-time hard backstop inside buildCustomerSheetPayloadFromRows: routes to `unmatched`
 //     instead of creating a block, unless the item was just explicitly routed via routingOverrides.
+// Per explicit instruction (confirmed live, 2026-10-12, "TOOTI FRUTI 28G * 120 PKT" created fresh
+// alongside the real "...PKT (new)" block): a new block is NEVER created automatically, not even for a
+// tab with zero real blocks yet -- the earlier version of this fix carved out exactly that exception
+// ("nothing to be ambiguous with yet"), which is what let TOOTI FRUTI through. Both checks now require
+// an explicit routingOverrides pick before any new block, with no "brand new tab" exemption.
 const path = require('path');
 const { extractBlock, extractLine, buildFromSource } = require('../lib/extract');
 const { makeRecorder } = require('../lib/assert');
@@ -55,7 +60,7 @@ const t = makeRecorder('catalog-block-ambiguity');
   );
   t.assertEqual(
     run('DIAMOND', { sheetGroup: 'NEWTAB', block: 'Whatever New Item' }, 'irrelevant', {}),
-    true, 'BRAND NEW TAB: no real blocks yet -> not ambiguous, first-ever block is fine'
+    false, 'POLICY CHANGE: a tab with zero real blocks yet is NO LONGER auto-fine -- forces the picker too, same as any other mismatch'
   );
 }
 
@@ -128,6 +133,32 @@ const t = makeRecorder('catalog-block-ambiguity');
       realBlocksFor: { 'DIAMOND||T 50': ['T 50 64G * 60 PKT'] },
     });
     t.assertEqual(unmatched.length, 0, 'NORMAL: a correctly-matching item is never blocked');
+  }
+  // *** THE EXACT LIVE CASE, PUSH-TIME ***: TOOTI FRUTI's catalog block doesn't match the tab's one
+  // real block -- must route to unmatched, never silently create "TOOTI FRUTI 28G * 120 PKT" fresh.
+  {
+    const groups = [{ description: 'TOOTI FRUTI 28G * 120 PKT', customer: 'DIAMOND', ledger: [] }];
+    const key = normalizeForCatalogMatch('TOOTI FRUTI 28G * 120 PKT');
+    const { unmatched, tabsMap } = run({
+      customer: 'DIAMOND', groups,
+      sheetGroupByItem: { [key]: 'TOOTI FRUTI' }, blockByItem: { [key]: 'TOOTI FRUTI 28G * 120 PKT' }, routingOverrides: {},
+      realBlocksFor: { 'DIAMOND||TOOTI FRUTI': ['TOOTI FRUTI 28G * 120 PKT (new)'] },
+    });
+    t.assertEqual(Object.keys(tabsMap).length, 0, 'LIVE CASE: nothing gets queued to push for TOOTI FRUTI');
+    t.assertEqual(unmatched.length, 1, 'LIVE CASE: reported as unmatched instead of creating a duplicate block');
+  }
+  // *** POLICY CHANGE ***: a tab with ZERO real blocks yet must also route to unmatched when not
+  // explicitly routed -- no more "first block for an empty tab is automatically fine" exception.
+  {
+    const groups = [{ description: 'Genuinely First Item For This Tab', customer: 'DIAMOND', ledger: [] }];
+    const key = normalizeForCatalogMatch('Genuinely First Item For This Tab');
+    const { unmatched, tabsMap } = run({
+      customer: 'DIAMOND', groups,
+      sheetGroupByItem: { [key]: 'BRAND NEW TAB' }, blockByItem: {}, routingOverrides: {},
+      realBlocksFor: {}, // tab genuinely has zero real blocks
+    });
+    t.assertEqual(Object.keys(tabsMap).length, 0, 'POLICY CHANGE: an empty tab still requires an explicit pick, nothing auto-created');
+    t.assertEqual(unmatched.length, 1, 'POLICY CHANGE: reported as unmatched, waiting for a deliberate assignment');
   }
 }
 

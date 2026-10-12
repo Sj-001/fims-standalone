@@ -63,14 +63,30 @@ module.exports = (async () => {
     t.assertEqual(newlyUnmatched, ['TOOTI FRUTI 28G * 120 PKT'], 'LIVE CASE: reported as unmatched instead of silently creating a block');
   }
 
-  /* ===== 2. A genuinely first-ever block for a tab with no real blocks yet is still fine ===== */
+  /* ===== 2. POLICY CHANGE: a tab with zero real blocks yet is NO LONGER automatically fine -- per
+     explicit instruction, a new block is only ever created when a person deliberately assigns it, full
+     stop, no "nothing to be ambiguous with yet" exception (that exact exception is what let the TOOTI
+     FRUTI case in test 1 through the FIRST version of this fix). ===== */
   {
     const fetchImpl = async () => ({ ok: true, json: async () => ({ ok: true, tabs: [{ existingBlockTitles: [] }] }) });
     const verify = loadFn({ DIAMOND: 'sheet-id-123' }, fetchImpl);
     const itemGroups = [{ tabName: 'NEW TAB', variants: [{ title: 'Genuinely New Item' }] }];
     const { safeItemGroups, newlyUnmatched } = await verify('DIAMOND', itemGroups, new Set());
-    t.assertEqual(safeItemGroups.length, 1, 'a brand new tab with nothing real yet still proceeds normally');
-    t.assertEqual(newlyUnmatched.length, 0, 'not reported as unmatched');
+    t.assertEqual(safeItemGroups.length, 0, 'POLICY CHANGE: an empty tab no longer auto-proceeds, pulled out of the push');
+    t.assertEqual(newlyUnmatched, ['Genuinely New Item'], 'POLICY CHANGE: reported as unmatched, waiting for a deliberate assignment');
+  }
+
+  /* ===== 2b. ...but an item explicitly routed in this same action (routingOverrides / exemptBlockTitles)
+     still proceeds even into a genuinely empty tab -- that IS the deliberate assignment the policy asks
+     for, not an automatic fallback. ===== */
+  {
+    const fetchImpl = async () => ({ ok: true, json: async () => ({ ok: true, tabs: [{ existingBlockTitles: [] }] }) });
+    const verify = loadFn({ DIAMOND: 'sheet-id-123' }, fetchImpl);
+    const itemGroups = [{ tabName: 'NEW TAB', variants: [{ title: 'Genuinely New Item', blockTitleOverride: 'Genuinely New Item' }] }];
+    const exempt = new Set([normalizeForCatalogMatch('Genuinely New Item')]);
+    const { safeItemGroups, newlyUnmatched } = await verify('DIAMOND', itemGroups, exempt);
+    t.assertEqual(safeItemGroups[0].variants.length, 1, 'an explicit pick still creates the first block for a genuinely empty tab');
+    t.assertEqual(newlyUnmatched.length, 0, 'not reported as unmatched -- this was a deliberate assignment');
   }
 
   /* ===== 3. A correctly-matching block proceeds normally ===== */
