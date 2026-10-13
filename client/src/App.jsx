@@ -3296,6 +3296,16 @@ function FIMSApp() {
       const av = dedupFieldValue(ra, f);
       const bv = dedupFieldValue(rb, f);
       if (wildcard.has(f) && (av === '' || bv === '')) return true;
+      // description: tolerate one normalized reading being a PREFIX of the other, not just exact
+      // equality — confirmed directly: "T 50 32G * 120 PKT new" vs "T 50 32G * 120 PKT" (the "new"
+      // was actually an illegible colour annotation on a second read) normalize to "t5032gnew" vs
+      // "t5032g" — never equal, but always a clean prefix relationship for this exact class of case
+      // (a trailing handwritten qualifier present on one read, missing on another). Every OTHER field
+      // in `fields` (date, pieces, dispatch, party/customerHint) still has to match first — this only
+      // loosens description, and only once the row's date and exact quantities already agree, which
+      // is already a strong real-world fingerprint on its own. A minimum length on the shorter side
+      // guards against a near-empty string trivially prefix-matching almost anything.
+      if (f === 'description' && av !== bv && av.length >= 4 && bv.length >= 4 && (av.startsWith(bv) || bv.startsWith(av))) return true;
       return av === bv;
     });
   };
@@ -3353,6 +3363,43 @@ function FIMSApp() {
   // below old ones on the same sheet, and the whole page gets rephotographed) each pass their OWN dedup
   // check clean, since neither has been confirmed yet and so neither sees the other as "already there."
   // Confirmed directly as the cause of real duplicate rows landing in the Production Register.
+  // Non-trivial words a description is actually built from — pure packaging/unit noise ("pkt",
+  // "packet", bare "g"/"gm"/"x", "new"/"old", anything under 3 letters) is excluded, same spirit as
+  // normalizeForCatalogMatch's own noise-stripping but kept as real whole words instead of a collapsed
+  // string, since what SIGNIFICANT_WORD_OVERLAP_FIELDS needs is "do these two sets of real words
+  // overlap," not "are these two strings similar."
+  const DESCRIPTION_NOISE_WORDS = new Set(['pkt', 'pkts', 'packet', 'packets', 'gm', 'new', 'old', 'and']);
+  const significantWords = (desc) => new Set(
+    String(desc || '').toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/)
+      .filter(w => w.length >= 3 && !DESCRIPTION_NOISE_WORDS.has(w))
+  );
+  // Fields (excluding description) that, together, are already a strong real-world fingerprint for
+  // "same physical entry" on their own — confirmed directly: a date and an exact-to-the-piece quantity
+  // match is a far stronger signal than two rows coincidentally sharing both by chance.
+  const NUMERIC_FINGERPRINT_FIELDS = { production: ['date', 'pieces', 'dispatch'], customerDispatch: ['date', 'quantity', 'rate', 'amount'] };
+  // Catches the failure Fix B (the prefix tolerance in rowsMatchForDedup) structurally cannot: a
+  // description that was abbreviated DIFFERENTLY between two reads, not just missing/gaining a trailing
+  // qualifier — confirmed directly: an already-confirmed "CREAM 60G*70PKT" (itself a shortened read
+  // from some earlier extraction) re-read correctly as "Cream Burst 60g x70 Packet" shares no prefix
+  // relationship at all ("cream60g" vs "creamburst60gpacket"), so it would otherwise sail through as a
+  // plain, unflagged "new" row even though the date (22.9.26) and exact piece count (2944) are
+  // identical. Deliberately a FLAG, never a silent match — unlike Fix B's prefix case, a bare word-set
+  // overlap is nowhere near as reliable a signal on its own (e.g. two single-word items sharing one
+  // common word but differing in the other), so this only ever asks a person to look, never assumes.
+  const findNumericFingerprintMatch = (registerKey, row, existing) => {
+    const fields = NUMERIC_FINGERPRINT_FIELDS[registerKey];
+    if (!fields || !row.description) return null;
+    const rowWords = significantWords(row.description);
+    if (!rowWords.size) return null;
+    return existing.find(e => {
+      if (!e.description) return false;
+      if (!fields.every(f => dedupFieldValue(e, f) === dedupFieldValue(row, f))) return false;
+      if (rowsMatchForDedup(registerKey, e, row)) return false; // already a silent match, nothing to flag
+      const eWords = significantWords(e.description);
+      if (!eWords.size) return false;
+      return [...rowWords].every(w => eWords.has(w)) || [...eWords].every(w => rowWords.has(w));
+    }) || null;
+  };
   const flagLikelyReReadDuplicates = (registerKey, rows, extraExisting = []) => {
     const isDescriptionBased = registerKey === 'production' || registerKey === 'customerDispatch';
     const isStructured = !!STRUCTURED_LOOSE_KEY_FIELDS[registerKey];
@@ -3364,13 +3411,24 @@ function FIMSApp() {
       if (isDescriptionBased && !r.description) return r;
       const loose = looseKeyOf(r);
       const match = existing.find(e => (isDescriptionBased ? !!e.description : true) && looseKeyOf(e) === loose);
-      if (!match || rowsMatchForDedup(registerKey, match, r)) return r;
-      const reason = isDescriptionBased
-        ? `Looks like the same entry as an existing confirmed row from ${match.date} ("${match.description}") — but the numbers on this reading don't match that entry. Check the original document before confirming; this may be a misread re-extraction of a row already in the register.`
-        : registerKey === 'rawMaterialIn'
-          ? `Looks like the same reel as an existing entry already in the Raw Material Register (${match.date}, ${match.mill}, size ${match.size}, GSM ${match.gsm}, ${match.weight_kg} kg) — but this reading's Reel No/Unit doesn't match that entry's. Check the original mill slip before confirming; this may be a misread re-extraction of a reel already recorded.`
-          : `Looks like the same strip as an existing entry already in the Consumption register (${match.date}, shade ${match.shade}, size ${match.size}, GSM ${match.gsm}, ${match.weight_consumed} kg) — but this reading's SL.No/leftover doesn't match that entry's. Check the original report before confirming; this may be a misread re-extraction of a row already recorded.`;
-      return { ...r, flagged: true, flagReason: reason };
+      if (match && !rowsMatchForDedup(registerKey, match, r)) {
+        const reason = isDescriptionBased
+          ? `Looks like the same entry as an existing confirmed row from ${match.date} ("${match.description}") — but the numbers on this reading don't match that entry. Check the original document before confirming; this may be a misread re-extraction of a row already in the register.`
+          : registerKey === 'rawMaterialIn'
+            ? `Looks like the same reel as an existing entry already in the Raw Material Register (${match.date}, ${match.mill}, size ${match.size}, GSM ${match.gsm}, ${match.weight_kg} kg) — but this reading's Reel No/Unit doesn't match that entry's. Check the original mill slip before confirming; this may be a misread re-extraction of a reel already recorded.`
+            : `Looks like the same strip as an existing entry already in the Consumption register (${match.date}, shade ${match.shade}, size ${match.size}, GSM ${match.gsm}, ${match.weight_consumed} kg) — but this reading's SL.No/leftover doesn't match that entry's. Check the original report before confirming; this may be a misread re-extraction of a row already recorded.`;
+        return { ...r, flagged: true, flagReason: reason };
+      }
+      if (isDescriptionBased) {
+        const fpMatch = findNumericFingerprintMatch(registerKey, r, existing);
+        if (fpMatch) {
+          return {
+            ...r, flagged: true,
+            flagReason: `Same date and quantity as an existing confirmed row from ${fpMatch.date} ("${fpMatch.description}") — but the item name read differently this time. Check the original document before confirming; this may be the same entry already in the register, read with a different/abbreviated name.`,
+          };
+        }
+      }
+      return r;
     });
   };
   // A page gets re-uploaded once new rows are added below earlier ones on the same physical sheet —
@@ -3880,7 +3938,20 @@ function FIMSApp() {
     .replace(/pkt\.?/g, '')
     // Trailing pack-count separator — Sheet block titles write this as "x", "×", or a bare "*"
     // ("35g*144", as opposed to the register's "35g x144"). All three mean the same thing here.
-    .replace(/\s*[x×*]\s*\d+\s*$/i, '')
+    //
+    // Lookahead instead of a hard `$` anchor: a handwritten qualifier after the pack count ("T 50
+    // 32G * 120 PKT new") used to survive completely untouched, since the old end-anchored version
+    // only fired when the pack count was the literal last thing in the string. Confirmed directly as
+    // a real re-upload case: the SAME physical row, same date, same exact piece count, read once as
+    // "...PKT new" and once as "...PKT" (the handwritten annotation — actually a colour note, not
+    // "new" at all — wasn't legible the second time) normalized to "t5032gnew" vs "t5032g", sharing
+    // nothing recognizable, so the row silently looked brand new on re-upload instead of being
+    // recognized as the one already confirmed. The lookahead only requires that nothing WITH A DIGIT
+    // follows the matched pack count — i.e. it still only strips the LAST pack-count-shaped number in
+    // the string, never one sitting mid-string before another real number — so this stays exactly as
+    // safe as before for genuinely different items; it only stops refusing to strip the pack count
+    // just because trailing text follows it.
+    .replace(/\s*[x×*]\s*\d+(?=[^\d]*$)/i, '')
     // "gm" and "g" both mean grams — real Sheet block titles and the handwritten register don't agree
     // on which one to use for the same item ("64gm" vs "64g"), so fold "gm" down to "g" wherever it's
     // written immediately after a digit, before the final alphanumeric-only strip below would otherwise

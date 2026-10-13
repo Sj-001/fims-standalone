@@ -37,10 +37,19 @@ function loadDedupFunctions(registerState, abbreviations = []) {
     'const structuredLooseKey = (registerKey, row) =>',
     (l) => l.trim().endsWith(".join('||');"),
   );
+  const descriptionNoiseWordsBlock = extractLine(APP_JSX, 'const DESCRIPTION_NOISE_WORDS = new Set(');
+  const significantWordsBlock = extractBlock(
+    APP_JSX, 'const significantWords = (desc) => new Set(', (l) => l.trim() === ');',
+  );
+  const numericFingerprintFieldsBlock = extractLine(APP_JSX, 'const NUMERIC_FINGERPRINT_FIELDS = {');
+  const findNumericFingerprintMatchBlock = extractBlock(
+    APP_JSX, 'const findNumericFingerprintMatch = (registerKey, row, existing) => {', (l) => l.trim() === '};',
+  );
   const flagLikelyReReadDuplicatesBlock = extractBlock(
     APP_JSX,
     'const flagLikelyReReadDuplicates = (registerKey, rows, extraExisting = []) => {',
-    (l) => l.trim() === '};'
+    'const dropAlreadyConfirmedDuplicates = (registerKey, rows, extraExisting = []) => {',
+    { endExclusive: true },
   );
   const dropAlreadyConfirmedDuplicatesBlock = extractBlock(
     APP_JSX,
@@ -52,6 +61,7 @@ function loadDedupFunctions(registerState, abbreviations = []) {
     dedupFieldsBlock, rowDedupKeyBlock, applyAbbreviationsBlock, normalizeForCatalogMatchBlock,
     dedupKeyForRowBlock, blankWildcardFieldsBlock, dedupFieldValueBlock, rowsMatchForDedupBlock,
     looseDateDescKeyBlock, structuredLooseFieldsBlock, structuredLooseKeyBlock,
+    descriptionNoiseWordsBlock, significantWordsBlock, numericFingerprintFieldsBlock, findNumericFingerprintMatchBlock,
   ];
 
   const dedupKeyForRow = buildFromSource(blocks, 'dedupKeyForRow', ['abbreviations'], [abbreviations]);
@@ -230,14 +240,85 @@ const t = makeRecorder('dedup-reextraction');
   t.assertEqual(dropped.length, 0, 'ASYMMETRY FIX: silently dropped as the same real row');
 }
 {
+  // POLICY CHANGE, confirmed live 2026-10-13: this used to be the expected, deliberate behavior --
+  // "(new)" present/absent was treated as a genuine word-level variant, never matched. Turned out wrong
+  // for the actual live case: "T 50 32G * 120 PKT new" (confirmed) vs "T 50 32G * 120 PKT" (re-read) was
+  // the SAME physical row -- the "new" was an illegible handwritten colour note, not a real distinguishing
+  // "new" designation, and OCR simply didn't catch it on the second read. Same date + same exact piece
+  // count is already a strong real-world fingerprint; once that agrees, a trailing-qualifier-only
+  // difference in the description (one reading has it, the other doesn't) is now tolerated and silently
+  // dropped, not flagged and not treated as a plain new item. See rowsMatchForDedup's prefix tolerance.
   const confirmed = [{
-    id: 'old1', date: '7.10.26', party: '', description: 'T 50 32G*120PKT',
+    id: 'old1', date: '7.10.26', party: '', description: 'T 50 32G*120PKT new',
     customerHint: '', pieces: 3200, dispatch: 0, stockConfirmed: true, confirmedCustomer: 'DIAMOND',
   }];
+  const { flagLikelyReReadDuplicates, dropAlreadyConfirmedDuplicates } = loadDedupFunctions({ production: confirmed });
+  const reExtracted = [{ id: 'new1', date: '7.10.26', description: 'T 50 32G * 120 PKT', pieces: 3200, dispatch: 0 }];
+  const flagged = flagLikelyReReadDuplicates('production', reExtracted);
+  t.assertTrue(!flagged[0].flagged, 'LIVE CASE (T50): trailing-qualifier-only difference, same date/pieces, is not flagged');
+  const dropped = dropAlreadyConfirmedDuplicates('production', flagged);
+  t.assertEqual(dropped.length, 0, 'LIVE CASE (T50): silently dropped as the same real row');
+}
+/* ===== 9d. THE SECOND LIVE INSTANCE of the same bug, different item: "Blacko 32g x120 (New)" vs
+   "Blacko 32g x120" -- confirms the fix generalizes, not a one-off special case for "T 50". ===== */
+{
+  const confirmed = [{
+    id: 'old1', date: '5.9.26', party: '', description: 'Blacko 32g x120 (New)',
+    customerHint: '', pieces: 4240, dispatch: 0, stockConfirmed: true, confirmedCustomer: 'anmol stock 01.08.26',
+  }];
+  const { flagLikelyReReadDuplicates, dropAlreadyConfirmedDuplicates } = loadDedupFunctions({ production: confirmed });
+  const reExtracted = [{ id: 'new1', date: '5.9.26', description: 'Blacko 32g x120', pieces: 4240, dispatch: 0 }];
+  const flagged = flagLikelyReReadDuplicates('production', reExtracted);
+  t.assertTrue(!flagged[0].flagged, 'LIVE CASE (Blacko): trailing-qualifier-only difference, same date/pieces, is not flagged');
+  const dropped = dropAlreadyConfirmedDuplicates('production', flagged);
+  t.assertEqual(dropped.length, 0, 'LIVE CASE (Blacko): silently dropped as the same real row');
+}
+/* ===== 9e. SAFETY: the prefix tolerance only kicks in once date+pieces already agree -- a genuinely
+   different variant on a genuinely different day (the real BLACKO 32g x120-OLD vs (New) case, which
+   really are two distinct catalog items) must never be silently merged just because one description is a
+   prefix of the other. ===== */
+{
+  const confirmed = [{
+    id: 'old1', date: '22.9.26', party: '', description: 'Blacko 32g x120-OLD',
+    customerHint: '', pieces: 6440, dispatch: 0, stockConfirmed: true, confirmedCustomer: 'DIAMOND',
+  }];
+  const { flagLikelyReReadDuplicates, dropAlreadyConfirmedDuplicates } = loadDedupFunctions({ production: confirmed });
+  // Different day, different quantity -- a genuinely separate batch, happens to share the prefix-able base name.
+  const newBatch = [{ id: 'new1', date: '5.9.26', description: 'Blacko 32g x120 (New)', pieces: 4240, dispatch: 0 }];
+  const flagged = flagLikelyReReadDuplicates('production', newBatch);
+  const dropped = dropAlreadyConfirmedDuplicates('production', flagged);
+  t.assertEqual(dropped.length, 1, 'SAFETY: a genuinely different day+quantity variant is never silently merged just by a description prefix relationship');
+}
+/* ===== 9f. THE SECOND REAL ROOT CAUSE, confirmed live 2026-10-13: a description abbreviated
+   DIFFERENTLY between two reads (not just a trailing qualifier) -- "CREAM 60G*70PKT" (itself a shortened
+   read, already confirmed) vs "Cream Burst 60g x70 Packet" (today's correct, fuller read). Same date,
+   same exact piece count, but "cream60g" and "creamburst60gpacket" share no prefix relationship at all,
+   so Fix B's tolerance can't catch this one -- it needs the separate word-overlap check
+   (findNumericFingerprintMatch), and deliberately only ever FLAGS this, never silently drops it, since a
+   bare word-overlap is a much weaker signal than an exact prefix match. ===== */
+{
+  const confirmed = [{
+    id: 'old1', date: '22.9.26', party: '', description: 'CREAM 60G*70PKT',
+    customerHint: '', pieces: 2944, dispatch: 0, stockConfirmed: true, confirmedCustomer: 'DIAMOND',
+  }];
   const { flagLikelyReReadDuplicates } = loadDedupFunctions({ production: confirmed });
-  const genuinelyDifferentVariant = [{ id: 'new1', date: '7.10.26', description: 'T 50 32G * 120 PKT (new)', pieces: 3200, dispatch: 0 }];
-  const result = flagLikelyReReadDuplicates('production', genuinelyDifferentVariant);
-  t.assertTrue(!result[0].flagged, 'SAFETY: a genuine word-level variant ("(new)") is not even flagged -- not found as a candidate at all, treated as a plain new item, same as before this fix');
+  const reExtracted = [{ id: 'new1', date: '22.9.26', description: 'Cream Burst 60g x70 Packet', pieces: 2944, dispatch: 0 }];
+  const result = flagLikelyReReadDuplicates('production', reExtracted);
+  t.assertTrue(result[0].flagged, 'LIVE CASE (CREAM): same date/quantity, differently-abbreviated description, is flagged for review');
+  t.assertTrue(/read differently/.test(result[0].flagReason), 'LIVE CASE (CREAM): flag reason explains it is a possible same-entry/different-reading case');
+}
+/* ===== 9g. SAFETY: the word-overlap flag requires BOTH date and exact quantity to already agree -- two
+   unrelated items that happen to share one common word (e.g. both have "Butter" in the name) on
+   different days/quantities must never be flagged just because of that shared word. ===== */
+{
+  const confirmed = [{
+    id: 'old1', date: '2.9.26', party: '', description: 'Butter Bake 130g x30 Packet',
+    customerHint: '', pieces: 7200, dispatch: 0, stockConfirmed: true, confirmedCustomer: 'anmol stock 01.08.26',
+  }];
+  const { flagLikelyReReadDuplicates } = loadDedupFunctions({ production: confirmed });
+  const unrelated = [{ id: 'new1', date: '2.9.26', description: 'Butter Plus 28g x140 Packet', pieces: 1940, dispatch: 0 }];
+  const result = flagLikelyReReadDuplicates('production', unrelated);
+  t.assertTrue(!result[0].flagged, 'SAFETY: a genuinely different item sharing one word is not flagged -- quantity disagrees, so the word-overlap check never even applies');
 }
 
 /* ===== 9. SAFETY: the blank-wildcard tolerance is scoped to production only, not customerDispatch --
