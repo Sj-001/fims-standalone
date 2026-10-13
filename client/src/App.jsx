@@ -4661,6 +4661,11 @@ function FIMSApp() {
     // vs-resolved-block check, right before anything is actually written, closing the race window the
     // first (necessarily cache-dependent) pass above can't close on its own.
     const exemptBlockTitles = new Set(Object.values(routingOverrides).map(o => normalizeForCatalogMatch(o.block || '')).filter(Boolean));
+    // Raw (not client-normalized) titles — the server has its own normalizer (normalizeTabKey) for its
+    // own equivalent exemption check, see pushCustomerSheet's own comment. Sent alongside every push so
+    // that check is never the one thing standing between a client-side bug and a block getting created
+    // with nobody having actually approved it.
+    const exemptBlockTitlesRaw = Object.values(routingOverrides).map(o => (o.block || '').trim()).filter(Boolean);
     const { safeItemGroups: itemGroups, newlyUnmatched } = await verifyAgainstFreshBlocks(customer, syncItemGroups, exemptBlockTitles);
     const unmatched = Array.from(new Set([...syncUnmatched, ...newlyUnmatched]));
     // newlyUnmatched means the cached reviewByCustomer data (what made Pending Review show this item as
@@ -4774,7 +4779,7 @@ function FIMSApp() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({ spreadsheetId: sheetId, itemGroups: wireItemGroups }),
+        body: JSON.stringify({ spreadsheetId: sheetId, itemGroups: wireItemGroups, exemptBlockTitles: exemptBlockTitlesRaw }),
       });
       if (res.status === 401) { window.dispatchEvent(new Event('fims-unauthorized')); return; }
       const data = await res.json().catch(() => ({}));

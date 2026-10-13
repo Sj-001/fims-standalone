@@ -1048,9 +1048,56 @@ function resolveTabPlansAgainstExisting(tabPlans, existingMeta) {
 // every tab's patches at once, then highlight all the touched cells in one final batchUpdate. That's 4
 // API calls total for the whole push, regardless of how many tabs or rows — comfortably inside Google's
 // 60 writes/minute/user quota for an infrequent, manually-triggered action.
+// Splits tabPlans into { authorized, blockedResults }: a plan is authorized only when EVERY one of its
+// variants either (a) matches a real, pre-existing block already in that tab (by title, normalized the
+// same way block-title matching already works everywhere else — see normalizeTabKey), or (b) has its
+// raw title present in exemptBlockTitles, the caller's own explicit "I deliberately picked this one"
+// list. A tab with ANY unauthorized variant is blocked IN FULL — nothing in it gets written, not just
+// the unauthorized variant — a mixed authorized/unauthorized tab should never actually happen (by the
+// time a push reaches here, the client has already filtered to exactly this), so failing the whole tab
+// visibly, rather than silently writing part of it, is the fail-safe choice if that assumption is ever
+// wrong. previousValuesByTab is keyed by tab name with no entry for a tab that doesn't exist yet
+// (readPushState only populates it for pre-existing tabs) — parseExistingBlocks on `[]` correctly comes
+// back with zero existing blocks, so a brand-new tab requires EVERY one of its variants to be exempt,
+// consistent with "even a tab with zero real blocks yet is never an exception" everywhere else this rule
+// is enforced.
+function authorizeTabPlansForPush(tabPlans, previousValuesByTab, exemptBlockTitles) {
+  const exemptKeys = new Set((exemptBlockTitles || []).map(normalizeTabKey).filter(Boolean));
+  const blockedResults = [];
+  const authorized = tabPlans.filter(plan => {
+    const existingTitleKeys = new Set(parseExistingBlocks(previousValuesByTab[plan.tabName] || []).blocks.map(b => normalizeTabKey(b.title)));
+    const unauthorized = plan.variants.filter(v => {
+      const key = normalizeTabKey(v.title);
+      return !existingTitleKeys.has(key) && !exemptKeys.has(key);
+    });
+    if (!unauthorized.length) return true;
+    blockedResults.push({
+      tab: plan.tabName, ok: false,
+      error: `Refused to create ${unauthorized.length} new block${unauthorized.length === 1 ? '' : 's'} without explicit confirmation: ${unauthorized.map(v => v.title).join(', ')}. Pick this block explicitly in the app, then push again.`,
+    });
+    return false;
+  });
+  return { authorized, blockedResults };
+}
 // itemGroups: [{ tabName, variants: [{ title, header, rows }] }]
-async function pushCustomerSheet(spreadsheetId, itemGroups) {
-  const { sheets, existingMeta, tabPlans, missing, previousValuesByTab } = await readPushState(spreadsheetId, itemGroups);
+//
+// exemptBlockTitles: raw block-title strings the CALLER explicitly intends to create fresh (a person's
+// own deliberate pick, e.g. via the app's Tab/Block picker) — everything else in `itemGroups` must
+// already match a real, pre-existing block in that tab, or this refuses to write it (see
+// authorizeTabPlansForPush above). This exists because, until now, that rule was enforced ONLY
+// client-side (see App.jsx's buildCustomerSheetPayloadFromRows / verifyAgainstFreshBlocks) — confirmed
+// directly as a real gap: this function itself has always silently created whatever block title a
+// caller happened to send it, with zero validation of its own. Every client-side guard that's ever been
+// added this way has, at some point, had a bug that let a mismatched item through (a stale cache, a
+// staleness race, an "empty tab" exception) — each one fixed in turn, but each one also proof that the
+// client is not a reliable last line of defense on its own. This makes the rule "a new block is only
+// ever created when a person deliberately assigns it, full stop" true no matter what the client sends,
+// not just true as long as the client's own logic happens to be bug-free that day.
+async function pushCustomerSheet(spreadsheetId, itemGroups, exemptBlockTitles = []) {
+  const { sheets, existingMeta, tabPlans: allTabPlans, missing: allMissing, previousValuesByTab } = await readPushState(spreadsheetId, itemGroups);
+  const { authorized: tabPlans, blockedResults } = authorizeTabPlansForPush(allTabPlans, previousValuesByTab, exemptBlockTitles);
+  const allowedTabNames = new Set(tabPlans.map(p => p.tabName));
+  const missing = allMissing.filter(t => allowedTabNames.has(t));
   if (missing.length) {
     const createResp = await sheets.spreadsheets.batchUpdate({
       spreadsheetId,
@@ -1063,7 +1110,7 @@ async function pushCustomerSheet(spreadsheetId, itemGroups) {
       }
     });
   }
-  const results = [];
+  const results = [...blockedResults];
   const formatRequests = [];
   const dataUpdates = [];
   const patchesByTab = {};
@@ -1317,7 +1364,11 @@ async function generateCustomerSheetStructure(spreadsheetId, categories) {
     })),
   }));
 
-  const pushResults = await pushCustomerSheet(id, itemGroups);
+  // Every item here is being created on purpose -- this whole function exists specifically to lay down
+  // a brand-new customer Sheet's structure from a person-provided category/item list (the "Generate
+  // Customer Sheet Structure" feature), not the regular production-register push path pushCustomerSheet's
+  // guard is actually meant to police. Exempting every title here is correct, not a bypass.
+  const pushResults = await pushCustomerSheet(id, itemGroups, cats.flatMap(c => c.items));
   const failed = pushResults.filter(r => !r.ok);
   if (failed.length) throw new Error(failed.map(f => `${f.tab}: ${f.error}`).join('; '));
 
@@ -1516,14 +1567,14 @@ async function importCustomerSheetHandler(req, res) {
 
 async function pushCustomerSheetHandler(req, res) {
   try {
-    const { spreadsheetId, itemGroups } = req.body || {};
+    const { spreadsheetId, itemGroups, exemptBlockTitles } = req.body || {};
     if (!spreadsheetId || !String(spreadsheetId).trim()) {
       return res.status(400).json({ error: 'spreadsheetId is required.' });
     }
     if (!Array.isArray(itemGroups)) {
       return res.status(400).json({ error: 'itemGroups must be an array.' });
     }
-    const results = await pushCustomerSheet(String(spreadsheetId).trim(), itemGroups);
+    const results = await pushCustomerSheet(String(spreadsheetId).trim(), itemGroups, Array.isArray(exemptBlockTitles) ? exemptBlockTitles : []);
     const failed = results.filter(r => !r.ok);
     // Refresh the Customer Sheets Mirror with what's REALLY in the sheet now, post-write — a fresh
     // read (via the same importCustomerSheet used at import time) rather than reconstructing values
