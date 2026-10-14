@@ -1325,6 +1325,37 @@ function BatchFillRow({ columns, rows, onUpdate, selectedIds, onClearSelection }
     </tr>
   );
 }
+// A register cell's own in-progress edit, held locally and committed to the real row data only on
+// blur or Enter — never on every keystroke. Real gap, confirmed directly: an editable date cell wired
+// straight to the row's committed value (plain value={row.date} + onChange={commit immediately}) fed
+// grouping/sorting logic (Consumption's group-by-date, EditableTable's own sort-by-date) that
+// recomputes on every render, so deleting a single digit of the year moved the row to a different date
+// group — or a brand-new one-row group — before a person had even finished typing the corrected date,
+// let alone pressed Enter or clicked away. `draft` only re-syncs from the real `value` while NOT
+// actively being edited, so an edit in progress is never overwritten out from under someone by an
+// unrelated re-render — e.g. another row's change flowing through the same `rows` array.
+function BufferedCellInput({ value, onCommit, type = 'text', className }) {
+  const [draft, setDraft] = useState(value ?? '');
+  const [editing, setEditing] = useState(false);
+  useEffect(() => {
+    if (!editing) setDraft(value ?? '');
+  }, [value, editing]);
+  const commit = () => {
+    setEditing(false);
+    if (draft !== (value ?? '')) onCommit(draft);
+  };
+  return (
+    <input
+      className={className}
+      type={type}
+      value={draft}
+      onFocus={() => setEditing(true)}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }}
+    />
+  );
+}
 function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow, sortByDate = true, showBatchFill = false }) {
   // Row selection (also showBatchFill-only, see BatchFillRow's "Apply to selected"): a plain click
   // TOGGLES just that row's checkbox without touching any other row's selection — matches the literal
@@ -1441,11 +1472,11 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
                       {ci === 0 && !suppressFlags && row.flagged && (
                         <AlertCircle size={13} color="var(--ledger-red)" style={{ flexShrink: 0 }} title={row.flagReason || 'Flagged during extraction — the model wasn\'t confident about this row. Check it against the original document.'} />
                       )}
-                      <input
+                      <BufferedCellInput
                         className="cell-input"
                         type={c.type === 'number' ? 'number' : 'text'}
-                        value={row[c.key] ?? ''}
-                        onChange={(e) => onUpdate(row.id, c.key, c.type === 'number' ? e.target.value : e.target.value)}
+                        value={row[c.key]}
+                        onCommit={(v) => onUpdate(row.id, c.key, v)}
                       />
                     </div>
                   </td>
@@ -5810,9 +5841,9 @@ function FIMSApp() {
                             <tr key={row.id}>
                               {COLUMNS.consumption.map(c => (
                                 <td key={c.key}>
-                                  <input className="cell-input" type={c.type === 'number' ? 'number' : 'text'}
-                                    value={row[c.key] ?? ''}
-                                    onChange={(e) => updateRow('consumption')(row.id, c.key, e.target.value)} />
+                                  <BufferedCellInput className="cell-input" type={c.type === 'number' ? 'number' : 'text'}
+                                    value={row[c.key]}
+                                    onCommit={(v) => updateRow('consumption')(row.id, c.key, v)} />
                                 </td>
                               ))}
                               <td>
