@@ -4865,7 +4865,17 @@ function FIMSApp() {
     if (!window.confirm(confirmMessage)) return;
     // Rows whose item is in `unmatched` must NOT be committed — they stay exactly as they were, still
     // pending, still visible, still offering the Tab/Block picker (see pushPendingRows' commitAll).
-    if (onConfirmed) onConfirmed(unmatched);
+    //
+    // THE LIVE BUG, confirmed directly against the real test environment, 2026-10-14: onConfirmed used
+    // to fire RIGHT HERE — immediately after this dialog, based only on this function's own CLIENT-SIDE
+    // pre-check (verifyAgainstFreshBlocks), before the server had even been asked. A real case: the
+    // client's pre-check said a row matched fine, but the actual payload sent to the server (built from
+    // the same routingOverrides, via a since-fixed stale-draft bug) didn't match what the server's own,
+    // independent authorizeTabPlansForPush check required — the server correctly refused the whole tab,
+    // but the row had ALREADY been marked confirmed a moment earlier and silently vanished from Pending
+    // Review with no real Sheet write behind it, and no easy way back into view. Moving this call to
+    // AFTER the real response is known — success or failure — below, means a row is only ever confirmed
+    // once the server has actually agreed, never on the strength of this function's own guess alone.
     setPushStatus(prev => ({ ...prev, [customer]: { state: 'pushing', message: '', unmatched } }));
     pushInFlightRef.current.add(customer);
     try {
@@ -4889,6 +4899,14 @@ function FIMSApp() {
         const partialRows = (data.results || []).filter(r => r.ok).reduce((s, r) => s + (r.newRows || 0), 0);
         const partialNote = partialRows ? ` ${partialRows} item${partialRows === 1 ? '' : 's'} still sent.` : '';
         setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: (failedTabs || data.error || `Push failed (HTTP ${res.status}).`) + partialNote, unmatched, stillOutstanding } }));
+        // Every row belonging to a tab the server itself refused (results[i].ok === false — authorized
+        // by position, same rename-proof convention as idsToMarkByIndex above) must stay pending too,
+        // on top of whatever this function's own pre-check already knew about — the server's verdict is
+        // the real, final one, and a row it rejected must never be confirmed just because the client
+        // thought it looked fine a moment earlier.
+        const failedIndexes = (data.results || []).reduce((acc, r, i) => { if (!r.ok && i < itemGroups.length) acc.push(i); return acc; }, []);
+        const serverRejectedTitles = failedIndexes.flatMap(i => (itemGroups[i].variants || []).map(v => v.title));
+        if (onConfirmed) onConfirmed(Array.from(new Set([...unmatched, ...serverRejectedTitles])));
         // Even on an overall-failed push, whatever DID land in the Sheet (the tabs in okIndexes) is real —
         // still worth reflecting in the mirror, re-baselining known counts, and re-diffing the review,
         // same as a full success would.
@@ -4900,6 +4918,10 @@ function FIMSApp() {
         return;
       }
       const rowsWritten = (data.results || []).reduce((s, r) => s + (r.newRows || 0), 0);
+      // Every tab in this push's own payload succeeded (we only reach here when data.ok is true) — the
+      // server has actually agreed, so it's now safe to confirm exactly the rows this function's own
+      // pre-check already knew were fine.
+      if (onConfirmed) onConfirmed(unmatched);
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'done', message: `Sent ${rowsWritten} item${rowsWritten === 1 ? '' : 's'} to ${customer}.`, unmatched, stillOutstanding } }));
       patchCustomerSheetEntry(customer, { sheetId, lastPushedAt: new Date().toISOString() });
       // Refreshes this customer's slice of the Customer Sheets Mirror with what's really in the Sheet
