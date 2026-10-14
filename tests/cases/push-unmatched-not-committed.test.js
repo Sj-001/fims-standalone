@@ -40,13 +40,17 @@ const t = makeRecorder('push-unmatched-not-committed');
     { endExclusive: true },
   );
 
-  function run({ rows, unmatchedOnPush = [] }) {
+  function run({ rows, unmatchedOnPush = [], notReadyCustomers = [] }) {
     const confirmed = [];
     const pushCalls = [];
     const confirmStockRow = (registerKey, row, customer) => confirmed.push(row.id);
     const isKnownCustomerGuess = () => true;
     const matchCustomer = (r) => r.confirmedCustomer || 'DIAMOND';
     const getCustomerSheetId = () => 'sheet-id-123';
+    // Defaults every customer to "ready" (review data already loaded) -- the pre-architectural-fix
+    // behavior every existing test here exercises. notReadyCustomers lets a test opt a specific
+    // customer INTO the "still checking" state to exercise the new push-time skip-guard.
+    const isReviewReadyForCustomer = (customer) => !notReadyCustomers.includes(customer);
     // Stands in for the real async pushCustomerSheetNow: synchronously invokes onConfirmed with
     // whatever this test configured as "what the fresh check would have rejected" -- exactly mirroring
     // what the real function does after its own confirm()/verifyAgainstFreshBlocks resolve.
@@ -56,8 +60,8 @@ const t = makeRecorder('push-unmatched-not-committed');
     };
     const fn = buildFromSource(
       block, 'pushPendingRows',
-      ['isKnownCustomerGuess', 'matchCustomer', 'pendingTabBlockForms', 'normalizeForCatalogMatch', 'confirmStockRow', 'getCustomerSheetId', 'pushCustomerSheetNow', 'window'],
-      [isKnownCustomerGuess, matchCustomer, {}, normalizeForCatalogMatch, confirmStockRow, getCustomerSheetId, pushCustomerSheetNow, { alert: () => {} }],
+      ['isKnownCustomerGuess', 'matchCustomer', 'pendingTabBlockForms', 'normalizeForCatalogMatch', 'confirmStockRow', 'getCustomerSheetId', 'pushCustomerSheetNow', 'isReviewReadyForCustomer', 'window'],
+      [isKnownCustomerGuess, matchCustomer, {}, normalizeForCatalogMatch, confirmStockRow, getCustomerSheetId, pushCustomerSheetNow, isReviewReadyForCustomer, { alert: () => {} }],
     );
     fn('production', rows);
     return { confirmed, pushCalls };
@@ -91,6 +95,27 @@ const t = makeRecorder('push-unmatched-not-committed');
     const rows = [{ id: 'r1', description: 'T 50 32G*120PKT', confirmedCustomer: 'DIAMOND' }];
     const { confirmed } = run({ rows, unmatchedOnPush: ['T 50 32G * 120 PKT'] });
     t.assertEqual(confirmed, [], 'PUNCTUATION: a cosmetically-different but equivalent description still withholds the commit');
+  }
+
+  // ARCHITECTURAL FIX, 2026-10-14: a customer whose real-Sheet review data hasn't loaded yet (still
+  // "(checking…)" in the UI) must never be pushed at all -- not even sent to pushCustomerSheetNow --
+  // since treating a not-yet-verified row as either matched or unmatched is exactly the race that let a
+  // correctly-matched real block ("100 ML") get a duplicate created next to it in production.
+  {
+    const rows = [
+      { id: 'r1', description: 'Butter Bake 130g x30 Packet', confirmedCustomer: 'DIAMOND' },
+      { id: 'r2', description: 'Jeera Dhamal 32g x144 Packet', confirmedCustomer: 'ANMOL' },
+    ];
+    const { confirmed, pushCalls } = run({ rows, notReadyCustomers: ['DIAMOND'] });
+    t.assertEqual(confirmed, ['r2'], 'NOT READY: the not-yet-checked customer\'s row is withheld, the ready one still pushes');
+    t.assertEqual(pushCalls.length, 1, 'NOT READY: pushCustomerSheetNow is never called for the not-yet-checked customer');
+    t.assertEqual(pushCalls[0].customer, 'ANMOL', 'NOT READY: only the ready customer reaches pushCustomerSheetNow');
+  }
+  {
+    const rows = [{ id: 'r1', description: 'Butter Bake 130g x30 Packet', confirmedCustomer: 'DIAMOND' }];
+    const { confirmed, pushCalls } = run({ rows, notReadyCustomers: ['DIAMOND'] });
+    t.assertEqual(confirmed, [], 'NOT READY, ALL: nothing is confirmed when every row\'s customer is still checking');
+    t.assertEqual(pushCalls.length, 0, 'NOT READY, ALL: pushCustomerSheetNow is never even called');
   }
 }
 

@@ -3674,8 +3674,17 @@ function FIMSApp() {
   const pushPendingRows = (registerKey, rows) => {
     const resolved = rows.filter(r => r.confirmedCustomer || isKnownCustomerGuess(r));
     const skipped = rows.length - resolved.length;
+    // Still waiting on the eager, non-debounced review fetch for this customer (see
+    // isReviewReadyForCustomer) — pushing now would risk treating a genuinely-matched item as
+    // unmatched just because its real Sheet data hasn't loaded yet. Hold these rows back entirely;
+    // they stay pending and visibly "(checking…)" until the fetch completes, then push normally.
+    const notYetReady = resolved.filter(r => {
+      const customer = (r.confirmedCustomer || matchCustomer(r)).trim();
+      return customer && !isReviewReadyForCustomer(customer);
+    });
+    const readyRows = resolved.filter(r => !notYetReady.includes(r));
     const byCustomer = new Map(); // customer -> { rows: [...], routingOverrides: {...}, commit: fn }
-    resolved.forEach(r => {
+    readyRows.forEach(r => {
       const customer = (r.confirmedCustomer || matchCustomer(r)).trim() || 'Unassigned';
       if (customer === 'Unassigned') return; // never auto-pushed — needs a deliberate pick first
       if (!byCustomer.has(customer)) byCustomer.set(customer, { rows: [], routingOverrides: {}, commits: [] });
@@ -3696,6 +3705,7 @@ function FIMSApp() {
       }
     });
     if (skipped > 0) window.alert(`Skipped ${skipped} row${skipped === 1 ? '' : 's'} whose customer couldn't be matched automatically — pick a customer in the dropdown for ${skipped === 1 ? 'it' : 'them'}, then push again.`);
+    if (notYetReady.length > 0) window.alert(`Skipped ${notYetReady.length} row${notYetReady.length === 1 ? '' : 's'} still checking the real Sheet for ${notYetReady.length === 1 ? 'its' : 'their'} customer — wait a moment for "(checking…)" to resolve, then push again.`);
     byCustomer.forEach(({ rows: confirmedRows, routingOverrides, commits }, customer) => {
       // Called with pushCustomerSheetNow's own `unmatched` list (description strings) once the user has
       // accepted the confirm() dialog — any row whose description is in that list did NOT actually get
@@ -4228,6 +4238,24 @@ function FIMSApp() {
     if (matchedTab && matchedTab.existingBlockTitles) return matchedTab.existingBlockTitles;
     return (rev.probedBlocksByTabName && rev.probedBlocksByTabName[sg]) || [];
   };
+  // Distinguishes "haven't actually checked this customer's real Sheet yet" from "checked it, and this
+  // specific item's block genuinely isn't there" — getRealBlocksForTab itself can't tell these apart,
+  // since reviewByCustomer[customer] being undefined (never fetched) and a loaded-but-genuinely-empty
+  // tab both end up as []. Display-layer only: never used by anything that actually decides what gets
+  // written to a Sheet (buildCustomerSheetPayloadFromRows' own check and verifyAgainstFreshBlocks are
+  // untouched, and stay the real, final word on that). This exists so Pending Review can show "still
+  // checking" instead of prematurely rendering "needs your input" for an item that would have matched
+  // fine the moment the real data actually arrived — confirmed directly: a customer's entire pending
+  // list showed every single row as needing a manual pick, including ones with a perfectly good,
+  // previously-used catalog mapping, purely because the page had been open a few seconds, not because
+  // any of them were actually wrong. A customer with no linked Sheet at all has nothing to check against
+  // and is always considered ready — matches how push already treats that case (commits straight away).
+  const isReviewReadyForCustomer = (customer) => {
+    if (!customer) return false;
+    if (!getCustomerSheetId(customer).trim()) return true;
+    const rev = reviewByCustomer[customer];
+    return !!rev && rev.loading !== true;
+  };
   // Real Sheet tab names for a customer, straight from the customer's actual spreadsheet (see
   // refreshReview, which now fires even with nothing routed/probed yet purely to populate this) — used
   // ALONGSIDE whatever tab names the Product Catalog already knows, never instead of them, so a Sheet
@@ -4274,6 +4302,25 @@ function FIMSApp() {
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reviewRefreshKey]);
+  // Fires the FIRST load for a customer immediately, not after the 700ms debounce above — specifically
+  // for whoever already has a row sitting in Pending Review right now, since that's the moment "is this
+  // actually matched" gets shown to a person, not some later background-convenience time. The general
+  // debounced effect above still owns every RE-check after this (something edited, a new item appears,
+  // etc.) — this only ever reaches past it for a customer reviewByCustomer has literally never heard of
+  // yet, so it can't fire twice for the same customer and can't fight with the debounced effect's own
+  // timing. Scoped to Pending Review specifically (not every customer in the account) so this doesn't
+  // turn into a burst of Sheets reads for customers nobody is currently looking at.
+  useEffect(() => {
+    const neededCustomers = new Set(
+      [...pendingProductionRows, ...pendingDispatchRows]
+        .map(r => r.confirmedCustomer || (isKnownCustomerGuess(r) ? matchCustomer(r) : ''))
+        .filter(Boolean)
+    );
+    neededCustomers.forEach(customer => {
+      if (reviewByCustomer[customer] === undefined && getCustomerSheetId(customer).trim()) refreshReview(customer);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingProductionRows, pendingDispatchRows, customerSheetIds]);
   const persistCustomerSheetIds = (next) => {
     setCustomerSheetIds(next);
     scheduleSave('customer-sheet-ids', () => window.storage.set(CUSTOMER_SHEET_IDS_KEY, JSON.stringify(next), false).catch(() => {}));
@@ -5931,7 +5978,8 @@ function FIMSApp() {
                     const renderRow = (row) => {
                       const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
                       const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
-                      const needsTabBlock = effectiveCustomer && (!catalogEntry || !isCatalogEntryBlockReal(effectiveCustomer, catalogEntry, row.description));
+                      const reviewReady = isReviewReadyForCustomer(effectiveCustomer);
+                      const needsTabBlock = effectiveCustomer && reviewReady && (!catalogEntry || !isCatalogEntryBlockReal(effectiveCustomer, catalogEntry, row.description));
                       const draft = pendingTabBlockForms[row.id];
                       const tabBlockUnresolved = needsTabBlock && (!((draft && draft.sheetGroup) || '').trim() || !((draft && draft.block) || '').trim());
                       return (
@@ -5944,7 +5992,12 @@ function FIMSApp() {
                             isKnownGuess={isKnownCustomerGuess(row)} knownCustomers={allCustomerTabNames}
                             onChange={v => updatePendingCustomer('production')(row.id, v)} />
                         </td>
-                        {needsTabBlock ? (
+                        {effectiveCustomer && !reviewReady ? (
+                          <>
+                            <td className="doc-hint" style={{ fontStyle: 'italic', opacity: 0.7 }} title="Checking this customer's real Sheet before showing a final answer — this is NOT a confirmed match yet.">{catalogEntry ? (catalogEntry.sheetGroup || catalogEntry.item) : ''} (checking…)</td>
+                            <td className="doc-hint" style={{ fontStyle: 'italic', opacity: 0.7 }}>{catalogEntry ? (catalogEntry.block || catalogEntry.item) : ''}</td>
+                          </>
+                        ) : needsTabBlock ? (
                           <TabBlockPickerCells rowId={row.id} description={row.description}
                             sheetGroupOptions={Array.from(new Set([
                               ...productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup),
@@ -5962,7 +6015,7 @@ function FIMSApp() {
                           </>
                         )}
                         <td className="col-action">
-                          <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm & push this row" onClick={() => pushPendingRows('production', [row])}><CheckCircle2 size={16} /></button>
+                          <button className="icon-btn" style={{ color: 'var(--ok)' }} title={effectiveCustomer && !reviewReady ? 'Still checking this customer\'s real Sheet — try again in a moment' : 'Confirm & push this row'} disabled={effectiveCustomer && !reviewReady} onClick={() => pushPendingRows('production', [row])}><CheckCircle2 size={16} /></button>
                           <button className="icon-btn danger" title="Delete this row entirely" onClick={() => { if (window.confirm('Delete this row from the Production Register entirely?')) deleteRow('production')(row.id); }}><Trash2 size={15} /></button>
                         </td>
                       </tr>
@@ -5998,7 +6051,8 @@ function FIMSApp() {
                     const renderRow = (row) => {
                       const effectiveCustomer = row.confirmedCustomer || (isKnownCustomerGuess(row) ? matchCustomer(row) : '');
                       const catalogEntry = getCatalogEntryForItem(effectiveCustomer, row.description);
-                      const needsTabBlock = effectiveCustomer && (!catalogEntry || !isCatalogEntryBlockReal(effectiveCustomer, catalogEntry, row.description));
+                      const reviewReady = isReviewReadyForCustomer(effectiveCustomer);
+                      const needsTabBlock = effectiveCustomer && reviewReady && (!catalogEntry || !isCatalogEntryBlockReal(effectiveCustomer, catalogEntry, row.description));
                       const draft = pendingTabBlockForms[row.id];
                       const tabBlockUnresolved = needsTabBlock && (!((draft && draft.sheetGroup) || '').trim() || !((draft && draft.block) || '').trim());
                       return (
@@ -6012,7 +6066,12 @@ function FIMSApp() {
                             isKnownGuess={isKnownCustomerGuess(row)} knownCustomers={allCustomerTabNames}
                             onChange={v => updatePendingCustomer('customerDispatch')(row.id, v)} />
                         </td>
-                        {needsTabBlock ? (
+                        {effectiveCustomer && !reviewReady ? (
+                          <>
+                            <td className="doc-hint" style={{ fontStyle: 'italic', opacity: 0.7 }} title="Checking this customer's real Sheet before showing a final answer — this is NOT a confirmed match yet.">{catalogEntry ? (catalogEntry.sheetGroup || catalogEntry.item) : ''} (checking…)</td>
+                            <td className="doc-hint" style={{ fontStyle: 'italic', opacity: 0.7 }}>{catalogEntry ? (catalogEntry.block || catalogEntry.item) : ''}</td>
+                          </>
+                        ) : needsTabBlock ? (
                           <TabBlockPickerCells rowId={row.id} description={row.description}
                             sheetGroupOptions={Array.from(new Set([
                               ...productCatalog.filter(c => c.customer.toLowerCase() === effectiveCustomer.toLowerCase()).map(c => c.sheetGroup),
@@ -6030,7 +6089,7 @@ function FIMSApp() {
                           </>
                         )}
                         <td className="col-action">
-                          <button className="icon-btn" style={{ color: 'var(--ok)' }} title="Confirm & push this row" onClick={() => pushPendingRows('customerDispatch', [row])}><CheckCircle2 size={16} /></button>
+                          <button className="icon-btn" style={{ color: 'var(--ok)' }} title={effectiveCustomer && !reviewReady ? 'Still checking this customer\'s real Sheet — try again in a moment' : 'Confirm & push this row'} disabled={effectiveCustomer && !reviewReady} onClick={() => pushPendingRows('customerDispatch', [row])}><CheckCircle2 size={16} /></button>
                           <button className="icon-btn danger" title="Delete this row entirely" onClick={() => { if (window.confirm('Delete this row from the Customer Dispatch Bills register entirely?')) deleteRow('customerDispatch')(row.id); }}><Trash2 size={15} /></button>
                         </td>
                       </tr>
