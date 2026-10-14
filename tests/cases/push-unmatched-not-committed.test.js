@@ -40,7 +40,7 @@ const t = makeRecorder('push-unmatched-not-committed');
     { endExclusive: true },
   );
 
-  function run({ rows, unmatchedOnPush = [], notReadyCustomers = [] }) {
+  function run({ rows, unmatchedOnPush = [], notReadyCustomers = [], pendingTabBlockForms = {}, catalogEntryByDescription = {}, blockIsRealByDescription = {} }) {
     const confirmed = [];
     const pushCalls = [];
     const confirmStockRow = (registerKey, row, customer) => confirmed.push(row.id);
@@ -51,6 +51,11 @@ const t = makeRecorder('push-unmatched-not-committed');
     // behavior every existing test here exercises. notReadyCustomers lets a test opt a specific
     // customer INTO the "still checking" state to exercise the new push-time skip-guard.
     const isReviewReadyForCustomer = (customer) => !notReadyCustomers.includes(customer);
+    // Defaults to "no catalog entry" for every row, which combined with an empty pendingTabBlockForms
+    // (the default) makes every existing test below a no-op for the stale-draft gate -- only tests that
+    // explicitly configure these exercise it.
+    const getCatalogEntryForItem = (customer, description) => catalogEntryByDescription[description] || null;
+    const isCatalogEntryBlockReal = (customer, catalogEntry, description) => !!blockIsRealByDescription[description];
     // Stands in for the real async pushCustomerSheetNow: synchronously invokes onConfirmed with
     // whatever this test configured as "what the fresh check would have rejected" -- exactly mirroring
     // what the real function does after its own confirm()/verifyAgainstFreshBlocks resolve.
@@ -60,8 +65,8 @@ const t = makeRecorder('push-unmatched-not-committed');
     };
     const fn = buildFromSource(
       block, 'pushPendingRows',
-      ['isKnownCustomerGuess', 'matchCustomer', 'pendingTabBlockForms', 'normalizeForCatalogMatch', 'confirmStockRow', 'getCustomerSheetId', 'pushCustomerSheetNow', 'isReviewReadyForCustomer', 'window'],
-      [isKnownCustomerGuess, matchCustomer, {}, normalizeForCatalogMatch, confirmStockRow, getCustomerSheetId, pushCustomerSheetNow, isReviewReadyForCustomer, { alert: () => {} }],
+      ['isKnownCustomerGuess', 'matchCustomer', 'pendingTabBlockForms', 'normalizeForCatalogMatch', 'confirmStockRow', 'getCustomerSheetId', 'pushCustomerSheetNow', 'isReviewReadyForCustomer', 'getCatalogEntryForItem', 'isCatalogEntryBlockReal', 'window'],
+      [isKnownCustomerGuess, matchCustomer, pendingTabBlockForms, normalizeForCatalogMatch, confirmStockRow, getCustomerSheetId, pushCustomerSheetNow, isReviewReadyForCustomer, getCatalogEntryForItem, isCatalogEntryBlockReal, { alert: () => {} }],
     );
     fn('production', rows);
     return { confirmed, pushCalls };
@@ -116,6 +121,38 @@ const t = makeRecorder('push-unmatched-not-committed');
     const { confirmed, pushCalls } = run({ rows, notReadyCustomers: ['DIAMOND'] });
     t.assertEqual(confirmed, [], 'NOT READY, ALL: nothing is confirmed when every row\'s customer is still checking');
     t.assertEqual(pushCalls.length, 0, 'NOT READY, ALL: pushCustomerSheetNow is never even called');
+  }
+
+  // THE LIVE BUG, confirmed directly against the real test environment, 2026-10-14: "Vishesh 100 ML"
+  // showed correctly matched in Pending Review (real catalog block "100 ML", genuinely existing in the
+  // real Sheet) and STILL got refused by the server for trying to create a brand-new block literally
+  // titled "Vishesh 100 ML" -- the row's own raw description. Root cause: a pendingTabBlockForms draft
+  // left over from BEFORE the row became correctly catalog-matched (Sheet Tab picked, Block left blank
+  // -- which the picker itself labels "blank = new block", correct for a genuinely new item at the
+  // time) was still being read and trusted unconditionally, with no check for whether the row still
+  // actually needed it.
+  {
+    const rows = [{ id: 'r1', description: 'Vishesh 100 ML', confirmedCustomer: 'VISHESH STOCK' }];
+    const { pushCalls } = run({
+      rows,
+      pendingTabBlockForms: { r1: { sheetGroup: 'VP PAPER CUP 1', block: '' } },
+      catalogEntryByDescription: { 'Vishesh 100 ML': { item: 'Vishesh 100 ML', sheetGroup: 'VP PAPER CUP 1', block: '100 ML' } },
+      blockIsRealByDescription: { 'Vishesh 100 ML': true },
+    });
+    t.assertEqual(pushCalls[0].routingOverrides, {}, 'LIVE CASE: a stale draft is ignored once the row is genuinely catalog-matched -- no bogus self-titled block override reaches the server');
+  }
+  // The exact same draft, but the row GENUINELY still needs it (no catalog match, or the catalog's
+  // block genuinely isn't real) -- must still work exactly as before, picking up the person's explicit
+  // choice. The stale-draft fix must never break a draft that's still actually needed.
+  {
+    const rows = [{ id: 'r1', description: 'Some New Item', confirmedCustomer: 'VISHESH STOCK' }];
+    const { pushCalls } = run({
+      rows,
+      pendingTabBlockForms: { r1: { sheetGroup: 'SOME NEW TAB', block: 'Some New Block' } },
+      catalogEntryByDescription: {},
+      blockIsRealByDescription: {},
+    });
+    t.assertEqual(pushCalls[0].routingOverrides, { somenewitem: { sheetGroup: 'SOME NEW TAB', block: 'Some New Block' } }, 'STILL NEEDED: a draft for a genuinely unmatched item is still honored exactly as before');
   }
 }
 

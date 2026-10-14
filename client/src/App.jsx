@@ -3716,7 +3716,25 @@ function FIMSApp() {
       bucket.commits.push({ description: r.description || '', run: () => confirmStockRow(registerKey, r, customer) });
       // Read now, not inside the deferred commit — pendingTabBlockForms[r.id] only exists while the row
       // is genuinely still pending; confirmStockRow itself clears it once it actually runs.
-      const tabBlockDraft = pendingTabBlockForms[r.id];
+      //
+      // THE LIVE BUG, confirmed directly against the real test environment, 2026-10-14: "Vishesh 100
+      // ML" showed correctly matched (catalog block "100 ML", genuinely real) and still got refused by
+      // the server for trying to create a brand-new block literally titled "Vishesh 100 ML" — the row's
+      // own raw description. Root cause: pendingTabBlockForms[r.id] is read and trusted UNCONDITIONALLY
+      // here, with no check for whether the row still actually needs it. A draft left over from BEFORE
+      // the row became correctly catalog-matched (Sheet Tab picked, Block left blank — which the picker
+      // itself labels "blank = new block", correct for a genuinely new item at the time) survives in
+      // this plain useState across renders. Once the row later resolves to a real catalog match, this
+      // stale draft is still here, still gets read, and — worse — because it's placed into
+      // routingOverrides, buildCustomerSheetPayloadFromRows treats it as a DELIBERATE pick and skips its
+      // own realBlocks safety check entirely, so the raw-description fallback for a blank Block sails
+      // straight through to the server instead of being caught. A draft only ever belongs in
+      // routingOverrides while the row still genuinely needs picking — once it's resolved some other
+      // way (a fresh catalog entry, a newly-synced real block), the leftover draft must be ignored, not
+      // trusted as if a person had just picked it.
+      const catalogEntryForRow = getCatalogEntryForItem(customer, r.description);
+      const stillNeedsPicker = !catalogEntryForRow || !isCatalogEntryBlockReal(customer, catalogEntryForRow, r.description);
+      const tabBlockDraft = stillNeedsPicker ? pendingTabBlockForms[r.id] : undefined;
       const draftSheetGroup = (tabBlockDraft && tabBlockDraft.sheetGroup || '').trim();
       if (draftSheetGroup) {
         const key = normalizeForCatalogMatch(r.description || '');
