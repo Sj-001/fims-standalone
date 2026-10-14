@@ -121,4 +121,44 @@ function gridWithBlocks(titles) {
   t.assertEqual(blockedResults[0].tab, 'T 50', 'ISOLATION: specifically the unauthorized one');
 }
 
+/* ===== 7. THE LIVE BUG: a variant whose own item title differs from its real block's title
+   (blockTitleOverride) must be authorized against the OVERRIDE, not the raw title -- confirmed directly
+   against the real VISHESH STOCK test Sheet: item "Vishesh 100 ML" correctly resolves to the real,
+   pre-existing block "100 ML", but was refused every time because this function used to key on v.title
+   alone, ignoring blockTitleOverride entirely (the one field every other block-matching step in
+   server/lib/sheets.js already treats as taking priority). ===== */
+{
+  const tabPlans = [{
+    tabName: 'VP PAPER CUP 1',
+    variants: [{ title: 'Vishesh 100 ML', blockTitleOverride: '100 ML', header: [], rows: [] }],
+  }];
+  const previousValuesByTab = { 'VP PAPER CUP 1': gridWithBlocks(['100 ML', 'DIA DOME']) };
+  const { authorized, blockedResults } = authorizeTabPlansForPush(tabPlans, previousValuesByTab, []);
+  t.assertEqual(authorized.length, 1, 'LIVE CASE: authorized against the real block the override points at, not the item\'s own name');
+  t.assertEqual(blockedResults.length, 0, 'LIVE CASE: not blocked -- "100 ML" genuinely exists');
+}
+/* ===== 8. The flip side: a blockTitleOverride that does NOT match any real block must still be
+   refused, exactly like a plain title would be -- the override isn't a bypass, just a different key to
+   check. ===== */
+{
+  const tabPlans = [{
+    tabName: 'VP PAPER CUP 1',
+    variants: [{ title: 'Vishesh 100 ML', blockTitleOverride: 'Totally Made Up Block', header: [], rows: [] }],
+  }];
+  const previousValuesByTab = { 'VP PAPER CUP 1': gridWithBlocks(['100 ML']) };
+  const { authorized, blockedResults } = authorizeTabPlansForPush(tabPlans, previousValuesByTab, []);
+  t.assertEqual(authorized.length, 0, 'FLIP SIDE: an override pointing at nothing real is still refused');
+  t.assertEqual(blockedResults.length, 1, 'FLIP SIDE: reported as blocked');
+  t.assertTrue(blockedResults[0].error.includes('Totally Made Up Block'), 'FLIP SIDE: the error names the override title, not the item\'s own name');
+}
+/* ===== 9. A variant with NO blockTitleOverride at all still authorizes against its own title, exactly
+   as before -- the override is additive, never required. ===== */
+{
+  const tabPlans = [{ tabName: 'T 50', variants: [{ title: 'T 50 32G * 120 PKT', header: [], rows: [] }] }];
+  const previousValuesByTab = { 'T 50': gridWithBlocks(['T 50 32G * 120 PKT']) };
+  const { authorized, blockedResults } = authorizeTabPlansForPush(tabPlans, previousValuesByTab, []);
+  t.assertEqual(authorized.length, 1, 'NO OVERRIDE: still authorizes correctly against the plain title');
+  t.assertEqual(blockedResults.length, 0, 'NO OVERRIDE: not blocked');
+}
+
 module.exports = t.summary();

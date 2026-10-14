@@ -1066,14 +1066,23 @@ function authorizeTabPlansForPush(tabPlans, previousValuesByTab, exemptBlockTitl
   const blockedResults = [];
   const authorized = tabPlans.filter(plan => {
     const existingTitleKeys = new Set(parseExistingBlocks(previousValuesByTab[plan.tabName] || []).blocks.map(b => normalizeTabKey(b.title)));
+    // THE LIVE BUG, confirmed directly against the real test environment, 2026-10-14: this used to key
+    // on v.title alone, completely ignoring v.blockTitleOverride -- the field that EVERY OTHER block-
+    // matching/writing step in this file already treats as taking priority (see processBlockGroup's own
+    // `normalizeTabKey(v.blockTitleOverride || v.title)`, and the new-block path's identical pattern).
+    // A real item whose own name differs from its real block's title ("Vishesh 100 ML" the item, "100
+    // ML" the real, pre-existing block it correctly resolves to) was refused here EVERY time, no matter
+    // how correct the override — this function was checking the one field blockTitleOverride exists
+    // specifically to NOT be checked for authorization purposes. Exactly the kind of gap this function's
+    // own comment warns about: a server-side guard is only as good as what it actually looks at.
     const unauthorized = plan.variants.filter(v => {
-      const key = normalizeTabKey(v.title);
+      const key = normalizeTabKey(v.blockTitleOverride || v.title);
       return !existingTitleKeys.has(key) && !exemptKeys.has(key);
     });
     if (!unauthorized.length) return true;
     blockedResults.push({
       tab: plan.tabName, ok: false,
-      error: `Refused to create ${unauthorized.length} new block${unauthorized.length === 1 ? '' : 's'} without explicit confirmation: ${unauthorized.map(v => v.title).join(', ')}. Pick this block explicitly in the app, then push again.`,
+      error: `Refused to create ${unauthorized.length} new block${unauthorized.length === 1 ? '' : 's'} without explicit confirmation: ${unauthorized.map(v => v.blockTitleOverride || v.title).join(', ')}. Pick this block explicitly in the app, then push again.`,
     });
     return false;
   });
