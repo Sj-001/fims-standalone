@@ -3574,6 +3574,25 @@ function FIMSApp() {
     for (const rule of customerMapping) {
       if (rule.keyword && d.includes(rule.keyword.toLowerCase())) return rule.customer || 'Unassigned';
     }
+    // THE LIVE GAP, confirmed directly against the real test environment, 2026-10-14: a Production
+    // Register row read as "T 50 32g x 120 PKT" never matched the Customer Mapping rule keyed
+    // "t 50 32g * 120 pkt" — correctly taught, correctly pointing at DIAMOND, sitting right there in
+    // Customer Mapping — because the raw substring check above is plain, unnormalized text: "x" and "*"
+    // are the exact same real-world pack-count separator (the Sheet itself writes it as "*", the
+    // register as "x"), but `.includes()` on raw lowercase text treats them as different characters, so
+    // the row fell through to "Unassigned" every time despite being completely unambiguous. Every OTHER
+    // matching step in this app (catalog lookup, dedup, block titles) already runs through
+    // normalizeForCatalogMatch for exactly this reason — this is the one place that still didn't. Tried
+    // only as a FALLBACK, after every raw-text rule has already had its shot, so no keyword that already
+    // matches today can ever match a DIFFERENT rule because of this — it only rescues rows that
+    // currently fall all the way through to Unassigned for no real reason.
+    const normalizedDescription = normalizeForCatalogMatch(row.description || '');
+    if (normalizedDescription) {
+      for (const rule of customerMapping) {
+        const normalizedKeyword = normalizeForCatalogMatch(rule.keyword || '');
+        if (normalizedKeyword && normalizedDescription.includes(normalizedKeyword)) return rule.customer || 'Unassigned';
+      }
+    }
     return 'Unassigned';
   };
   // Strips a trailing "x<digits>"/"×<digits>" pack-count — e.g. "Kaju Bake 65g x60" -> "Kaju Bake
