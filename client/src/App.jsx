@@ -4185,6 +4185,16 @@ function FIMSApp() {
         .filter(f => (f.customer || '').trim().toLowerCase() === customer.toLowerCase())
         .map(f => (f.sheetGroup || '').trim()),
       ...pendingRowsForCustomer.map(row => ((pendingTabBlockForms[row.id] && pendingTabBlockForms[row.id].sheetGroup) || '').trim()),
+      // THE LIVE GAP, confirmed directly against the real BINDAL test Sheet, 2026-10-14: a pending row
+      // with a perfectly good Product Catalog mapping (sheetGroup "IT 500", real block "IT 500
+      // CONTAINER" genuinely sitting in the Sheet) was NEVER actually checked, because nothing above
+      // probes a row's catalog-suggested tab until a person has already started typing into its own
+      // picker draft — which a row showing as "matched" obviously never does. Without this, every
+      // first-time item (catalog-known but never before pushed/confirmed for this customer) was
+      // structurally unable to ever resolve as matched, no matter how long you waited — this is NOT the
+      // "still loading" race the checking-state fix addresses, it's that the real tab was simply never
+      // asked for. Probing the catalog's own suggested tab for every pending row closes that gap.
+      ...pendingRowsForCustomer.map(row => ((getCatalogEntryForItem(customer, row.description) || {}).sheetGroup || '').trim()),
     ].filter(Boolean)));
     // Deliberately NOT excluding a probe name just because it looks like it already matches an
     // itemGroups tab: real customer sheets routinely have trailing spaces / inconsistent casing in tab
