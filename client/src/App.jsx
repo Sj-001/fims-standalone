@@ -2461,7 +2461,10 @@ function FIMSApp() {
         ? { ...r, raw: mergedRaw, rows: mergedRows, originalRows: mergedRows.map(x => ({ ...x })), truncated: r.truncated || truncated }
         : r));
       if (localIndex) localIndex[current.fileId] = { id: target.id, raw: mergedRaw };
-      setErrorMsg('Continuation page found — its partition/plate details were merged into the earlier page\'s row.');
+      // Deliberately silent on success — per explicit instruction, a clean merge doesn't need to
+      // interrupt anyone with a message, red-error-box-styled or otherwise (this shares errorMsg's
+      // display with genuine errors, and a successful merge isn't one). The 'unmatched' case below
+      // still speaks up, since that one's an actual problem someone needs to notice and act on.
       removeQueuedPages([current.id]);
       return 'merged';
     }
@@ -2645,11 +2648,10 @@ function FIMSApp() {
     } else if (anyTruncated) {
       setErrorMsg('One or more files in this batch had a response cut off before it finished the page — they\'re marked below. Check each against the original and use "Re-extract this file" for any that look incomplete.');
     } else if (continuationUnmatched) {
-      // Takes priority over a plain "merged fine" message — this needs a person's attention, a clean
-      // merge doesn't.
+      // The only continuation outcome that still speaks up — a clean merge (continuationMerges) is
+      // deliberately silent per explicit instruction (see tryMergeContinuationPage's own comment);
+      // this one is a genuine problem someone needs to notice and act on, not just a status update.
       setErrorMsg(`${continuationUnmatched} continuation page${continuationUnmatched === 1 ? '' : 's'} (partition/plate details, no item header) had no matching earlier page from the same upload to merge into — make sure every page of a multi-page document is uploaded together, then try again.${continuationMerges ? ` (${continuationMerges} other continuation page${continuationMerges === 1 ? '' : 's'} merged in fine.)` : ''}`);
-    } else if (continuationMerges) {
-      setErrorMsg(`${continuationMerges} continuation page${continuationMerges === 1 ? '' : 's'} found — partition/plate details merged into the earlier page${continuationMerges === 1 ? '' : 's'}' row${continuationMerges === 1 ? '' : 's'} below.`);
     } else {
       setErrorMsg('');
     }
