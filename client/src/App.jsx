@@ -2416,10 +2416,16 @@ function FIMSApp() {
   };
   // Shared by runExtraction/extractQueue: handles a just-extracted page's raw payload for a document
   // type that supports continuation pages (currently only dabur_pm_spec_cutting — see
-  // isContinuationPage/mergeContinuationFields on it). Returns true when this page WAS a continuation
-  // and has been fully handled (merged into an earlier page's row from the same upload, or reported as
-  // unmatched) — the caller must stop immediately rather than also creating this page's own row.
-  // Returns false for a page that isn't a continuation at all, telling the caller to proceed normally.
+  // isContinuationPage/mergeContinuationFields on it). Returns 'merged' or 'unmatched' when this page
+  // WAS a continuation and has been fully handled (either way) — the caller must stop immediately
+  // rather than also creating this page's own row. Returns false for a page that isn't a continuation
+  // at all, telling the caller to proceed normally. The string (not just a boolean) is what lets
+  // extractQueue's own end-of-batch summary report what actually happened instead of unconditionally
+  // overwriting it — see the real bug this fixed: a continuation page's "merged" confirmation was
+  // being set mid-loop via setErrorMsg below, then silently wiped out by extractQueue's own
+  // setErrorMsg('') once the whole batch finished successfully, so NOTHING ever visibly told a person
+  // their 2-page document's second page had actually been folded in — confirmed directly: a real
+  // 2-page upload just "vanished" the second page with no visible trace at all.
   //
   // localIndex: optional, { fileId -> { id, raw } } — passed by extractQueue's loop, which maintains
   // its own always-current accumulator rather than relying on this component's `fileResults` state,
@@ -2446,11 +2452,12 @@ function FIMSApp() {
         : r));
       if (localIndex) localIndex[current.fileId] = { id: target.id, raw: mergedRaw };
       setErrorMsg('Continuation page found — its partition/plate details were merged into the earlier page\'s row.');
-    } else {
-      setErrorMsg('This looks like a continuation page (partition/plate details, no item header) but no matching earlier page from the same upload was found to merge it into — make sure every page of this document is uploaded together, then try again.');
+      removeQueuedPages([current.id]);
+      return 'merged';
     }
+    setErrorMsg('This looks like a continuation page (partition/plate details, no item header) but no matching earlier page from the same upload was found to merge it into — make sure every page of this document is uploaded together, then try again.');
     removeQueuedPages([current.id]);
-    return true;
+    return 'unmatched';
   };
   const runExtraction = async () => {
     // Defensive guard against a double-fire (e.g. a fast double-click landing before React re-renders
@@ -2537,6 +2544,8 @@ function FIMSApp() {
     let haltedForRetry = false;
     let lastHaltError = null;
     let cancelled = false;
+    let continuationMerges = 0;
+    let continuationUnmatched = 0;
     // Rows extracted so far in THIS SAME batch run, per register — fileResults (component state) is a
     // stale snapshot for the rest of this loop no matter how many setFileResults calls already fired,
     // since this whole function is one continuous execution, not a fresh render per target. Without this
@@ -2572,7 +2581,13 @@ function FIMSApp() {
         }, (secondsLeft) => {
           setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
         });
-        if (tryMergeContinuationPage(pageConfig, p, raw, truncated, continuationIndexByFileId)) { anySucceeded = true; continue; }
+        const continuationResult = tryMergeContinuationPage(pageConfig, p, raw, truncated, continuationIndexByFileId);
+        if (continuationResult) {
+          anySucceeded = true;
+          if (truncated) anyTruncated = true;
+          if (continuationResult === 'merged') continuationMerges++; else continuationUnmatched++;
+          continue;
+        }
         const extraExistingForDedup = extractedThisRunByRegister[pageConfig.register] || [];
         const rows = dropAlreadyConfirmedDuplicates(pageConfig.register, flagLikelyReReadDuplicates(pageConfig.register, pageConfig.shape(raw), extraExistingForDedup), extraExistingForDedup);
         extractedThisRunByRegister[pageConfig.register] = [...extraExistingForDedup, ...rows];
@@ -2619,6 +2634,12 @@ function FIMSApp() {
       setErrorMsg('Every file in this batch failed to extract. Check your connection and try again, or extract one file at a time to isolate the problem.');
     } else if (anyTruncated) {
       setErrorMsg('One or more files in this batch had a response cut off before it finished the page — they\'re marked below. Check each against the original and use "Re-extract this file" for any that look incomplete.');
+    } else if (continuationUnmatched) {
+      // Takes priority over a plain "merged fine" message — this needs a person's attention, a clean
+      // merge doesn't.
+      setErrorMsg(`${continuationUnmatched} continuation page${continuationUnmatched === 1 ? '' : 's'} (partition/plate details, no item header) had no matching earlier page from the same upload to merge into — make sure every page of a multi-page document is uploaded together, then try again.${continuationMerges ? ` (${continuationMerges} other continuation page${continuationMerges === 1 ? '' : 's'} merged in fine.)` : ''}`);
+    } else if (continuationMerges) {
+      setErrorMsg(`${continuationMerges} continuation page${continuationMerges === 1 ? '' : 's'} found — partition/plate details merged into the earlier page${continuationMerges === 1 ? '' : 's'}' row${continuationMerges === 1 ? '' : 's'} below.`);
     } else {
       setErrorMsg('');
     }
