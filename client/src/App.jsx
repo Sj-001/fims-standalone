@@ -840,6 +840,7 @@ Return ONLY one JSON object: {"invoice_no":"","date":"","party":"","buyer_order_
 - LAYOUT B: header has SEPARATE "Item:" and "Item Code:" fields instead of one combined "Product" line; the spec table has columns like TEST ID / TEST NAME / SPECIFICATION / LOWER VALUE / TARGET / UPPER VALUE / UOM / STP REFERENCE, with a row's range split into separate LOWER VALUE and UPPER VALUE numeric columns instead of one combined text value (ignore the TARGET column — it's neither the min nor the max).
 Extract ONLY the specific fields listed below — ignore Shelf Life, Creation/Revision/Valid dates, Visual Check/Description defect-criteria text, Total GSM (Box), Bursting factor, Flutes type, Flute Direction, Thickness (board), Compression Strength, Moisture Content, Packing configuration, and any Instructions-to-Plant/Vendor/Storage rows — none of those are used here.
 CRITICAL — you are shown ONE PAGE at a time, in isolation, and this may be one page out of several in a multi-page file. Default to extracting normally — most pages in a batch like this ARE genuine spec pages, just possibly in the less-common layout above, or with a slightly different header block than either example. Only return an empty "item_code" (leaving every other field at its default/empty/zero value) when this page is CLEARLY not a spec sheet at all — genuinely blank, a bare signature/approval stamp with no spec content, or unrelated to Dabur PM specifications entirely. Do not skip a page just because it doesn't match Layout A or Layout B exactly, or because a column is labeled slightly differently than expected — read the actual row labels and values in front of you.
+CONTINUATION PAGES: some real specs run onto a second page that has NO "Item"/"Item Code" header on it at all — just a few more rows continuing the same spec table (most often Partition Size and/or Central Plate, sometimes also a Storage Condition / Mfg. Locations block), before the sheet ends. A page like this is NOT "not a spec sheet" — leave item_code and item_name empty (they genuinely aren't printed on this page), but still extract every other listed field that IS visible here exactly per the field notes below, the same as you would on any other page. Never zero out or omit a Partition Size / Central Plate row's data just because this particular page doesn't show the item header — that header is on the page before it.
 Return ONLY one JSON object:
 {"item_code":"the item code — the leading numeric code from a combined Product line (Layout A), or the separate Item Code field (Layout B)","item_name":"the item name — the rest of the Product line after the code (Layout A), or the separate Item field (Layout B)","no_of_ply":number (from Number of Plies),"box_length_min":number,"box_length_max":number,"box_width_min":number,"box_width_max":number,"box_height_min":number,"box_height_max":number,"paper_comb":"the Paper Combination and GSM text exactly as printed, e.g. '140(VK)/120(SK)/120(SK)/120(SK)/150(SK) ±10%'","partition_tier_count":number,"partition_longer_length_mm":number,"partition_longer_height_mm":number,"partition_longer_qty_total":number,"partition_shorter_width_mm":number,"partition_shorter_height_mm":number,"partition_shorter_qty_total":number,"paper_comb_partitions":"the Paper combination (Partition) text exactly as printed","no_of_plate":number,"paper_comb_plate":"the Paper combination (Plate) text exactly as printed","plate_length_mm":number,"plate_width_mm":number}
 FIELD NOTES:
@@ -902,6 +903,40 @@ FIELD NOTES:
         plate_size_mm: hasPlate ? `${num(raw.plate_length_mm)}x${num(raw.plate_width_mm)}` : '',
         plate_size_inch: hasPlate ? `${plateLIn} x ${plateWIn}` : '',
       }];
+    },
+    // Real gap, confirmed directly against real 2-page Dabur spec sheets (e.g. "CFB Bucket Pack
+    // (1Lx4) RGP'26", "CFB Real Standup Pouch 3L RGP'26"): the partition spec lives ONLY on page 2,
+    // which has no item header printed on it at all — just a few more rows continuing page 1's table.
+    // Since every page is extracted completely independently (see runExtraction/extractQueue), page 1
+    // correctly produced a row with everything EXCEPT partition data (page 1 genuinely doesn't show
+    // it), and page 2 — having no item_code to key a row off — produced nothing, silently discarding
+    // the only place the partition spec actually appears. isContinuationPage/mergeContinuationFields
+    // let the orchestration recognize that case and fold page 2's fields back into page 1's row
+    // instead of treating a blank item_code as "nothing on this page."
+    isContinuationPage: (raw) => !String(raw && raw.item_code || '').trim() && (num(raw && raw.partition_tier_count) > 0 || num(raw && raw.no_of_plate) > 0),
+    // Only overwrites a field GROUP (partition fields together, plate fields together) when the
+    // continuation page actually reports data for that group — never lets a continuation page that
+    // only adds plate info silently wipe out partition data a real page already established (or vice
+    // versa), and never lets an empty/zeroed group on this page overwrite a non-empty one already set.
+    mergeContinuationFields: (prevRaw, raw) => {
+      const merged = { ...prevRaw };
+      if (num(raw.partition_tier_count) > 0) {
+        merged.partition_tier_count = raw.partition_tier_count;
+        merged.partition_longer_length_mm = raw.partition_longer_length_mm;
+        merged.partition_longer_height_mm = raw.partition_longer_height_mm;
+        merged.partition_longer_qty_total = raw.partition_longer_qty_total;
+        merged.partition_shorter_width_mm = raw.partition_shorter_width_mm;
+        merged.partition_shorter_height_mm = raw.partition_shorter_height_mm;
+        merged.partition_shorter_qty_total = raw.partition_shorter_qty_total;
+        merged.paper_comb_partitions = raw.paper_comb_partitions;
+      }
+      if (num(raw.no_of_plate) > 0) {
+        merged.no_of_plate = raw.no_of_plate;
+        merged.paper_comb_plate = raw.paper_comb_plate;
+        merged.plate_length_mm = raw.plate_length_mm;
+        merged.plate_width_mm = raw.plate_width_mm;
+      }
+      return merged;
     },
   },
   {
@@ -2218,17 +2253,23 @@ function FIMSApp() {
       const failedFiles = [];
       for (const file of files) {
         const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+        // One id per UPLOADED FILE (not per page) — shared by every page split out of it. Otherwise-
+        // independent per-page extraction (see runExtraction/extractQueue) uses this to find "the
+        // other page(s) of THIS SAME document" for a type that needs a later page's fields merged back
+        // into an earlier page's row (see isContinuationPage on dabur_pm_spec_cutting) — never mixed
+        // across two separately-uploaded files, even two of the exact same document type.
+        const fileId = genId();
         try {
           if (isPdf) {
             const pages = await pdfFileToPages(file);
             if (!pages.length) throw new Error('NO_PAGES');
             pages.forEach((p, idx) => allPages.push({
-              id: genId(), dataUrl: p.dataUrl, base64: p.base64, copyLabel: p.copyLabel, docTypeKey: uploadDocTypeKey,
+              id: genId(), fileId, dataUrl: p.dataUrl, base64: p.base64, copyLabel: p.copyLabel, docTypeKey: uploadDocTypeKey,
               label: pages.length > 1 ? `${file.name} — page ${idx + 1}` : file.name,
             }));
           } else {
             const { dataUrl, base64 } = await resizeImageToBase64(file);
-            allPages.push({ id: genId(), dataUrl, base64, copyLabel: 'unknown', docTypeKey: uploadDocTypeKey, label: file.name });
+            allPages.push({ id: genId(), fileId, dataUrl, base64, copyLabel: 'unknown', docTypeKey: uploadDocTypeKey, label: file.name });
           }
         } catch (e) {
           failedFiles.push(file.name);
@@ -2373,6 +2414,44 @@ function FIMSApp() {
     const detail = e && e.message ? String(e.message).slice(0, 300) : '';
     return detail ? `${friendly} (Server said: ${detail})` : friendly;
   };
+  // Shared by runExtraction/extractQueue: handles a just-extracted page's raw payload for a document
+  // type that supports continuation pages (currently only dabur_pm_spec_cutting — see
+  // isContinuationPage/mergeContinuationFields on it). Returns true when this page WAS a continuation
+  // and has been fully handled (merged into an earlier page's row from the same upload, or reported as
+  // unmatched) — the caller must stop immediately rather than also creating this page's own row.
+  // Returns false for a page that isn't a continuation at all, telling the caller to proceed normally.
+  //
+  // localIndex: optional, { fileId -> { id, raw } } — passed by extractQueue's loop, which maintains
+  // its own always-current accumulator rather than relying on this component's `fileResults` state,
+  // since that state is a STALE snapshot for the rest of one loop run no matter how many setFileResults
+  // calls already fired within it (same reason extractedThisRunByRegister exists, see its comment).
+  // Omitted by runExtraction, where every call is its own fresh invocation after a real render, so the
+  // live `fileResults` closure is always current there.
+  const tryMergeContinuationPage = (pageConfig, current, raw, truncated, localIndex) => {
+    if (!pageConfig.isContinuationPage || !pageConfig.isContinuationPage(raw)) return false;
+    // Latest (not just any) matching entry, so a document with MORE than one continuation page (e.g.
+    // partition on page 2, a central plate addendum on page 3) keeps folding into the same growing
+    // row rather than each one separately racing to find the original page 1.
+    const target = localIndex
+      ? localIndex[current.fileId]
+      : [...fileResults].reverse().find(r =>
+          r.id !== current.id && r.fileId === current.fileId && r.docTypeKey === current.docTypeKey &&
+          r.status === 'done' && r.raw && String(r.raw.item_code || '').trim()
+        );
+    if (target) {
+      const mergedRaw = pageConfig.mergeContinuationFields(target.raw, raw);
+      const mergedRows = pageConfig.shape(mergedRaw);
+      setFileResults(prev => prev.map(r => r.id === target.id
+        ? { ...r, raw: mergedRaw, rows: mergedRows, originalRows: mergedRows.map(x => ({ ...x })), truncated: r.truncated || truncated }
+        : r));
+      if (localIndex) localIndex[current.fileId] = { id: target.id, raw: mergedRaw };
+      setErrorMsg('Continuation page found — its partition/plate details were merged into the earlier page\'s row.');
+    } else {
+      setErrorMsg('This looks like a continuation page (partition/plate details, no item header) but no matching earlier page from the same upload was found to merge it into — make sure every page of this document is uploaded together, then try again.');
+    }
+    removeQueuedPages([current.id]);
+    return true;
+  };
   const runExtraction = async () => {
     // Defensive guard against a double-fire (e.g. a fast double-click landing before React re-renders
     // the button's disabled state) — without this, two overlapping calls could each open their own
@@ -2387,7 +2466,7 @@ function FIMSApp() {
     abortControllerRef.current = new AbortController();
     setFileResults(prev => {
       const existing = prev.find(r => r.id === current.id);
-      const base = existing || { id: current.id, label: current.label, docTypeKey: current.docTypeKey, status: 'pending', rows: [], originalRows: [], error: '' };
+      const base = existing || { id: current.id, fileId: current.fileId, label: current.label, docTypeKey: current.docTypeKey, status: 'pending', rows: [], originalRows: [], error: '' };
       const next = prev.some(r => r.id === current.id) ? prev.map(r => r.id === current.id ? { ...base, status: 'extracting' } : r) : [...prev, { ...base, status: 'extracting' }];
       return next;
     });
@@ -2401,6 +2480,7 @@ function FIMSApp() {
       }, (secondsLeft) => {
         setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
       });
+      if (tryMergeContinuationPage(pageConfig, current, raw, truncated)) return;
       // Rows from other pages already extracted (but not yet confirmed) for this SAME register — see
       // flagLikelyReReadDuplicates' comment. fileResults is fresh here (this function call is a fresh
       // closure each time it fires), so this reads whatever's actually sitting in the review queue right
@@ -2427,7 +2507,7 @@ function FIMSApp() {
       } else {
         if (truncated) setErrorMsg(`Claude's response was cut off before it finished this page — it may have more rows than the ${rows.length} shown below. Check against the original, and use "Re-extract this file" if anything's missing.`);
         else setErrorMsg('');
-        setFileResults(prev => prev.map(r => r.id === current.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })), truncated } : r));
+        setFileResults(prev => prev.map(r => r.id === current.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })), truncated, raw } : r));
       }
     } catch (e) {
       console.error('Extraction error:', e);
@@ -2464,6 +2544,11 @@ function FIMSApp() {
     // rows added below old ones on the same sheet, whole page rephotographed) would each check dedup
     // against an "existing" set that has neither of them — see flagLikelyReReadDuplicates' comment.
     const extractedThisRunByRegister = {};
+    // See tryMergeContinuationPage's own comment for why this has to be a local accumulator rather than
+    // reading fileResults directly: within this one loop run, a page's primary row may have been
+    // produced just one or two iterations ago, and this component's own fileResults state hasn't
+    // caught up to that setFileResults call yet by the time a later continuation page needs to find it.
+    const continuationIndexByFileId = {};
     for (let t = 0; t < targets.length; t++) {
       const p = targets[t];
       // skip files that were removed from the queue mid-batch (e.g. via the × on a thumbnail)
@@ -2487,6 +2572,7 @@ function FIMSApp() {
         }, (secondsLeft) => {
           setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
         });
+        if (tryMergeContinuationPage(pageConfig, p, raw, truncated, continuationIndexByFileId)) { anySucceeded = true; continue; }
         const extraExistingForDedup = extractedThisRunByRegister[pageConfig.register] || [];
         const rows = dropAlreadyConfirmedDuplicates(pageConfig.register, flagLikelyReReadDuplicates(pageConfig.register, pageConfig.shape(raw), extraExistingForDedup), extraExistingForDedup);
         extractedThisRunByRegister[pageConfig.register] = [...extraExistingForDedup, ...rows];
@@ -2500,7 +2586,14 @@ function FIMSApp() {
           removeQueuedPages([p.id]);
         } else {
           if (truncated) anyTruncated = true;
-          setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })), truncated } : r));
+          setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'done', rows, originalRows: rows.map(x => ({ ...x })), truncated, raw } : r));
+          // Record this as a possible merge target for a LATER continuation page from the same upload
+          // (see tryMergeContinuationPage) — only when this type actually supports the feature, and
+          // only a genuine primary page (a real item_code), never a page that merely didn't produce
+          // rows for some unrelated reason.
+          if (pageConfig.isContinuationPage && String(raw.item_code || '').trim()) {
+            continuationIndexByFileId[p.fileId] = { id: p.id, raw };
+          }
         }
       } catch (e) {
         console.error('Extraction error:', e);
@@ -2549,7 +2642,7 @@ function FIMSApp() {
     setFileResults(prev => {
       const existingIds = new Set(prev.map(r => r.id));
       const missing = targets.filter(p => !existingIds.has(p.id))
-        .map(p => ({ id: p.id, label: p.label, docTypeKey: p.docTypeKey, status: 'pending', rows: [], originalRows: [], error: '' }));
+        .map(p => ({ id: p.id, fileId: p.fileId, label: p.label, docTypeKey: p.docTypeKey, status: 'pending', rows: [], originalRows: [], error: '' }));
       return missing.length ? [...prev, ...missing] : prev;
     });
   };
