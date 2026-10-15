@@ -1738,6 +1738,7 @@ const DABUR_SPEC_COLUMN_ORDER = [
   'partition_longer_qty', 'partition_shorter_qty',
   'no_of_plate', 'paper_comb_plate',
   'plate_size_mm', 'plate_size_inch',
+  'compression_strength', 'bursting_strength',
 ];
 
 // Appends confirmed Dabur PM Spec rows to a PERSON'S OWN external spreadsheet (not GOOGLE_SHEET_ID) —

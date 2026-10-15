@@ -838,11 +838,11 @@ Return ONLY one JSON object: {"invoice_no":"","date":"","party":"","buyer_order_
     systemPrompt: `You read a printed "Dabur India Limited" PM/packaging specification sheet for a corrugated box. Different print runs of this document use different layouts — adapt to whichever one this specific page actually uses, using the row LABELS (Product/Item, Item Code, Number of Plies, Length, Width, Height, Paper Combination, Partition Size, Central Plate, etc.) as your anchor, not one fixed column structure. Two layouts seen in practice:
 - LAYOUT A: header has a single "Product" line combining the code and name (e.g. "1223069359 CFB Ghrit Common- New specs"); the spec table has columns S.No / TEST / SPECIFICATION / STANDARD TEST PROCEDURE, with a row's full tolerance range written as one combined text value (e.g. "338.00 - 344.00mm").
 - LAYOUT B: header has SEPARATE "Item:" and "Item Code:" fields instead of one combined "Product" line; the spec table has columns like TEST ID / TEST NAME / SPECIFICATION / LOWER VALUE / TARGET / UPPER VALUE / UOM / STP REFERENCE, with a row's range split into separate LOWER VALUE and UPPER VALUE numeric columns instead of one combined text value (ignore the TARGET column — it's neither the min nor the max).
-Extract ONLY the specific fields listed below — ignore Shelf Life, Creation/Revision/Valid dates, Visual Check/Description defect-criteria text, Total GSM (Box), Bursting factor, Flutes type, Flute Direction, Thickness (board), Compression Strength, Moisture Content, Packing configuration, and any Instructions-to-Plant/Vendor/Storage rows — none of those are used here.
+Extract ONLY the specific fields listed below — ignore Shelf Life, Creation/Revision/Valid dates, Visual Check/Description defect-criteria text, Total GSM (Box), Bursting factor, Flutes type, Flute Direction, Thickness (board), Moisture Content, Packing configuration, and any Instructions-to-Plant/Vendor/Storage rows — none of those are used here.
 CRITICAL — you are shown ONE PAGE at a time, in isolation, and this may be one page out of several in a multi-page file. Default to extracting normally — most pages in a batch like this ARE genuine spec pages, just possibly in the less-common layout above, or with a slightly different header block than either example. Only return an empty "item_code" (leaving every other field at its default/empty/zero value) when this page is CLEARLY not a spec sheet at all — genuinely blank, a bare signature/approval stamp with no spec content, or unrelated to Dabur PM specifications entirely. Do not skip a page just because it doesn't match Layout A or Layout B exactly, or because a column is labeled slightly differently than expected — read the actual row labels and values in front of you.
 CONTINUATION PAGES: some real specs run onto a second page that has NO "Item"/"Item Code" header on it at all — just a few more rows continuing the same spec table (most often Partition Size and/or Central Plate, sometimes also a Storage Condition / Mfg. Locations block), before the sheet ends. A page like this is NOT "not a spec sheet" — leave item_code and item_name empty (they genuinely aren't printed on this page), but still extract every other listed field that IS visible here exactly per the field notes below, the same as you would on any other page. Never zero out or omit a Partition Size / Central Plate row's data just because this particular page doesn't show the item header — that header is on the page before it.
 Return ONLY one JSON object:
-{"item_code":"the item code — the leading numeric code from a combined Product line (Layout A), or the separate Item Code field (Layout B)","item_name":"the item name — the rest of the Product line after the code (Layout A), or the separate Item field (Layout B)","no_of_ply":number (from Number of Plies),"box_length_min":number,"box_length_max":number,"box_width_min":number,"box_width_max":number,"box_height_min":number,"box_height_max":number,"paper_comb":"the Paper Combination and GSM text exactly as printed, e.g. '140(VK)/120(SK)/120(SK)/120(SK)/150(SK) ±10%'","partition_tier_count":number,"partition_longer_length_mm":number,"partition_longer_height_mm":number,"partition_longer_qty_total":number,"partition_shorter_width_mm":number,"partition_shorter_height_mm":number,"partition_shorter_qty_total":number,"paper_comb_partitions":"the Paper combination (Partition) text exactly as printed","no_of_plate":number,"paper_comb_plate":"the Paper combination (Plate) text exactly as printed","plate_length_mm":number,"plate_width_mm":number}
+{"item_code":"the item code — the leading numeric code from a combined Product line (Layout A), or the separate Item Code field (Layout B)","item_name":"the item name — the rest of the Product line after the code (Layout A), or the separate Item field (Layout B)","no_of_ply":number (from Number of Plies),"box_length_min":number,"box_length_max":number,"box_width_min":number,"box_width_max":number,"box_height_min":number,"box_height_max":number,"paper_comb":"the Paper Combination and GSM text exactly as printed, e.g. '140(VK)/120(SK)/120(SK)/120(SK)/150(SK) ±10%'","partition_tier_count":number,"partition_longer_length_mm":number,"partition_longer_height_mm":number,"partition_longer_qty_total":number,"partition_shorter_width_mm":number,"partition_shorter_height_mm":number,"partition_shorter_qty_total":number,"paper_comb_partitions":"the Paper combination (Partition) text exactly as printed","no_of_plate":number,"paper_comb_plate":"the Paper combination (Plate) text exactly as printed","plate_length_mm":number,"plate_width_mm":number,"compression_strength":"the Compression Strength spec exactly as printed, see field notes","bursting_strength":"the Bursting Strength spec exactly as printed, see field notes"}
 FIELD NOTES:
 - box_length_min/max, box_width_min/max, box_height_min/max: from the Length/Width/Height rows. Layout A: one combined range like "338.00 - 344.00mm" -> min=338, max=344 (strip "mm"). Layout B: separate LOWER VALUE / UPPER VALUE columns on that row -> min=LOWER VALUE, max=UPPER VALUE. Keep the numbers exactly as printed, do not average them yourself.
 - The Partition Size row typically reads like "337(L)X95(H)±2mm-Longer side-5 nos for 1st tier and 5 for 2nd tier" plus a second line like "330(W)X95(H)-short side-5 nos for 1st tier and 5 for 2nd tier": partition_longer_length_mm/partition_longer_height_mm come from the "Longer side" line's two dimensions (337 and 95 here) — drop the ± tolerance. partition_shorter_width_mm/partition_shorter_height_mm come from the "short side" line the same way (330 and 95 here).
@@ -851,6 +851,7 @@ FIELD NOTES:
 - partition_tier_count: count the DISTINCT tiers mentioned in the Partition Size row (e.g. "1st tier" and "2nd tier" mentioned -> 2). If the row gives just one plain count with no tier language at all, use 1.
 - partition_longer_qty_total / partition_shorter_qty_total: the TOTAL piece count for that side, summed across every tier mentioned (e.g. "5 nos for 1st tier and 5 for 2nd tier" -> 5+5=10 for that side). Do not just copy the per-tier number if more than one tier is mentioned — add them up.
 - If the sheet has no Partition Size / Number of Sets of Partition row at all (some box specs genuinely have no internal partitions), set partition_tier_count to 0, all four partition dimension fields and both partition qty fields to 0, and paper_comb_partitions to an empty string — do not invent partition data that isn't printed on this specific sheet. Same rule for plate fields (no_of_plate=0, plate_length_mm/plate_width_mm=0, paper_comb_plate="") if there's no SEPARATELY-labeled Central Plate / Number of Center Plate row.
+- compression_strength / bursting_strength: both are usually printed as a single "NLT <number> <unit>" / "Not Less Than <number> <unit>" spec (e.g. "NLT 300 kgf (with partition)", "NLT 11.5 Kg / cm²") — when the SPECIFICATION cell's own text already has the full number and unit, copy it verbatim, qualifier in parentheses included. Some pages (Layout B) instead split this across columns, with the SPECIFICATION cell holding only partial wording (e.g. just "Not Less Than") and the actual number sitting alone in whichever of LOWER VALUE / TARGET / UPPER VALUE is filled in for that row (the other two are blank) — in that case, combine the SPECIFICATION text with that number and the UOM column into one string the same way, e.g. "Not Less Than 350 KG". This is combining text that's already on the page, never inventing or calculating a number that isn't printed anywhere — if the row is entirely missing or blank, leave the field as an empty string.
 - Never do any arithmetic yourself — no averaging, no unit conversion, no multiplying tier counts. Extract every number exactly as printed; all calculation happens after this, outside your response.`,
     shape: (raw) => {
       // A page that isn't a genuine spec page (blank, a signature page, an OCR text dump, a
@@ -891,7 +892,11 @@ FIELD NOTES:
         box_length_mm: boxL, box_width_mm: boxW, box_height_mm: boxH,
         paper_comb: raw.paper_comb || '',
         box_length_inch: round2(boxLInRaw), box_width_inch: round2(boxWInRaw), box_height_inch: round2(boxHInRaw),
-        sheet_size_inch: `${sheetLen} x ${sheetWid}`,
+        // Width first, then length — matches the factory's own cutting-sheet convention, flipped from
+        // this function's own internal sheetLen/sheetWid naming (which follows the Sheet_len/Sheet_wid
+        // formula comment above, length first) purely because that's the order people actually read
+        // this value in.
+        sheet_size_inch: `${sheetWid} x ${sheetLen}`,
         no_of_partitions: tierCount,
         paper_comb_partitions: hasPartitions ? (raw.paper_comb_partitions || '') : '',
         partition_longer_piece: hasPartitions ? `${num(raw.partition_longer_length_mm)}x${num(raw.partition_longer_height_mm)}` : '',
@@ -904,6 +909,8 @@ FIELD NOTES:
         paper_comb_plate: hasPlate ? (raw.paper_comb_plate || '') : '',
         plate_size_mm: hasPlate ? `${num(raw.plate_length_mm)}x${num(raw.plate_width_mm)}` : '',
         plate_size_inch: hasPlate ? `${plateLIn} x ${plateWIn}` : '',
+        compression_strength: String(raw.compression_strength || '').trim(),
+        bursting_strength: String(raw.bursting_strength || '').trim(),
       }];
     },
     // Real gap, confirmed directly against real 2-page Dabur spec sheets (e.g. "CFB Bucket Pack
@@ -1004,7 +1011,7 @@ const COLUMNS = {
     { key: 'buyer_order_no', label: 'Buyer Order No' }, { key: 'description', label: 'Description' },
     { key: 'quantity', label: 'Quantity Dispatched', type: 'number' }, { key: 'rate', label: 'Rate', type: 'number' }, { key: 'amount', label: 'Amount', type: 'number' },
   ],
-  // Mirrors the exact 23-column layout of the external cutting-spec Google Sheet this pushes to (see
+  // Mirrors the exact 25-column layout of the external cutting-spec Google Sheet this pushes to (see
   // DABUR_SPEC_COLUMN_ORDER in server/lib/sheets.js) — column order here doesn't need to match that
   // list exactly (this is just for on-screen review/local display), but the field KEYS must, since
   // that's what actually gets sent to the sheet.
@@ -1020,6 +1027,7 @@ const COLUMNS = {
     { key: 'partition_longer_qty', label: 'Partition Longer Qty', type: 'number' }, { key: 'partition_shorter_qty', label: 'Partition Shorter Qty', type: 'number' },
     { key: 'no_of_plate', label: 'No. of Plate', type: 'number' }, { key: 'paper_comb_plate', label: 'Paper Comb (Plate)' },
     { key: 'plate_size_mm', label: 'Plate Size (mm)' }, { key: 'plate_size_inch', label: 'Plate Size (in)' },
+    { key: 'compression_strength', label: 'Compression Strength' }, { key: 'bursting_strength', label: 'Bursting Strength' },
   ],
   daburPO: [
     { key: 'po_number', label: 'PO Number' }, { key: 'date', label: 'Date' }, { key: 'material_desc', label: 'Material' },
