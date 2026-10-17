@@ -5225,17 +5225,25 @@ function FIMSApp() {
           }
         });
       });
-      if (newProductionRows.length) {
-        setProduction(prev => { const next = [...prev, ...newProductionRows]; persist('production', next); return next; });
-      }
-      if (newDispatchRows.length) {
-        setCustomerDispatch(prev => { const next = [...prev, ...newDispatchRows]; persist('customerDispatch', next); return next; });
-      }
+      // Routed through addRows (the same dedup gate every extraction-confirm path already uses,
+      // keyed on DEDUP_FIELDS — see its own comment on exactly this "row pulled in via Sync from
+      // Sheet" shape) instead of appending directly: THE LIVE BUG, confirmed directly against the
+      // real test register, 2026-10-17 — this block used to append unconditionally, so a known-count
+      // baseline that fell even one row behind the real Sheet (e.g. the debounced persist() for the
+      // count bump losing a race with a page reload right after a push) made the next sync re-pull
+      // whatever had just been pushed, landing a second, pulledFromSheet-flagged copy (raw Sheet block
+      // title, so often differently-cased) right alongside the row that was already there. addRows
+      // can't prevent the baseline from drifting, but it does mean a drift like that no longer creates
+      // a visible duplicate — it just silently recognizes the "new" row as one already in the register.
+      let productionSkipped = 0;
+      let dispatchSkipped = 0;
+      if (newProductionRows.length) productionSkipped = addRows('production', newProductionRows);
+      if (newDispatchRows.length) dispatchSkipped = addRows('customerDispatch', newDispatchRows);
       // Re-baseline AFTER pulling the delta in, using this exact same fresh read — the counts and the
       // rows they were computed from can never drift apart this way.
       updateKnownCountsFromMirrorRows(customer, mirrorRows);
       replaceCustomerMirrorRows(customer, mirrorRows);
-      const pulled = newProductionRows.length + newDispatchRows.length;
+      const pulled = (newProductionRows.length - productionSkipped) + (newDispatchRows.length - dispatchSkipped);
       setSyncStatus(prev => ({ ...prev, [customer]: { state: 'done', message: pulled ? `Pulled in ${pulled} entr${pulled === 1 ? 'y' : 'ies'} added directly in the Sheet.` : 'Nothing new in the Sheet.' } }));
     } catch (e) {
       setSyncStatus(prev => ({ ...prev, [customer]: { state: 'error', message: e.message || 'Network error — could not reach the server.' } }));
