@@ -1574,6 +1574,30 @@ async function importCustomerSheetHandler(req, res) {
   }
 }
 
+// THE LIVE BUG, confirmed directly against a real customer's Sheet, 2026-10-21: pushCustomerSheet reads
+// the tab's current rows, computes where new rows/blocks go relative to that snapshot, then writes —
+// and nothing here ever serialized two pushes to the SAME spreadsheet against each other. Two overlapping
+// requests (two browser tabs/devices, or any other way two pushes for one customer land close together)
+// each read the same pre-write snapshot and each compute their own insert plan against it, so the second
+// one's plan is stale the moment the first one's write lands — confirmed as the real cause of a genuine
+// duplicate production row (one push's new row landing twice) and, for a different item in the same
+// push, a column-shifted row (production value landing in the Dispatch column) in the real DIAMOND
+// sheet. withSpreadsheetLock below serializes every write that does this same read-then-write dance —
+// pushCustomerSheet and appendDaburSpecRows — per spreadsheetId, so a second write for the same
+// spreadsheet always starts its OWN fresh read only after the first one's write has actually landed,
+// never against a snapshot the first write is about to invalidate. Scoped to a single Node process
+// (an in-memory Map, not a cross-process lock) — correct as long as this server runs as one process,
+// which is how it's deployed.
+const pushLocksBySpreadsheetId = new Map();
+function withSpreadsheetLock(spreadsheetId, fn) {
+  const previous = pushLocksBySpreadsheetId.get(spreadsheetId) || Promise.resolve();
+  const settled = previous.then(fn, fn);
+  // Stored tail never rejects — a failed push must never permanently wedge the lock for every push
+  // after it — but the real result/error still reaches THIS call's own caller via `settled` below.
+  pushLocksBySpreadsheetId.set(spreadsheetId, settled.then(() => undefined, () => undefined));
+  return settled;
+}
+
 async function pushCustomerSheetHandler(req, res) {
   try {
     const { spreadsheetId, itemGroups, exemptBlockTitles } = req.body || {};
@@ -1583,7 +1607,8 @@ async function pushCustomerSheetHandler(req, res) {
     if (!Array.isArray(itemGroups)) {
       return res.status(400).json({ error: 'itemGroups must be an array.' });
     }
-    const results = await pushCustomerSheet(String(spreadsheetId).trim(), itemGroups, Array.isArray(exemptBlockTitles) ? exemptBlockTitles : []);
+    const id = String(spreadsheetId).trim();
+    const results = await withSpreadsheetLock(id, () => pushCustomerSheet(id, itemGroups, Array.isArray(exemptBlockTitles) ? exemptBlockTitles : []));
     const failed = results.filter(r => !r.ok);
     // Refresh the Customer Sheets Mirror with what's REALLY in the sheet now, post-write — a fresh
     // read (via the same importCustomerSheet used at import time) rather than reconstructing values
@@ -1592,7 +1617,7 @@ async function pushCustomerSheetHandler(req, res) {
     // a refresh failure here must never mask the push's own (already-succeeded) results.
     let mirrorRows = [];
     try {
-      const fresh = await importCustomerSheet(String(spreadsheetId).trim());
+      const fresh = await importCustomerSheet(id);
       mirrorRows = fresh.mirrorRows;
     } catch (e) {
       console.error('Post-push Customer Sheets Mirror refresh failed (push itself still succeeded):', e);
@@ -1783,7 +1808,9 @@ async function pushDaburSpecRowsHandler(req, res) {
     if (!spreadsheetId || !Array.isArray(rows) || !rows.length) {
       return res.status(400).json({ error: 'spreadsheetId and a non-empty rows array are required.' });
     }
-    const result = await appendDaburSpecRows(spreadsheetId, rows);
+    // Same read-then-conditional-append race as pushCustomerSheet (reads existing A3:A item codes,
+    // then appends whatever's new against that snapshot) — same lock, same reason.
+    const result = await withSpreadsheetLock(String(spreadsheetId).trim(), () => appendDaburSpecRows(spreadsheetId, rows));
     res.json(result);
   } catch (e) {
     console.error('Dabur spec sheet push error:', e);

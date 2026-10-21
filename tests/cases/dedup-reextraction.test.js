@@ -30,6 +30,8 @@ function loadDedupFunctions(registerState, abbreviations = []) {
   const blankWildcardFieldsBlock = extractLine(APP_JSX, 'const BLANK_WILDCARD_DEDUP_FIELDS = {');
   const dedupFieldValueBlock = extractLine(APP_JSX, 'const dedupFieldValue = (row, f) =>');
   const rowsMatchForDedupBlock = extractBlock(APP_JSX, 'const rowsMatchForDedup = (registerKey, a, b) => {', (l) => l.trim() === '};');
+  const disagreeingDedupFieldsBlock = extractBlock(APP_JSX, 'const disagreeingDedupFields = (registerKey, a, b) => {', (l) => l.trim() === '};');
+  const dedupFieldLabelsBlock = extractBlock(APP_JSX, 'const DEDUP_FIELD_LABELS = {', (l) => l.trim() === '};');
   const looseDateDescKeyBlock = extractLine(APP_JSX, 'const looseDateDescKey = (row) =>');
   const structuredLooseFieldsBlock = extractBlock(APP_JSX, 'const STRUCTURED_LOOSE_KEY_FIELDS = {', (l) => l.trim() === '};');
   const structuredLooseKeyBlock = extractBlock(
@@ -60,6 +62,7 @@ function loadDedupFunctions(registerState, abbreviations = []) {
   const blocks = [
     dedupFieldsBlock, rowDedupKeyBlock, applyAbbreviationsBlock, normalizeForCatalogMatchBlock,
     dedupKeyForRowBlock, blankWildcardFieldsBlock, dedupFieldValueBlock, rowsMatchForDedupBlock,
+    disagreeingDedupFieldsBlock, dedupFieldLabelsBlock,
     looseDateDescKeyBlock, structuredLooseFieldsBlock, structuredLooseKeyBlock,
     descriptionNoiseWordsBlock, significantWordsBlock, numericFingerprintFieldsBlock, findNumericFingerprintMatchBlock,
   ];
@@ -333,6 +336,26 @@ const t = makeRecorder('dedup-reextraction');
   const reExtracted = [{ id: 'new1', date: '9.10.26', invoice_no: 'INV-1', party: 'Some Buyer Ltd', buyer_order_no: '', description: 'IT 500 Jumbo Container', quantity: 500, rate: 10, amount: 5000 }];
   const result = flagLikelyReReadDuplicates('customerDispatch', reExtracted);
   t.assertTrue(result[0].flagged, 'SAFETY: customerDispatch party is NOT given the blank-wildcard tolerance -- still flags');
+}
+
+/* ===== 10. THE LIVE BUG, confirmed directly against the real production register (main), 2026-10-21:
+   a page-header party name misread once ("रिटलाई") and correctly the next time ("सिलाई") -- same date,
+   same item, same pieces -- correctly gets flagged (party genuinely disagrees, no wildcard tolerance
+   for a non-blank vs non-blank mismatch), but the flagReason's own wording used to always say "the
+   numbers on this reading don't match," which is actively wrong here: the numbers agree completely: it
+   points a person checking the flag at the wrong thing. The reason must now name the field that
+   actually disagrees (party), not blindly blame "the numbers." ===== */
+{
+  const confirmed = [{
+    id: 'old1', date: '16.10.26', party: 'रिटलाई', description: 'N 100 Jumbo Container',
+    customerHint: '', pieces: 540, dispatch: 0, stockConfirmed: true, confirmedCustomer: 'BINDAL STOCK 1.08.26',
+  }];
+  const { flagLikelyReReadDuplicates } = loadDedupFunctions({ production: confirmed });
+  const reExtracted = [{ id: 'new1', date: '16.10.26', party: 'सिलाई', description: 'N 100 Jumbo Container', pieces: 540, dispatch: 0 }];
+  const result = flagLikelyReReadDuplicates('production', reExtracted);
+  t.assertTrue(result[0].flagged, 'LIVE BUG: a genuine party-name disagreement (two different non-blank readings) still flags, same as before');
+  t.assertTrue(/\bparty\b/i.test(result[0].flagReason), 'LIVE BUG: the flag reason names "party" as the disagreeing field');
+  t.assertTrue(!/numbers on this reading/i.test(result[0].flagReason), 'LIVE BUG: the flag reason no longer blames "the numbers" when the numbers (date + pieces) actually agree');
 }
 
 module.exports = t.summary();

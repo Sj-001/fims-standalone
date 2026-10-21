@@ -3466,6 +3466,35 @@ function FIMSApp() {
       return av === bv;
     });
   };
+  // Same per-field comparison as rowsMatchForDedup (identical normalization, identical tolerances —
+  // kept side by side rather than refactored into one shared implementation so a future change to one
+  // can't silently drift the other out of sync unnoticed), but instead of stopping at the first
+  // disagreement, collects every field that actually disagrees — so flagLikelyReReadDuplicates' own
+  // message can name the real field(s) involved, instead of always assuming "the numbers," which is
+  // wrong whenever the real disagreement is on date, party, or description. THE LIVE BUG, confirmed
+  // directly: a Production Register row flagged "the numbers on this reading don't match" when the
+  // numbers (date + pieces) were actually identical — the real disagreement was the `party` field (a
+  // page-header name misread once as "रिटलाई", correctly as "सिलाई" on re-extraction) — the message's
+  // own wording pointed a person at the wrong thing to go check.
+  const disagreeingDedupFields = (registerKey, a, b) => {
+    const fields = DEDUP_FIELDS[registerKey];
+    const wildcard = BLANK_WILDCARD_DEDUP_FIELDS[registerKey] || new Set();
+    const norm = (row) => (row && row.description) ? { ...row, description: normalizeForCatalogMatch(String(row.description)) } : row;
+    const ra = norm(a);
+    const rb = norm(b);
+    return fields.filter(f => {
+      const av = dedupFieldValue(ra, f);
+      const bv = dedupFieldValue(rb, f);
+      if (wildcard.has(f) && (av === '' || bv === '')) return false;
+      if (f === 'description' && av !== bv && av.length >= 4 && bv.length >= 4 && (av.startsWith(bv) || bv.startsWith(av))) return false;
+      return av !== bv;
+    });
+  };
+  const DEDUP_FIELD_LABELS = {
+    date: 'date', party: 'party (page header)', description: 'item name', customerHint: 'bracketed customer note',
+    pieces: 'pieces', dispatch: 'dispatch', invoice_no: 'invoice no.', buyer_order_no: "buyer's order no.",
+    quantity: 'quantity', rate: 'rate', amount: 'amount',
+  };
   // date + normalized description ONLY — deliberately ignores every numeric field, unlike
   // dedupKeyForRow. This is what lets flagLikelyReReadDuplicates (below) recognize "same real row" even
   // when a number was misread, which an exact/near-exact dedup key never can (the numbers genuinely
@@ -3569,8 +3598,12 @@ function FIMSApp() {
       const loose = looseKeyOf(r);
       const match = existing.find(e => (isDescriptionBased ? !!e.description : true) && looseKeyOf(e) === loose);
       if (match && !rowsMatchForDedup(registerKey, match, r)) {
+        const disagreeing = isDescriptionBased ? disagreeingDedupFields(registerKey, match, r) : [];
+        const disagreeingLabel = disagreeing.length
+          ? disagreeing.map(f => DEDUP_FIELD_LABELS[f] || f).join(', ')
+          : 'the numbers'; // fields list came back empty only if rowsMatchForDedup's own verdict and this check somehow disagree — falls back to the old generic wording rather than naming nothing
         const reason = isDescriptionBased
-          ? `Looks like the same entry as an existing confirmed row from ${match.date} ("${match.description}") — but the numbers on this reading don't match that entry. Check the original document before confirming; this may be a misread re-extraction of a row already in the register.`
+          ? `Looks like the same entry as an existing confirmed row from ${match.date} ("${match.description}") — but this reading's ${disagreeingLabel} ${disagreeing.length === 1 ? "doesn't" : "don't"} match that entry's. Check the original document before confirming; this may be a misread re-extraction of a row already in the register.`
           : registerKey === 'rawMaterialIn'
             ? `Looks like the same reel as an existing entry already in the Raw Material Register (${match.date}, ${match.mill}, size ${match.size}, GSM ${match.gsm}, ${match.weight_kg} kg) — but this reading's Reel No/Unit doesn't match that entry's. Check the original mill slip before confirming; this may be a misread re-extraction of a reel already recorded.`
             : `Looks like the same strip as an existing entry already in the Consumption register (${match.date}, shade ${match.shade}, size ${match.size}, GSM ${match.gsm}, ${match.weight_consumed} kg) — but this reading's SL.No/leftover doesn't match that entry's. Check the original report before confirming; this may be a misread re-extraction of a row already recorded.`;
