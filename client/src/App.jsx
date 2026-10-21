@@ -5701,7 +5701,25 @@ function FIMSApp() {
                 </label>
                 <input id="fileInput" type="file" accept="image/*,application/pdf" multiple style={{ display: 'none' }} onChange={(e) => handleFiles(e.target.files)} />
                 {pdfLoading && <div className="doc-hint" style={{ marginTop: 10 }}><Loader2 size={13} className="spin" style={{ verticalAlign: 'middle', marginRight: 6 }} />Reading file(s)…</div>}
-                {preview && <img src={preview} alt="preview" className="preview-img" title="Click to enlarge" onClick={() => setZoomedImage(preview)} />}
+                {preview && (
+                  <div style={{ position: 'relative', display: 'inline-block' }}>
+                    <img src={preview} alt="preview" className="preview-img" title="Click to enlarge" onClick={() => setZoomedImage(preview)} />
+                    {/* The thumbnail grid below (with its own × per page) only renders once there are
+                        2+ queued pages — with exactly one left, this was the only preview shown and it
+                        had no way to drop it at all, confirmed directly as a real dead end: "Start
+                        fresh" was the only option, which also discards anything already extracted, not
+                        just this one queued page. Mirrors the same removeQueuedPage/× control the
+                        multi-page grid already has, just for the single-page case it never covered. */}
+                    {queuedPages.length === 1 && (
+                      <button
+                        title="Remove from queue"
+                        onClick={(e) => { e.stopPropagation(); removeQueuedPage(queuedPages[0].id); }}
+                        style={{ position: 'absolute', top: -8, right: -8, width: 22, height: 22, borderRadius: '50%', border: 'none', background: 'var(--ledger-red)', color: '#fff', fontSize: 13, lineHeight: '22px', textAlign: 'center', padding: 0, cursor: 'pointer' }}>
+                        ×
+                      </button>
+                    )}
+                  </div>
+                )}
                 {queuedPages.length > 1 && (
                   <div style={{ marginTop: 10 }}>
                     <div className="doc-hint">{queuedIndex + 1} of {queuedPages.length}: {queuedPages[queuedIndex]?.label} ({docTypeLabel(queuedPages[queuedIndex]?.docTypeKey)}) — click a thumbnail to preview it, click × to drop it from the queue (works anytime, even mid-extraction), or extract everything at once.</div>
