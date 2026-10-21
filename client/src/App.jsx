@@ -4906,6 +4906,19 @@ function FIMSApp() {
   };
   const pushInFlightRef = useRef(new Set());
   const pushQueuedRef = useRef(new Map()); // customer -> { productionRows, dispatchRows, routingOverrides, onConfirmedFns } waiting their turn
+  // THE LIVE BUG, confirmed directly against a real customer's Sheet: a row queued here because a push
+  // for the same customer was already in flight gets resent EXACTLY as queued once that in-flight push
+  // finishes — including when the row it was queued with is one the in-flight push itself just finished
+  // writing (e.g. a bulk "Push to Sheet" covering 5 items is still in flight — rows haven't been marked
+  // pushed yet, so they're still clickable in Pending Review — and one of those 5 also gets clicked
+  // individually while the bulk push is running; that click queues instead of sending, correctly, but
+  // the retry below never re-checks whether its queued rows got covered by the push it waited behind).
+  // Real, confirmed consequence: a genuine duplicate row for one item and a column-shifted row for two
+  // others, all in the same real DIAMOND sheet. A plain `production`/`customerDispatch` state read in
+  // the `finally` block below can't catch this — React state updates from THIS SAME call's own
+  // markPushedForIndexes haven't propagated into this closure's bindings yet at that point — so this
+  // tracks just-pushed ids in a ref, updated synchronously, read synchronously, no render needed.
+  const pushedIdsRef = useRef(new Set());
   // Pushes EXACTLY productionRows/dispatchRows — the specific rows the caller was just handed, nothing
   // recomputed, nothing swept in from elsewhere. This used to rebuild its own payload from "everything
   // currently unpushed for this customer," which is exactly how a row confirmed in one action ended up
@@ -5032,6 +5045,11 @@ function FIMSApp() {
       confirmedDispatchRows.filter(r => !r.pushedToSheet && !justPushedDispatchIds.has(r.id) && (r.confirmedCustomer || '').trim() === customer).length;
     const markPushedForIndexes = (indexes) => {
       const { productionIds, dispatchIds } = idsForIndexes(indexes);
+      // Recorded synchronously, before either setState call below — see pushedIdsRef's own comment.
+      // Anything landing here is real: these ids are only ever added once the server has actually
+      // confirmed the write (okIndexes, computed from data.results), never speculatively.
+      productionIds.forEach(id => pushedIdsRef.current.add(id));
+      dispatchIds.forEach(id => pushedIdsRef.current.add(id));
       if (productionIds.size) {
         setProduction(prev => {
           const next = prev.map(r => productionIds.has(r.id) ? { ...r, pushedToSheet: true } : r);
@@ -5137,8 +5155,19 @@ function FIMSApp() {
       const queued = pushQueuedRef.current.get(customer);
       if (queued) {
         pushQueuedRef.current.delete(customer);
-        const mergedOnConfirmed = queued.onConfirmedFns.length ? (unmatchedDescriptions) => queued.onConfirmedFns.forEach(fn => fn(unmatchedDescriptions)) : undefined;
-        pushCustomerSheetNow(customer, queued.productionRows, queued.dispatchRows, queued.routingOverrides, mergedOnConfirmed);
+        // Drop anything the push that just finished already covered — see pushedIdsRef's own comment.
+        // Never adds rows, never re-reads "what's outstanding" (that's the exact sweep-in-extra-rows
+        // bug this function's own top comment warns about) — purely removes rows that are now stale.
+        const freshProductionRows = queued.productionRows.filter(r => !pushedIdsRef.current.has(r.id));
+        const freshDispatchRows = queued.dispatchRows.filter(r => !pushedIdsRef.current.has(r.id));
+        if (freshProductionRows.length || freshDispatchRows.length) {
+          const mergedOnConfirmed = queued.onConfirmedFns.length ? (unmatchedDescriptions) => queued.onConfirmedFns.forEach(fn => fn(unmatchedDescriptions)) : undefined;
+          pushCustomerSheetNow(customer, freshProductionRows, freshDispatchRows, queued.routingOverrides, mergedOnConfirmed);
+        } else if (queued.onConfirmedFns.length) {
+          // Every queued row turned out to already be covered — nothing left to send, but whichever
+          // row-level UI was waiting on this still needs to know it's done, not left hanging forever.
+          queued.onConfirmedFns.forEach(fn => fn([]));
+        }
       }
     }
   };
@@ -6268,7 +6297,7 @@ function FIMSApp() {
                     <div><h2>Pending Production Review ({pendingProductionRows.length})</h2><p className="subtitle">New Production Register entries not yet pushed to any customer's Sheet. Check or fix the suggested customer, then push — nothing here counts toward balances or reaches the real Sheet until you do.</p></div>
                     <div style={{ display: 'flex', gap: 8 }}>
                       <button className="btn btn-danger" onClick={() => { if (window.confirm(`Discard all ${pendingProductionRows.length} pending row(s)? This deletes them from the Production Register entirely — not just from this pending list.`)) deleteRows('production')(pendingProductionRows.map(r => r.id)); }}><Trash2 size={15} /> Discard all pending</button>
-                      <button className="btn btn-primary" onClick={() => pushPendingRows('production', pendingProductionRows)}><FileSpreadsheet size={15} /> Push to Sheet</button>
+                      <button className="btn btn-primary" disabled={pendingProductionRows.some(r => pushStatus[r.confirmedCustomer || matchCustomer(r)]?.state === 'pushing')} title={pendingProductionRows.some(r => pushStatus[r.confirmedCustomer || matchCustomer(r)]?.state === 'pushing') ? 'A push is already in progress for one of these rows\' customers — wait for it to finish' : undefined} onClick={() => pushPendingRows('production', pendingProductionRows)}><FileSpreadsheet size={15} /> Push to Sheet</button>
                     </div>
                   </div>
                   {buildPendingGroups(pendingProductionRows).map(group => (
@@ -6318,7 +6347,7 @@ function FIMSApp() {
                           </>
                         )}
                         <td className="col-action">
-                          <button className="icon-btn" style={{ color: 'var(--ok)' }} title={effectiveCustomer && !reviewReady ? 'Still checking this customer\'s real Sheet — try again in a moment' : 'Confirm & push this row'} disabled={effectiveCustomer && !reviewReady} onClick={() => pushPendingRows('production', [row])}><CheckCircle2 size={16} /></button>
+                          <button className="icon-btn" style={{ color: 'var(--ok)' }} title={effectiveCustomer && !reviewReady ? 'Still checking this customer\'s real Sheet — try again in a moment' : pushStatus[effectiveCustomer]?.state === 'pushing' ? 'A push for this customer is already in progress' : 'Confirm & push this row'} disabled={(effectiveCustomer && !reviewReady) || pushStatus[effectiveCustomer]?.state === 'pushing'} onClick={() => pushPendingRows('production', [row])}><CheckCircle2 size={16} /></button>
                           <button className="icon-btn danger" title="Delete this row entirely" onClick={() => { if (window.confirm('Delete this row from the Production Register entirely?')) deleteRow('production')(row.id); }}><Trash2 size={15} /></button>
                         </td>
                       </tr>
@@ -6341,7 +6370,7 @@ function FIMSApp() {
                     <div><h2>Pending Dispatch Bill Review ({pendingDispatchRows.length})</h2><p className="subtitle">New Customer Dispatch Bill entries not yet pushed to any customer's Sheet. Check or fix the suggested customer, then push — nothing here counts toward balances or reaches the real Sheet until you do.</p></div>
                     <div style={{ display: 'flex', gap: 8 }}>
                       <button className="btn btn-danger" onClick={() => { if (window.confirm(`Discard all ${pendingDispatchRows.length} pending row(s)? This deletes them from the Customer Dispatch Bills register entirely — not just from this pending list.`)) deleteRows('customerDispatch')(pendingDispatchRows.map(r => r.id)); }}><Trash2 size={15} /> Discard all pending</button>
-                      <button className="btn btn-primary" onClick={() => pushPendingRows('customerDispatch', pendingDispatchRows)}><FileSpreadsheet size={15} /> Push to Sheet</button>
+                      <button className="btn btn-primary" disabled={pendingDispatchRows.some(r => pushStatus[r.confirmedCustomer || matchCustomer(r)]?.state === 'pushing')} title={pendingDispatchRows.some(r => pushStatus[r.confirmedCustomer || matchCustomer(r)]?.state === 'pushing') ? 'A push is already in progress for one of these rows\' customers — wait for it to finish' : undefined} onClick={() => pushPendingRows('customerDispatch', pendingDispatchRows)}><FileSpreadsheet size={15} /> Push to Sheet</button>
                     </div>
                   </div>
                   {buildPendingGroups(pendingDispatchRows).map(group => (
@@ -6392,7 +6421,7 @@ function FIMSApp() {
                           </>
                         )}
                         <td className="col-action">
-                          <button className="icon-btn" style={{ color: 'var(--ok)' }} title={effectiveCustomer && !reviewReady ? 'Still checking this customer\'s real Sheet — try again in a moment' : 'Confirm & push this row'} disabled={effectiveCustomer && !reviewReady} onClick={() => pushPendingRows('customerDispatch', [row])}><CheckCircle2 size={16} /></button>
+                          <button className="icon-btn" style={{ color: 'var(--ok)' }} title={effectiveCustomer && !reviewReady ? 'Still checking this customer\'s real Sheet — try again in a moment' : pushStatus[effectiveCustomer]?.state === 'pushing' ? 'A push for this customer is already in progress' : 'Confirm & push this row'} disabled={(effectiveCustomer && !reviewReady) || pushStatus[effectiveCustomer]?.state === 'pushing'} onClick={() => pushPendingRows('customerDispatch', [row])}><CheckCircle2 size={16} /></button>
                           <button className="icon-btn danger" title="Delete this row entirely" onClick={() => { if (window.confirm('Delete this row from the Customer Dispatch Bills register entirely?')) deleteRow('customerDispatch')(row.id); }}><Trash2 size={15} /></button>
                         </td>
                       </tr>
@@ -6806,7 +6835,7 @@ function FIMSApp() {
                             <button className="btn btn-ghost" onClick={() => setOutstandingPreviewOpen(prev => ({ ...prev, [customer]: !prev[customer] }))}>
                               {outstandingPreviewOpen[customer] ? 'Hide preview' : 'Preview outstanding'}
                             </button>
-                            <button className="btn btn-primary" onClick={() => pushOutstandingForCustomer(customer)} disabled={!sheetId.trim()} title="Push everything already confirmed for this customer that hasn't reached the Sheet yet — e.g. a row confirmed here but never actually sent">
+                            <button className="btn btn-primary" onClick={() => pushOutstandingForCustomer(customer)} disabled={!sheetId.trim() || pushStatus[customer]?.state === 'pushing'} title={pushStatus[customer]?.state === 'pushing' ? 'A push for this customer is already in progress — wait for it to finish before pushing again' : 'Push everything already confirmed for this customer that hasn\'t reached the Sheet yet — e.g. a row confirmed here but never actually sent'}>
                               <FileSpreadsheet size={15} /> Push outstanding ({outstandingRowCount})
                             </button>
                           </>

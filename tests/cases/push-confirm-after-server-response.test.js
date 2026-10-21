@@ -43,6 +43,7 @@ async function run({ fetchResponse, fetchThrows, preCheckUnmatched = [] }) {
   const getCustomerSheetId = () => 'sheet-id-123';
   const pushInFlightRef = { current: new Set() };
   const pushQueuedRef = { current: new Map() };
+  const pushedIdsRef = { current: new Set() };
   const getEditedPayloadFromRows = () => ({ itemGroups: VISHESH_ITEM_GROUPS, unmatched: preCheckUnmatched });
   const normalizeForCatalogMatch = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const verifyAgainstFreshBlocks = async (customer, itemGroups) => ({ safeItemGroups: itemGroups, newlyUnmatched: [] });
@@ -66,14 +67,14 @@ async function run({ fetchResponse, fetchThrows, preCheckUnmatched = [] }) {
   const fn = buildFromSource(
     BLOCK, 'pushCustomerSheetNow',
     [
-      'getCustomerSheetId', 'pushInFlightRef', 'pushQueuedRef', 'getEditedPayloadFromRows',
+      'getCustomerSheetId', 'pushInFlightRef', 'pushQueuedRef', 'pushedIdsRef', 'getEditedPayloadFromRows',
       'normalizeForCatalogMatch', 'verifyAgainstFreshBlocks', 'setPushStatus', 'setProduction',
       'setCustomerDispatch', 'persist', 'confirmedProductionRows', 'confirmedDispatchRows',
       'replaceCustomerMirrorRows', 'updateKnownCountsFromMirrorRows', 'refreshReview',
       'patchCustomerSheetEntry', 'setReviewEdits', 'window', 'fetch',
     ],
     [
-      getCustomerSheetId, pushInFlightRef, pushQueuedRef, getEditedPayloadFromRows,
+      getCustomerSheetId, pushInFlightRef, pushQueuedRef, pushedIdsRef, getEditedPayloadFromRows,
       normalizeForCatalogMatch, verifyAgainstFreshBlocks, setPushStatus, setProduction,
       setCustomerDispatch, persist, confirmedProductionRows, confirmedDispatchRows,
       replaceCustomerMirrorRows, updateKnownCountsFromMirrorRows, refreshReview,
