@@ -5850,6 +5850,23 @@ function FIMSApp() {
                               <span>{page.rows.filter(r => r.flagged).length} row(s) below are flagged (highlighted, with a warning icon on the first cell) — the model wasn't confident about a value, usually because a column looked cut off/missing or a crossed-out number was ambiguous. Check those against the original document and fix by hand; nothing was guessed for them.</span>
                             </div>
                           )}
+                          {/* page.docTypeKey is this page's OWN tag from when it was queued, not whatever
+                              the dropdown currently shows (see docTypeKey's own comment — switching the
+                              dropdown never retags something already queued, on purpose). If those two
+                              now disagree, this page was extracted using a DIFFERENT prompt than what's
+                              currently selected -- confirmed directly as a real, alarming-looking result:
+                              a Production Register page queued while "Mill Packing Slip" was still
+                              selected got forced through that prompt's schema and came back with
+                              hallucinated mill/reel data built out of real numbers from the actual page.
+                              This is never silently dangerous (nothing saves without a person clicking
+                              Confirm, looking straight at this warning first), but without an explicit
+                              call-out it just looks like broken/random output. */}
+                          {page.docTypeKey !== docType && (
+                            <div className="error-box" style={{ marginBottom: 10 }}>
+                              <AlertCircle size={16} />
+                              <span>This file was queued as <strong>{pageConfig.label}</strong> — different from <strong>{docTypeLabel(docType)}</strong>, which is selected now. It extracted using its own original type (switching the dropdown only affects new uploads, never something already queued), so if that's not the document type this page actually is, discard it below and re-upload it with the right type selected instead of confirming.</span>
+                            </div>
+                          )}
                           <p className="subtitle" style={{ marginBottom: 10 }}>{page.rows.length} row(s) found for <strong>{pageConfig.label}</strong>. Fix anything that looks wrong, then confirm.</p>
                           <EditableTable columns={REVIEW_COLUMNS[pageConfig.register] || COLUMNS[pageConfig.register]} rows={page.rows}
                             onUpdate={(rowId, field, value) => updateReviewCell(idx, rowId, field, value)}
