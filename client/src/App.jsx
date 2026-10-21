@@ -638,7 +638,14 @@ const REAL_DATE_RE = /^\d{1,2}\.\d{1,2}\.\d{2,4}$/;
 const DEDUP_FIELDS = {
   rawMaterialIn: ['date', 'mill', 'reel_no', 'size', 'unit', 'gsm', 'bf', 'shade', 'weight_kg'],
   consumption: ['sl_no', 'date', 'shade', 'size', 'gsm', 'weight_consumed', 'leftover_weight'],
-  production: ['date', 'party', 'description', 'customerHint', 'pieces', 'dispatch'],
+  // party and customerHint were dropped from this list on purpose, per explicit instruction: the real-
+  // world identity of a Production Register row is its date, item, and quantity — a page-header party
+  // name is noise for this purpose (it can be misread once and correctly re-read every time after,
+  // which used to mean two readings of the exact same physical row would never stop disagreeing — see
+  // "N 100 Jumbo Container"/"N 100 Jumbo Lid" 16.10.26, misread as party "रिटलाई" once, correctly
+  // "सिलाई" every time since, flagged as a mismatch on every single re-extraction forever, for a field
+  // that was never what made the row the row it is).
+  production: ['date', 'description', 'pieces'],
   customerDispatch: ['date', 'invoice_no', 'party', 'buyer_order_no', 'description', 'quantity', 'rate', 'amount'],
   daburPO: ['po_number', 'date', 'material_desc', 'hsn', 'quantity', 'rate', 'delivery_date'],
   daburDispatch: ['date', 'invoice_no', 'party', 'buyer_order_no', 'description', 'quantity', 'rate', 'amount'],
@@ -3404,19 +3411,13 @@ function FIMSApp() {
     return rowDedupKey(fields, r);
   };
   // DEDUP_FIELDS entries where neither side being blank should count as a disagreement — see
-  // rowsMatchForDedup. Scoped to Production's party/customerHint only: confirmed directly against a
-  // real re-upload of the exact same physical page, where a bracketed note next to an item read as
-  // blank the first time and "Vijyant" the second — these two specifically are NOT reliably
-  // deterministic the way every other DEDUP_FIELDS field is, so a blank reading means "the model
-  // wasn't confident it saw anything," not "there's genuinely nothing there." Treating that as a real
-  // disagreement forced an already-correct, already-confirmed row to get flagged for review on every
-  // re-upload, forever, for no reason — exactly the friction this exists to avoid. Two DIFFERENT
-  // non-blank values (e.g. "Vijyant" vs "Suresh") still count as a real disagreement and still flag;
-  // only a blank-vs-populated difference is tolerated. Not extended to any other register — a
-  // customerDispatch row's "party" is the actual Buyer name off a printed invoice, not a sometimes-
-  // caught bracketed note, and silently tolerating a blank mismatch there risks hiding a genuinely
-  // different buyer's order instead of just reducing noise.
-  const BLANK_WILDCARD_DEDUP_FIELDS = { production: new Set(['party', 'customerHint']) };
+  // rowsMatchForDedup. Empty now: this used to carry Production's party/customerHint (tolerating a
+  // blank-vs-populated reading of a sometimes-missed bracketed note), but those two fields were
+  // dropped from DEDUP_FIELDS.production entirely, per explicit instruction — party/customerHint
+  // never determine a Production row's real-world identity now, blank or not, so there's nothing left
+  // for this exemption to apply to there. Kept as a live mechanism (not deleted outright) in case a
+  // future register needs this same blank-tolerance for some other field.
+  const BLANK_WILDCARD_DEDUP_FIELDS = {};
   // Same real-world-identity check as dedupKeyForRow (same fields, same description normalization),
   // but tolerant of BLANK_WILDCARD_DEDUP_FIELDS — used everywhere "is this actually the same confirmed
   // row" needs to survive that specific kind of noise instead of either silently creating a duplicate

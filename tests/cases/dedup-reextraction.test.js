@@ -165,11 +165,13 @@ const t = makeRecorder('dedup-reextraction');
   t.assertTrue(result[0].flagged, 'REGRESSION: structured-register loose match (reel_no disagreement) still flags as before');
 }
 
-/* ===== 7. THE EXACT LIVE CASE: blank party (confirmed) vs a stray party reading (re-extraction) of an
-   otherwise-identical row must NOT be flagged, and must be silently dropped from the preview -- not a
-   new duplicate, not something needing a person's attention. Confirmed live: 2026-10-09, Production
-   Register, "Butter Bake 130g x30 Packet" 3.10.26/4000 pieces, re-upload read a bracketed note as
-   "Vijyant" that the original confirmed row never had. ===== */
+/* ===== 7. party/customerHint are no longer part of a Production row's identity at all, per explicit
+   instruction: a blank party (confirmed) vs ANY re-extraction reading of the same otherwise-identical
+   row -- stray text, a real name, anything -- must NOT be flagged, and must be silently dropped from
+   the preview. Originally added for a narrower "blank vs populated" tolerance (Production Register,
+   "Butter Bake 130g x30 Packet" 3.10.26/4000 pieces, re-upload read a bracketed note as "Vijyant" that
+   the original confirmed row never had); now covers any party reading at all, not just a blank one,
+   since party was dropped from DEDUP_FIELDS.production entirely. ===== */
 {
   const confirmed = [{
     id: 'old1', date: '3.10.26', party: '', description: 'Butter Bake 130g x30 Packet',
@@ -177,29 +179,37 @@ const t = makeRecorder('dedup-reextraction');
   }];
   const { flagLikelyReReadDuplicates, dropAlreadyConfirmedDuplicates, dedupKeyForRow } = loadDedupFunctions({ production: confirmed });
   const reExtracted = [{ id: 'new1', date: '3.10.26', party: 'Vijyant', description: 'Butter Bake 130g x30 Packet', customerHint: '', pieces: 4000, dispatch: 0 }];
-  t.assertNotEqual(
+  t.assertEqual(
     dedupKeyForRow('production', confirmed[0]), dedupKeyForRow('production', reExtracted[0]),
-    'sanity: the byte-exact key genuinely disagrees here (party blank vs "Vijyant"), so this is actually exercising the new tolerance, not accidentally matching anyway'
+    'sanity: the byte-exact key now agrees despite party blank vs "Vijyant" -- party is no longer part of the key at all'
   );
   const flagged = flagLikelyReReadDuplicates('production', reExtracted);
-  t.assertTrue(!flagged[0].flagged, 'LIVE CASE: blank-vs-populated party on an otherwise-identical row is NOT flagged');
+  t.assertTrue(!flagged[0].flagged, 'blank-vs-populated party on an otherwise-identical row is NOT flagged');
   const dropped = dropAlreadyConfirmedDuplicates('production', flagged);
-  t.assertEqual(dropped.length, 0, 'LIVE CASE: silently dropped from the preview, same as a byte-exact re-upload');
+  t.assertEqual(dropped.length, 0, 'silently dropped from the preview, same as a byte-exact re-upload');
 }
 
-/* ===== 8. SAFETY: two DIFFERENT non-blank party/customerHint values must still flag -- the tolerance
-   is for "nothing seen" vs "something seen", never for "something" vs "something else". Without this,
-   a second customer's genuinely separate same-day/same-item/same-quantity order would silently vanish
-   instead of surfacing for a person to notice. ===== */
+/* ===== 8. THE LIVE FIX, per explicit instruction, 2026-10-22: two DIFFERENT non-blank party values on
+   an otherwise-identical row must NOT flag either -- this inverts the old "SAFETY" test that used to
+   require exactly the opposite. A page-header party name can be misread once and read correctly every
+   time after (confirmed live: "N 100 Jumbo Container"/"N 100 Jumbo Lid" 16.10.26, misread as party
+   "रिटलाई" once, correctly "सिलाई" every time since), which meant two readings of the SAME physical
+   row would disagree on party forever, with no way for that disagreement to ever resolve itself. party
+   was dropped from DEDUP_FIELDS.production entirely rather than given another tolerance rule, since
+   it was never what made a Production row the row it is -- date, item, and quantity are. A genuinely
+   different second order sharing the same date/item/quantity is a real, if rare, edge case this no
+   longer catches -- an explicit, accepted trade-off, not an oversight. ===== */
 {
   const confirmed = [{
     id: 'old1', date: '3.10.26', party: 'Vijyant', description: 'Butter Bake 130g x30 Packet',
     customerHint: '', pieces: 4000, dispatch: 0, stockConfirmed: true, confirmedCustomer: 'anmol stock 01.08.26',
   }];
-  const { flagLikelyReReadDuplicates } = loadDedupFunctions({ production: confirmed });
+  const { flagLikelyReReadDuplicates, dropAlreadyConfirmedDuplicates } = loadDedupFunctions({ production: confirmed });
   const differentParty = [{ id: 'new1', date: '3.10.26', party: 'Suresh', description: 'Butter Bake 130g x30 Packet', customerHint: '', pieces: 4000, dispatch: 0 }];
-  const result = flagLikelyReReadDuplicates('production', differentParty);
-  t.assertTrue(result[0].flagged, 'SAFETY: two different non-blank party values still flag, not silently tolerated');
+  const flagged = flagLikelyReReadDuplicates('production', differentParty);
+  t.assertTrue(!flagged[0].flagged, 'LIVE FIX: two different non-blank party values no longer flag -- party is not part of a Production row\'s identity');
+  const dropped = dropAlreadyConfirmedDuplicates('production', flagged);
+  t.assertEqual(dropped.length, 0, 'LIVE FIX: silently dropped, same as any other party reading of the same date/item/quantity');
 }
 
 /* ===== 9b. THE REAL FAILURE MODE: a confirmed row loaded back from the register/Sheet has its numeric
@@ -338,24 +348,25 @@ const t = makeRecorder('dedup-reextraction');
   t.assertTrue(result[0].flagged, 'SAFETY: customerDispatch party is NOT given the blank-wildcard tolerance -- still flags');
 }
 
-/* ===== 10. THE LIVE BUG, confirmed directly against the real production register (main), 2026-10-21:
-   a page-header party name misread once ("रिटलाई") and correctly the next time ("सिलाई") -- same date,
-   same item, same pieces -- correctly gets flagged (party genuinely disagrees, no wildcard tolerance
-   for a non-blank vs non-blank mismatch), but the flagReason's own wording used to always say "the
-   numbers on this reading don't match," which is actively wrong here: the numbers agree completely: it
-   points a person checking the flag at the wrong thing. The reason must now name the field that
-   actually disagrees (party), not blindly blame "the numbers." ===== */
+/* ===== 10. THE LIVE BUG, confirmed directly against the real production register (main), 2026-10-21,
+   and ITS OWN FIX, per explicit instruction, 2026-10-22: a page-header party name misread once
+   ("रिटलाई") and correctly the next time ("सिलाई") -- same date, same item, same pieces -- used to get
+   flagged every single re-extraction forever, because that disagreement could never self-resolve (the
+   row genuinely IS the same physical row; only the party reading drifts). The fix removed party from
+   DEDUP_FIELDS.production entirely: date, item, and pieces are what make a Production row the row it
+   is, not a page-header party name. So this exact live case must now be silently matched and dropped,
+   not flagged at all. ===== */
 {
   const confirmed = [{
     id: 'old1', date: '16.10.26', party: 'रिटलाई', description: 'N 100 Jumbo Container',
     customerHint: '', pieces: 540, dispatch: 0, stockConfirmed: true, confirmedCustomer: 'BINDAL STOCK 1.08.26',
   }];
-  const { flagLikelyReReadDuplicates } = loadDedupFunctions({ production: confirmed });
+  const { flagLikelyReReadDuplicates, dropAlreadyConfirmedDuplicates } = loadDedupFunctions({ production: confirmed });
   const reExtracted = [{ id: 'new1', date: '16.10.26', party: 'सिलाई', description: 'N 100 Jumbo Container', pieces: 540, dispatch: 0 }];
-  const result = flagLikelyReReadDuplicates('production', reExtracted);
-  t.assertTrue(result[0].flagged, 'LIVE BUG: a genuine party-name disagreement (two different non-blank readings) still flags, same as before');
-  t.assertTrue(/\bparty\b/i.test(result[0].flagReason), 'LIVE BUG: the flag reason names "party" as the disagreeing field');
-  t.assertTrue(!/numbers on this reading/i.test(result[0].flagReason), 'LIVE BUG: the flag reason no longer blames "the numbers" when the numbers (date + pieces) actually agree');
+  const flagged = flagLikelyReReadDuplicates('production', reExtracted);
+  t.assertTrue(!flagged[0].flagged, 'FIXED: the रिटलाई/सिलाई party disagreement no longer flags -- party is not part of a Production row\'s identity anymore');
+  const dropped = dropAlreadyConfirmedDuplicates('production', flagged);
+  t.assertEqual(dropped.length, 0, 'FIXED: silently dropped from the preview, never surfaced for a person to re-check, since date/item/pieces all agree');
 }
 
 module.exports = t.summary();
