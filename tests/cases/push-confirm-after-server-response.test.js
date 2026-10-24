@@ -47,6 +47,10 @@ async function run({ fetchResponse, fetchThrows, preCheckUnmatched = [] }) {
   const getEditedPayloadFromRows = () => ({ itemGroups: VISHESH_ITEM_GROUPS, unmatched: preCheckUnmatched });
   const normalizeForCatalogMatch = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const verifyAgainstFreshBlocks = async (customer, itemGroups) => ({ safeItemGroups: itemGroups, newlyUnmatched: [] });
+  // Simulates the real-world case where a total network loss means the recovery re-check ALSO can't
+  // reach the server -- nothing recoverable, falls through to the original "genuine failure" behavior.
+  // See push-network-error-recovery.test.js for the cases where this recovery check DOES find something.
+  const verifyRowsActuallyWritten = async () => ({ verifiedIndexes: [], mirrorRows: null });
   const setPushStatus = (fn) => pushStatuses.push(fn({}));
   const setProduction = () => {};
   const setCustomerDispatch = () => {};
@@ -68,14 +72,14 @@ async function run({ fetchResponse, fetchThrows, preCheckUnmatched = [] }) {
     BLOCK, 'pushCustomerSheetNow',
     [
       'getCustomerSheetId', 'pushInFlightRef', 'pushQueuedRef', 'pushedIdsRef', 'getEditedPayloadFromRows',
-      'normalizeForCatalogMatch', 'verifyAgainstFreshBlocks', 'setPushStatus', 'setProduction',
+      'normalizeForCatalogMatch', 'verifyAgainstFreshBlocks', 'verifyRowsActuallyWritten', 'setPushStatus', 'setProduction',
       'setCustomerDispatch', 'persist', 'confirmedProductionRows', 'confirmedDispatchRows',
       'replaceCustomerMirrorRows', 'updateKnownCountsFromMirrorRows', 'refreshReview',
       'patchCustomerSheetEntry', 'setReviewEdits', 'window', 'fetch',
     ],
     [
       getCustomerSheetId, pushInFlightRef, pushQueuedRef, pushedIdsRef, getEditedPayloadFromRows,
-      normalizeForCatalogMatch, verifyAgainstFreshBlocks, setPushStatus, setProduction,
+      normalizeForCatalogMatch, verifyAgainstFreshBlocks, verifyRowsActuallyWritten, setPushStatus, setProduction,
       setCustomerDispatch, persist, confirmedProductionRows, confirmedDispatchRows,
       replaceCustomerMirrorRows, updateKnownCountsFromMirrorRows, refreshReview,
       patchCustomerSheetEntry, setReviewEdits, windowMock, fetchMock,

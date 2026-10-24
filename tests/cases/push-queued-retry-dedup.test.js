@@ -40,6 +40,9 @@ function makeEnv() {
   const getCustomerSheetId = () => 'sheet-id-123';
   const normalizeForCatalogMatch = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const verifyAgainstFreshBlocks = async (customer, itemGroups) => ({ safeItemGroups: itemGroups, newlyUnmatched: [] });
+  // None of this file's scenarios exercise the catch block (every fetchMock resolves, never rejects),
+  // so this is never actually called -- present only so buildFromSource has a value for the name.
+  const verifyRowsActuallyWritten = async () => ({ verifiedIndexes: [], mirrorRows: null });
   const setPushStatus = () => {};
   const setProduction = () => {};
   const setCustomerDispatch = () => {};
@@ -72,14 +75,14 @@ function makeEnv() {
     BLOCK, 'pushCustomerSheetNow',
     [
       'getCustomerSheetId', 'pushInFlightRef', 'pushQueuedRef', 'pushedIdsRef', 'getEditedPayloadFromRows',
-      'normalizeForCatalogMatch', 'verifyAgainstFreshBlocks', 'setPushStatus', 'setProduction',
+      'normalizeForCatalogMatch', 'verifyAgainstFreshBlocks', 'verifyRowsActuallyWritten', 'setPushStatus', 'setProduction',
       'setCustomerDispatch', 'persist', 'confirmedProductionRows', 'confirmedDispatchRows',
       'replaceCustomerMirrorRows', 'updateKnownCountsFromMirrorRows', 'refreshReview',
       'patchCustomerSheetEntry', 'setReviewEdits', 'window', 'fetch',
     ],
     [
       getCustomerSheetId, pushInFlightRef, pushQueuedRef, pushedIdsRef, getEditedPayloadFromRows,
-      normalizeForCatalogMatch, verifyAgainstFreshBlocks, setPushStatus, setProduction,
+      normalizeForCatalogMatch, verifyAgainstFreshBlocks, verifyRowsActuallyWritten, setPushStatus, setProduction,
       setCustomerDispatch, persist, confirmedProductionRows, confirmedDispatchRows,
       replaceCustomerMirrorRows, updateKnownCountsFromMirrorRows, refreshReview,
       patchCustomerSheetEntry, setReviewEdits, windowMock, fetchMock,

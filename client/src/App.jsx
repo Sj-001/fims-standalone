@@ -4873,6 +4873,74 @@ function FIMSApp() {
   // server hiccup), this falls back to the synchronous check's own decision rather than blocking the
   // whole push on an unrelated failure — strictly safer than before (a real extra check now runs most of
   // the time) even though it isn't a 100%-always guarantee.
+  // Pure matching logic for pushCustomerSheetNow's post-network-failure recovery check (see
+  // verifyRowsActuallyWritten below) — kept separate from the fetch so it's fully unit-testable
+  // without mocking the network. A tab (itemGroup) counts as verified only when EVERY row in EVERY
+  // variant (block) it was trying to send is found in a freshly-read mirror of the real Sheet —
+  // partial credit per block is never given, matching the same all-or-nothing-per-tab granularity the
+  // server's own push response already uses (one verdict per tab — see idsToMarkByIndex). A row
+  // counts as found when the mirror has a row for the same tab+block+date whose production (if this
+  // row claims one — not null) and dispatch (if this row claims one) both match — the same
+  // date+quantity real-world-identity test DEDUP_FIELDS already uses everywhere else in this app for
+  // exactly this question ("is this genuinely the same entry"), not a new one invented just for this.
+  const computeVerifiedIndexesFromMirror = (wireItemGroups, mirrorRows) => {
+    const norm = (s) => normalizeForCatalogMatch(String(s || ''));
+    const byTabBlockDate = new Map();
+    (mirrorRows || []).forEach(r => {
+      const key = `${norm(r.sheetTab)}||${norm(r.block)}||${String(r.date || '').trim().toLowerCase()}`;
+      if (!byTabBlockDate.has(key)) byTabBlockDate.set(key, []);
+      byTabBlockDate.get(key).push({ production: Number(r.production) || 0, dispatch: Number(r.dispatch) || 0 });
+    });
+    const verified = [];
+    (wireItemGroups || []).forEach((g, gi) => {
+      const tabOk = (g.variants || []).every(v => {
+        const block = v.blockTitleOverride || v.title || '';
+        return (v.rows || []).every(row => {
+          const [date, , production, dispatch] = row;
+          if (production === null && dispatch === null) return true; // nothing claimed here, nothing to verify
+          const key = `${norm(g.tabName)}||${norm(block)}||${String(date || '').trim().toLowerCase()}`;
+          const candidates = byTabBlockDate.get(key) || [];
+          return candidates.some(c =>
+            (production === null || c.production === Number(production)) &&
+            (dispatch === null || c.dispatch === Number(dispatch))
+          );
+        });
+      });
+      if (tabOk) verified.push(gi);
+    });
+    return verified;
+  };
+  // THE LIVE BUG, confirmed directly against the real test environment, 2026-10-24: a push's fetch()
+  // can fail on the client (a dropped connection, a cold-started free-tier Render dyno waking up mid-
+  // request, anything) AFTER the server has already finished writing to the real Sheet — Google Sheets
+  // writes take a few seconds, long enough for a lost connection to look identical, client-side, to a
+  // genuine failure. Before this fix, pushCustomerSheetNow's catch block treated every network-level
+  // failure as "nothing happened" and never called onConfirmed — a row that was actually already
+  // written to the Sheet correctly stayed stuck in Pending Review forever, with no way back in, even
+  // though the real data was fine. Confirmed directly: "M.D PLAIN" 22.10.26, 538 pieces, genuinely
+  // present in the real VISHESH STOCK Sheet, still showing as pending days later.
+  // This re-reads the Sheet fresh and checks whether the SPECIFIC rows this push was trying to send
+  // are actually there now, before accepting the network error as final. If the re-check itself fails
+  // for any reason (also offline, server still unreachable, anything) — or genuinely finds nothing —
+  // this returns no verified indexes, which is indistinguishable from this fix not existing at all:
+  // the row stays pending, visibly in error, exactly as before. This can only ever recover a row FROM
+  // wrongly-stuck-forever; it can never mark something pushed that the fresh read doesn't actually show.
+  const verifyRowsActuallyWritten = async (customer, wireItemGroups) => {
+    const sheetId = getCustomerSheetId(customer).trim();
+    if (!sheetId || !wireItemGroups.length) return { verifiedIndexes: [], mirrorRows: null };
+    try {
+      const res = await fetch('/api/customer-sheets/import', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+        body: JSON.stringify({ spreadsheetId: sheetId }),
+      });
+      if (!res.ok) return { verifiedIndexes: [], mirrorRows: null };
+      const data = await res.json().catch(() => ({}));
+      if (!data.ok || !Array.isArray(data.mirrorRows)) return { verifiedIndexes: [], mirrorRows: null };
+      return { verifiedIndexes: computeVerifiedIndexesFromMirror(wireItemGroups, data.mirrorRows), mirrorRows: data.mirrorRows };
+    } catch (e) {
+      return { verifiedIndexes: [], mirrorRows: null };
+    }
+  };
   const verifyAgainstFreshBlocks = async (customer, itemGroups, exemptBlockTitles) => {
     const sheetId = getCustomerSheetId(customer).trim();
     if (!sheetId || !itemGroups.length) return { safeItemGroups: itemGroups, newlyUnmatched: [] };
@@ -5147,6 +5215,47 @@ function FIMSApp() {
       setReviewEdits(prev => { const next = { ...prev }; delete next[customer]; return next; });
       refreshReview(customer);
     } catch (e) {
+      // See verifyRowsActuallyWritten's own comment for the full live bug this closes. A network-level
+      // failure here doesn't necessarily mean nothing was written — only that this client never heard
+      // back. Re-check against the real Sheet before accepting that as final.
+      // Defense in depth: verifyRowsActuallyWritten already fails safe internally (its own try/catch
+      // returns empty rather than throwing), but we're already inside this function's OWN catch block —
+      // nothing left to fall back to if this one additionally throws. Guarding it here directly means
+      // the original, already-safe error behavior below is truly unconditional, not merely "safe as
+      // long as a function three layers down behaves exactly as documented."
+      let verifiedIndexes = [];
+      let mirrorRows = null;
+      try {
+        ({ verifiedIndexes, mirrorRows } = await verifyRowsActuallyWritten(customer, wireItemGroups));
+      } catch (verifyErr) { /* fail safe: fall through to the original error handling below */ }
+      if (verifiedIndexes.length) {
+        const { productionIds: justPushedProductionIds, dispatchIds: justPushedDispatchIds } = idsForIndexes(verifiedIndexes);
+        markPushedForIndexes(verifiedIndexes);
+        const stillOutstanding = countStillOutstanding(justPushedProductionIds, justPushedDispatchIds);
+        const verifiedSet = new Set(verifiedIndexes);
+        const verifiedCount = verifiedIndexes.length;
+        // Same rename-proof, position-based convention as idsToMarkByIndex/failedIndexes above — a tab
+        // this re-check could NOT confirm stays exactly as unconfirmed as it already was; nothing here
+        // ever assumes success for a tab the fresh read didn't actually show.
+        const unverifiedTitles = itemGroups.flatMap((g, i) => verifiedSet.has(i) ? [] : (g.variants || []).map(v => v.title));
+        if (onConfirmed) onConfirmed(Array.from(new Set([...unmatched, ...unverifiedTitles])));
+        setPushStatus(prev => ({
+          ...prev,
+          [customer]: {
+            state: unverifiedTitles.length ? 'error' : 'done',
+            message: unverifiedTitles.length
+              ? `Lost connection to the server, but ${verifiedCount} item${verifiedCount === 1 ? '' : 's'} were confirmed already written to the Sheet on re-check and marked done. ${unverifiedTitles.length} item${unverifiedTitles.length === 1 ? '' : 's'} could not be confirmed and stay pending: ${unverifiedTitles.join(', ')}.`
+              : `Lost connection to the server, but all ${verifiedCount} item${verifiedCount === 1 ? '' : 's'} were confirmed already written to the Sheet on re-check.`,
+            unmatched, stillOutstanding,
+          },
+        }));
+        if (mirrorRows) {
+          replaceCustomerMirrorRows(customer, mirrorRows);
+          updateKnownCountsFromMirrorRows(customer, mirrorRows);
+          refreshReview(customer);
+        }
+        return;
+      }
       setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: e.message || 'Network error — could not reach the server.', unmatched, stillOutstanding: countStillOutstanding(new Set(), new Set()) } }));
     } finally {
       pushInFlightRef.current.delete(customer);
