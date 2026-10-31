@@ -843,6 +843,34 @@ function buildHighlightRequestsForPatches(sheetId, patches) {
     };
   });
 }
+// Confirmed directly against a real customer sheet (2026-10-31): a brand-new block's Opening/Closing
+// cells displayed as dates ("30-Dec", "3-Mar") instead of the plain numbers they actually hold (0,
+// 4080) — Sheets internally stores a date as a day-count from Dec 30 1899, so the DISPLAYED value was
+// just that correct number rendered through whatever number format happened to already be sitting in
+// that spot on the sheet (this app has never once set numberFormat anywhere before writing). The Date
+// column itself is immune (forceTextValue's leading apostrophe forces literal text, which no number
+// format can override), so it's safe to reset every written cell uniformly rather than singling out
+// which columns are "the numeric ones" — a title/header text cell simply ignores a number format with
+// no visible effect. Same repeatCell technique as the highlight requests above, built from the exact
+// same patches, so it can never disagree with what was actually written.
+function buildNumberFormatRequestsForPatches(sheetId, patches) {
+  if (sheetId === undefined || sheetId === null) return [];
+  return (patches || []).map(p => {
+    const height = p.values.length;
+    const width = Math.max(0, ...p.values.map(r => r.length));
+    return {
+      repeatCell: {
+        range: {
+          sheetId,
+          startRowIndex: p.startRow0, endRowIndex: p.startRow0 + height,
+          startColumnIndex: p.startCol0, endColumnIndex: p.startCol0 + width,
+        },
+        cell: { userEnteredFormat: { numberFormat: { type: 'NUMBER', pattern: '#,##0' } } },
+        fields: 'userEnteredFormat.numberFormat',
+      },
+    };
+  });
+}
 const colorsClose = (a, b) => Math.abs((a.red || 0) - b.red) < HIGHLIGHT_COLOR_TOLERANCE
   && Math.abs((a.green || 0) - b.green) < HIGHLIGHT_COLOR_TOLERANCE
   && Math.abs((a.blue || 0) - b.blue) < HIGHLIGHT_COLOR_TOLERANCE;
@@ -1263,6 +1291,7 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, exemptBlockTitles = 
   tabPlans.forEach(plan => {
     const sheetId = existingMeta[plan.tabName] && existingMeta[plan.tabName].sheetId;
     formatRequests.push(...buildUnhighlightRequests(sheetId, highlightedCellsByTab[plan.tabName]));
+    formatRequests.push(...buildNumberFormatRequestsForPatches(sheetId, patchesByTab[plan.tabName]));
     formatRequests.push(...buildHighlightRequestsForPatches(sheetId, patchesByTab[plan.tabName]));
   });
   if (formatRequests.length) {
