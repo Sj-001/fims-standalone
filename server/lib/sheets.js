@@ -592,6 +592,17 @@ const forceTextValue = (v) => `'${v === undefined || v === null ? '' : v}`;
 // structured data drives both, so there's no risk of the two ever disagreeing about what's "new".
 function computeMergePatches(existingGrid, variants) {
   const { headerRowIdx, blocks } = parseExistingBlocks(existingGrid);
+  // Temporary — see the matching comments in pushCustomerSheet/processBlockGroup. Shows every block
+  // parseExistingBlocks actually found in this grid (title/startCol/width/row count), so a block
+  // genuinely missing/misparsed is distinguishable from one that parsed fine but whose row count came
+  // back wrong for some other reason.
+  if (blocks.length) {
+    console.log(
+      `parseExistingBlocks: headerRowIdx=${headerRowIdx} blocks=${JSON.stringify(blocks.map(b => ({
+        title: b.title, startCol: b.startCol, width: b.width, nextRowIdx: b.nextRowIdx, existingRows: b.existingRowsOrdered.length,
+      })))}`
+    );
+  }
   const usedHeaderRowIdx = headerRowIdx === -1 ? 1 : headerRowIdx; // title row 0, header row 1 by default
   let rightmostCol = blocks.reduce((max, b) => Math.max(max, b.startCol + b.width), -1);
   const patches = [];
@@ -1179,6 +1190,14 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, exemptBlockTitles = 
   const formatCopyRequests = [];
   for (const plan of tabPlans) {
     const previousGrid = previousValuesByTab[plan.tabName] || [];
+    // Temporary — see the matching comment in processBlockGroup. That log proved existingRowsOrdered
+    // came back empty for a block with 20 real rows; this one shows what the server actually read
+    // for the WHOLE tab right before parseExistingBlocks ran on it, so a truncated read range (wrong
+    // columnCount/rowCount) vs. a parsing miss (right data, wrong column found) is distinguishable.
+    console.log(
+      `readPushState grid for tab [${plan.tabName}]: meta=${JSON.stringify(existingMeta[plan.tabName])} ` +
+      `gridRows=${previousGrid.length} row0=${JSON.stringify(previousGrid[0])} row1=${JSON.stringify(previousGrid[1])} row2=${JSON.stringify(previousGrid[2])}`
+    );
     const { patches, placements, insertRequests, newBlockPlacements } = computeMergePatches(previousGrid, plan.variants);
     patchesByTab[plan.tabName] = patches;
     if (newBlockPlacements.length) {
