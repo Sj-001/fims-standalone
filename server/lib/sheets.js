@@ -464,11 +464,30 @@ function parseExistingBlocks(grid) {
     // real dispatch bills routinely share a day). production/dispatch/opening/closing are carried along
     // purely for the read-only Customer Sheets Mirror (extractMirrorRowsFromGrid) to display; a
     // chronological insert only ever needs rowIdx/dateKey.
+    //
+    // Confirmed directly as the real cause of a live corruption (2026-11-03): this used to stop at the
+    // FIRST blank date cell, on the assumption that a block's blanks are always trailing padding
+    // (GENERATED_PAD_ROWS writes blank-dated filler rows specifically so this scan stops right after
+    // the real data). That assumption breaks if a row in the MIDDLE of a block's real data goes blank —
+    // e.g. a person clears a row's cells by hand instead of deleting the row structurally, which empties
+    // its content but doesn't shift anything up. The scan hit that one blank row, stopped immediately,
+    // and reported the block as having ZERO existing rows even though 20 real rows sat right below it —
+    // so the next push inserted a new row at the very top of the block, shoving every real row down by
+    // one. Tolerating a run of blank rows before giving up means a single cleared-by-hand row no longer
+    // masks everything below it; real trailing padding is still hundreds of rows long, so this never
+    // mistakes genuine padding for more data.
+    const MAX_CONSECUTIVE_BLANK_ROWS_BEFORE_BLOCK_ENDS = 5;
     const existingRowsOrdered = [];
     let nextRowIdx = headerRowIdx + 1;
+    let consecutiveBlankRows = 0;
     for (let r = headerRowIdx + 1; r < rows.length; r++) {
       const dateStr = normalizeDateCell((rows[r] || [])[startCol]);
-      if (!dateStr) break; // first blank date cell ends this block's existing data
+      if (!dateStr) {
+        consecutiveBlankRows++;
+        if (consecutiveBlankRows >= MAX_CONSECUTIVE_BLANK_ROWS_BEFORE_BLOCK_ENDS) break;
+        continue; // could still be a gap, not necessarily the real end — keep looking
+      }
+      consecutiveBlankRows = 0;
       const dateKey = canonicalDateKey((rows[r] || [])[startCol]);
       existingRowsOrdered.push({
         rowIdx: r,
@@ -478,7 +497,7 @@ function parseExistingBlocks(grid) {
         opening: width >= 4 ? (Number((rows[r] || [])[startCol + 1]) || 0) : 0,
         closing: width >= 4 ? (Number((rows[r] || [])[startCol + width - 1]) || 0) : 0,
       });
-      nextRowIdx = r + 1;
+      nextRowIdx = r + 1; // one past the last REAL row found, never a blank gap in between
     }
     return { title, startCol, width, nextRowIdx, existingRowsOrdered };
   });
