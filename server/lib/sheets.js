@@ -637,6 +637,17 @@ function computeMergePatches(existingGrid, variants) {
     const hasRealPriorRow = match.existingRowsOrdered.length > 0;
     const groups = planChronologicalInserts(match.existingRowsOrdered, allNew);
     const { totalInserted, adjustExistingRowIdx } = finalizeInsertPlacement(match.nextRowIdx, groups);
+    // Temporary — a real top-of-block insert happened on a real customer sheet (2026-11-03,
+    // "butter bake 130gm x 30") with no code-level explanation found: planChronologicalInserts,
+    // reproduced in isolation against that exact block's real existing dates plus the real new row,
+    // correctly returned beforeRowIdx=null (append at the end), yet the live push inserted at the
+    // very top. Logs the exact inputs and outputs THIS real push actually used, so the next
+    // occurrence shows what genuinely differed from the isolated repro instead of guessing again.
+    console.log(
+      `processBlockGroup [${match.title}]: existing=[${match.existingRowsOrdered.map(r => r.dateKey).join(',')}] ` +
+      `new=[${allNew.map(n => `${JSON.stringify((n.row || [])[0])}->${n.dateKey}`).join(',')}] ` +
+      `groups=${JSON.stringify(groups.map(g => ({ beforeRowIdx: g.beforeRowIdx, dateKeys: g.rows.map(r => r.dateKey) })))}`
+    );
 
     const openingCol = colLetter(match.startCol + 1);
     const prodCol = colLetter(match.startCol + 2);
@@ -1636,6 +1647,10 @@ async function pushCustomerSheetHandler(req, res) {
     if (!Array.isArray(itemGroups)) {
       return res.status(400).json({ error: 'itemGroups must be an array.' });
     }
+    // Temporary — see the matching comment in processBlockGroup. Logs exactly what the client sent,
+    // before any server-side processing, so a genuinely wrong incoming date (vs. a server-side
+    // placement bug) is distinguishable at a glance.
+    console.log(`pushCustomerSheet request: spreadsheetId=${spreadsheetId} itemGroups=${JSON.stringify(itemGroups)}`);
     const id = String(spreadsheetId).trim();
     const results = await withSpreadsheetLock(id, () => pushCustomerSheet(id, itemGroups, Array.isArray(exemptBlockTitles) ? exemptBlockTitles : []));
     const failed = results.filter(r => !r.ok);
