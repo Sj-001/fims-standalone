@@ -90,6 +90,11 @@ function rotateBase64Image(base64, degreesClockwise) {
   });
 }
 const ORIENTATION_TO_ROTATE_DEG = { rotate_cw: 90, rotate_ccw: -90, upside_down: 180 };
+// Must stay byte-identical to the fixed part of the interior-gap flag reason set inside
+// consumption_sheet's shape() — see the comment next to where that string is built. Checking the
+// reason text (rather than a separate internal field) means this never has to touch what a row
+// actually carries once it's on screen or saved; it just reads what's already there.
+const DROPPED_ROW_FLAG_MARKER = 'usually means a row was skipped during extraction';
 // Detects which printed copy a PDF page is (Original/Duplicate/Triplicate/Extra/e-Way Bill) by reading
 // the PDF's own text layer — free, instant, no API call. Only works for real digital PDFs (which is
 // exactly how dispatch bills come in); photographed JPG/PNG pages have no text layer, so this always
@@ -814,6 +819,11 @@ IMPORTANT:
           if (!missing.length) return;
           const names = missing.map(m => m === 4 ? '0 (printed in place of 4)' : String(m));
           r.flagged = true;
+          // DROPPED_ROW_FLAG_MARKER (near maybeRetryForDroppedRows) must stay inside this exact string —
+          // that's how a fresh extraction attempt gets triggered for this specific flag reason (an
+          // interior gap, a real failure mode a repeat call can self-heal) and not for any other reason
+          // a row might be flagged (a scribble, a leftover/weight mismatch — those need a person, not a
+          // retry).
           r.flagReason = `SL.NO ${names.join(', ')} ${names.length > 1 ? 'seem' : 'seems'} to be missing — this page has real data both before and after, which usually means a row was skipped during extraction. Check the original sheet and add it by hand if it has real data.`;
         });
       }
@@ -2468,6 +2478,20 @@ function FIMSApp() {
     const retried = await extractWithRateLimitBackoff(prompt, rotatedBase64, signal, onWaiting, onTick);
     return { ...retried, base64: rotatedBase64 };
   };
+  // consumption_sheet-only, and only for the specific interior-gap flag (DROPPED_ROW_FLAG_MARKER) —
+  // confirmed directly (2026-11-19): the same already-upright page, re-sent unchanged, came back with
+  // all 11 real rows the second time after silently dropping 5 of them the first time. That's genuine
+  // run-to-run non-determinism in the model, not anything about the image — so a second, fresh attempt
+  // on the exact same image is a real fix, not a guess. Never retried for any OTHER flag reason (a
+  // scribble, a leftover/weight mismatch) — those reflect something genuinely ambiguous on the page
+  // itself, which asking again won't resolve; only a person can. One retry only, same as orientation.
+  const maybeRetryForDroppedRows = async (pageConfig, result, base64, prompt, signal, onWaiting, onTick) => {
+    if (pageConfig.key !== 'consumption_sheet' || result.truncated) return result;
+    const shaped = pageConfig.shape(result.raw);
+    if (!shaped.some(r => r.flagged && r.flagReason && r.flagReason.includes(DROPPED_ROW_FLAG_MARKER))) return result;
+    const retried = await extractWithRateLimitBackoff(prompt, base64, signal, onWaiting, onTick);
+    return { raw: retried.raw, truncated: retried.truncated };
+  };
   const cancelExtraction = () => {
     setCancelRequested(true);
     if (abortControllerRef.current) abortControllerRef.current.abort();
@@ -2576,7 +2600,8 @@ function FIMSApp() {
         setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
       };
       const firstResult = await extractWithRateLimitBackoff(promptWithTraining, base64Img, abortControllerRef.current.signal, onWaitingCb, onTickCb);
-      const { raw, truncated } = await maybeCorrectOrientationAndRetry(pageConfig, firstResult, base64Img, promptWithTraining, abortControllerRef.current.signal, onWaitingCb, onTickCb);
+      const oriented = await maybeCorrectOrientationAndRetry(pageConfig, firstResult, base64Img, promptWithTraining, abortControllerRef.current.signal, onWaitingCb, onTickCb);
+      const { raw, truncated } = await maybeRetryForDroppedRows(pageConfig, oriented, oriented.base64, promptWithTraining, abortControllerRef.current.signal, onWaitingCb, onTickCb);
       if (tryMergeContinuationPage(pageConfig, current, raw, truncated)) return;
       // Rows from other pages already extracted (but not yet confirmed) for this SAME register — see
       // flagLikelyReReadDuplicates' comment. fileResults is fresh here (this function call is a fresh
@@ -2673,7 +2698,8 @@ function FIMSApp() {
           setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
         };
         const firstResult = await extractWithRateLimitBackoff(promptWithTraining, p.base64, signal, onWaitingCb, onTickCb);
-        const { raw, truncated } = await maybeCorrectOrientationAndRetry(pageConfig, firstResult, p.base64, promptWithTraining, signal, onWaitingCb, onTickCb);
+        const oriented = await maybeCorrectOrientationAndRetry(pageConfig, firstResult, p.base64, promptWithTraining, signal, onWaitingCb, onTickCb);
+        const { raw, truncated } = await maybeRetryForDroppedRows(pageConfig, oriented, oriented.base64, promptWithTraining, signal, onWaitingCb, onTickCb);
         const continuationResult = tryMergeContinuationPage(pageConfig, p, raw, truncated, continuationIndexByFileId);
         if (continuationResult) {
           anySucceeded = true;
