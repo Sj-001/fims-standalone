@@ -67,6 +67,29 @@ function canvasToScaled(canvas, maxDim, quality) {
   const dataUrl = out.toDataURL('image/jpeg', quality);
   return { dataUrl, base64: dataUrl.split(',')[1] };
 }
+// Physically rotates a base64 JPEG by a multiple of 90° (positive = clockwise, matching how
+// consumption_sheet's "orientation" field is worded) before a corrected re-extraction call — used
+// only for a page the model itself reported as sideways; every other document type never calls this.
+function rotateBase64Image(base64, degreesClockwise) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const swap = degreesClockwise === 90 || degreesClockwise === -90;
+      const canvas = document.createElement('canvas');
+      canvas.width = swap ? img.height : img.width;
+      canvas.height = swap ? img.width : img.height;
+      const ctx = canvas.getContext('2d');
+      ctx.translate(canvas.width / 2, canvas.height / 2);
+      ctx.rotate((degreesClockwise * Math.PI) / 180);
+      ctx.drawImage(img, -img.width / 2, -img.height / 2);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
+      resolve(dataUrl.split(',')[1]);
+    };
+    img.onerror = () => reject(new Error('ROTATE_IMAGE_DECODE_FAILED'));
+    img.src = `data:image/jpeg;base64,${base64}`;
+  });
+}
+const ORIENTATION_TO_ROTATE_DEG = { rotate_cw: 90, rotate_ccw: -90, upside_down: 180 };
 // Detects which printed copy a PDF page is (Original/Duplicate/Triplicate/Extra/e-Way Bill) by reading
 // the PDF's own text layer — free, instant, no API call. Only works for real digital PDFs (which is
 // exactly how dispatch bills come in); photographed JPG/PNG pages have no text layer, so this always
@@ -714,8 +737,8 @@ FINAL COUNT CHECK — MANDATORY BEFORE YOU FINALIZE: count the actual number of 
     label: 'Daily Consumption Report (raw material)',
     hint: 'The handwritten daily sheet workers use to record raw material consumed — columns are usually Shade, GSM, Size, Weight, and Balance Left.',
     register: 'consumption',
-    systemPrompt: `You read a handwritten daily raw-material consumption report from a corrugated box factory. The sheet has Hindi column headers. Most rows share one date written once at the top. Return ONLY one JSON object:
-{"date":"as written at the top, DD/MM/YYYY","items":[{"sl_no":"this row's own SL.NO./serial number exactly as printed in that column, as a string — see rules below","shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number — this is the reel's own TOTAL weight (matches what was recorded when it came in), not an amount used up — see rules below","leftover_weight":"the टुकड़ा / Tukda column value, as a number, ONLY if that row actually has one written — omit entirely if the row has nothing there, do not default it to 0","leftover_sl_no":"REQUIRED whenever leftover_weight is present, else omit entirely — see the LEFTOVER ROW CHECK rule below","date_override":"only include this if a specific row has a different date than the header, else omit","flag":"only if you couldn't reliably read this row's weight — e.g. a column looks cut off/missing, or there's a crossed-out number and you're unsure which replacement is correct — a short reason why, else omit"}]}
+    systemPrompt: `You read a handwritten daily raw-material consumption report from a corrugated box factory. The sheet has Hindi column headers. Most rows share one date written once at the top. Photos of this exact form sometimes arrive rotated 90° or 180° from upright (confirmed directly: scans from one phone scanning app come in sideways every time, while others are upright) — reading a sideways table is much more error-prone than reading an upright one, so orientation must be settled FIRST, before any row data is read. Return ONLY one JSON object:
+{"orientation":"REQUIRED, and decide this before reading anything else: find the printed header row (DATE / SL.NO. / S/K / ग्रा / साइज़ / वजन / टुकड़ा) and judge how the image itself is turned relative to upright — \\"upright\\" if those headers already read normally left-to-right along the top; \\"rotate_cw\\" if you would need to spin the IMAGE (not your head) 90° clockwise for the headers to read normally; \\"rotate_ccw\\" if spinning it 90° counter-clockwise would; \\"upside_down\\" if it's 180° off. If orientation is anything other than \\"upright\\": set \\"items\\" to an empty array and stop — do NOT attempt to read any row data from a sideways image, since that's exactly the condition that causes rows to get skipped or misread; a corrected, upright copy of this same page will be sent to you right after, and you'll read it then. Only read row data below when orientation is \\"upright\\".","date":"as written at the top, DD/MM/YYYY","items":[{"sl_no":"this row's own SL.NO./serial number exactly as printed in that column, as a string — see rules below","shade":"shade code — see rules below","gsm":"the ग्रा / GMS column value","size":"the साइज़ / Size column value","weight_consumed":"the वजन / Weight column value, as a number — this is the reel's own TOTAL weight (matches what was recorded when it came in), not an amount used up — see rules below","leftover_weight":"the टुकड़ा / Tukda column value, as a number, ONLY if that row actually has one written — omit entirely if the row has nothing there, do not default it to 0","leftover_sl_no":"REQUIRED whenever leftover_weight is present, else omit entirely — see the LEFTOVER ROW CHECK rule below","date_override":"only include this if a specific row has a different date than the header, else omit","flag":"only if you couldn't reliably read this row's weight — e.g. a column looks cut off/missing, or there's a crossed-out number and you're unsure which replacement is correct — a short reason why, else omit"}]}
 IMPORTANT:
 - SKIP TRULY BLANK LINES. This sheet is pre-ruled with a fixed number of numbered SL.NO. slots/columns, and it is completely normal for a real day's report to only fill in the first several and leave the rest of the printed grid blank. A line that has ONLY a pre-printed SL.NO. with no shade, no GSM, no size, and no weight actually written on it is not a row of data — do not output an item for it. Only extract a line that has genuine handwritten content in it.
 - SL.NO IS YOUR ROW-ALIGNMENT ANCHOR. This sheet's rows are frequently laid out as narrow vertical strips (SL.NO increasing left-to-right or in whatever direction the page actually runs, sometimes numbered right-to-left, e.g. strip "20" on the far left and strip "1" on the far right) with every strip looking nearly identical (same date, same shade, similar GSM) — the kind of layout where it's extremely easy for a value to silently slide into the wrong row, or for an entire strip to get skipped without you noticing. To prevent that: for EACH row, first locate its SL.NO in the image, then read every other field (shade, GSM, size, weight, leftover) from that exact same physical strip/line — never from a neighboring one — before moving to the next SL.NO.
@@ -2430,6 +2453,21 @@ function FIMSApp() {
       }
     }
   };
+  // consumption_sheet-only: that document type's prompt reports "orientation" before reading any row
+  // data (see its systemPrompt) because scans from one phone scanning app come in sideways every time
+  // — confirmed directly by rendering real uploaded pages, see client/src/App.jsx's rotateBase64Image.
+  // Every other document type's raw response never has an "orientation" field, so the check below is a
+  // no-op for them. One retry only, with a physically-rotated copy of the SAME image — never a second
+  // guess at the data, just a second, fairer look at it right-side up.
+  const maybeCorrectOrientationAndRetry = async (pageConfig, result, base64, prompt, signal, onWaiting, onTick) => {
+    if (pageConfig.key !== 'consumption_sheet') return { ...result, base64 };
+    const orientation = result.raw && result.raw.orientation;
+    const deg = ORIENTATION_TO_ROTATE_DEG[orientation];
+    if (!orientation || orientation === 'upright' || !deg) return { ...result, base64 };
+    const rotatedBase64 = await rotateBase64Image(base64, deg);
+    const retried = await extractWithRateLimitBackoff(prompt, rotatedBase64, signal, onWaiting, onTick);
+    return { ...retried, base64: rotatedBase64 };
+  };
   const cancelExtraction = () => {
     setCancelRequested(true);
     if (abortControllerRef.current) abortControllerRef.current.abort();
@@ -2530,12 +2568,15 @@ function FIMSApp() {
     try {
       const basePrompt = pageConfig.systemPrompt.replace('{{PRODUCT_CATALOG}}', buildCatalogText(productCatalog)).replace('{{ABBREVIATIONS}}', buildAbbreviationsText(abbreviations)).replace('{{RECENT_ENTRIES}}', pageConfig.register === 'production' ? buildRecentEntriesText(registerState.production) : '');
       const promptWithTraining = buildPromptWithTraining(basePrompt, trainingExamples[current.docTypeKey]);
-      const { raw, truncated } = await extractWithRateLimitBackoff(promptWithTraining, base64Img, abortControllerRef.current.signal, (waitMs, attempt, total, kind) => {
+      const onWaitingCb = (waitMs, attempt, total, kind) => {
         const label = kind === 'server_error' ? 'Server temporarily unreachable' : 'Rate limit hit';
         setErrorMsg(`${label} — waiting ${Math.round(waitMs / 1000)}s and retrying automatically (attempt ${attempt} of ${total})… Click Cancel below if you'd rather stop.`);
-      }, (secondsLeft) => {
+      };
+      const onTickCb = (secondsLeft) => {
         setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
-      });
+      };
+      const firstResult = await extractWithRateLimitBackoff(promptWithTraining, base64Img, abortControllerRef.current.signal, onWaitingCb, onTickCb);
+      const { raw, truncated } = await maybeCorrectOrientationAndRetry(pageConfig, firstResult, base64Img, promptWithTraining, abortControllerRef.current.signal, onWaitingCb, onTickCb);
       if (tryMergeContinuationPage(pageConfig, current, raw, truncated)) return;
       // Rows from other pages already extracted (but not yet confirmed) for this SAME register — see
       // flagLikelyReReadDuplicates' comment. fileResults is fresh here (this function call is a fresh
@@ -2624,12 +2665,15 @@ function FIMSApp() {
       } catch (e) { cancelled = true; break; }
       setFileResults(prev => prev.map(r => r.id === p.id ? { ...r, status: 'extracting' } : r));
       try {
-        const { raw, truncated } = await extractWithRateLimitBackoff(promptWithTraining, p.base64, signal, (waitMs, attempt, total, kind) => {
+        const onWaitingCb = (waitMs, attempt, total, kind) => {
           const label = kind === 'server_error' ? `Server temporarily unreachable while extracting "${p.label}"` : `Rate limit hit on "${p.label}"`;
           setErrorMsg(`${label} — waiting ${Math.round(waitMs / 1000)}s and retrying automatically (attempt ${attempt} of ${total})… Click Cancel below if you'd rather stop.`);
-        }, (secondsLeft) => {
+        };
+        const onTickCb = (secondsLeft) => {
           setErrorMsg(prevMsg => prevMsg.replace(/waiting \d+s/, `waiting ${secondsLeft}s`));
-        });
+        };
+        const firstResult = await extractWithRateLimitBackoff(promptWithTraining, p.base64, signal, onWaitingCb, onTickCb);
+        const { raw, truncated } = await maybeCorrectOrientationAndRetry(pageConfig, firstResult, p.base64, promptWithTraining, signal, onWaitingCb, onTickCb);
         const continuationResult = tryMergeContinuationPage(pageConfig, p, raw, truncated, continuationIndexByFileId);
         if (continuationResult) {
           anySucceeded = true;
