@@ -766,6 +766,34 @@ IMPORTANT:
           r.flagReason = r.flagReason || `Leftover (${r.leftover_weight}) was re-read as belonging to SL.NO ${r.leftover_sl_no}, but this row is SL.NO ${r.sl_no} — check which row it actually belongs to on the original sheet.`;
         }
       });
+      // Code-level backstop for a real, repeated failure confirmed directly (2026-11-18): the prompt's
+      // own "count every strip" self-check above is not reliable by itself — on a page where SL.NO 1
+      // through 20 ALL genuinely had handwritten data, four separate extraction runs each silently
+      // dropped several strips from the MIDDLE of that run (e.g. only 6 or 7 of the 20 real rows came
+      // back), with nothing visibly wrong about the result. A gap in the extracted SL.NO sequence is a
+      // reliable sign of exactly that: on this sheet a genuinely unused part of the pre-printed grid is
+      // always TRAILING (every sample seen has one single filled block from SL.NO 1 up to some point,
+      // then blank the rest of the way to 20) — never sandwiched between two rows that do have data. So
+      // an INTERIOR gap (missing SL.NOs with extracted rows on both sides) almost always means a row got
+      // skipped, not that it was genuinely blank. This can't recover the missing row — only a person
+      // checking the original sheet can — so it flags the row right after the gap instead of silently
+      // trusting an incomplete page. This sheet also prints "0" in place of "4" (confirmed on every
+      // sample seen), so a "0" fills that slot rather than counting as a gap on its own.
+      const slNoNum = (slNo) => { const n = parseInt(String(slNo || '').trim(), 10); return Number.isNaN(n) ? null : (n === 0 ? 4 : n); };
+      const presentNums = new Set(filled.map(r => slNoNum(r.sl_no)).filter(n => n !== null));
+      if (presentNums.size) {
+        const lo = Math.min(...presentNums);
+        filled.forEach(r => {
+          const n = slNoNum(r.sl_no);
+          if (n === null || n <= lo || r.flagged) return;
+          const missing = [];
+          for (let m = n - 1; m > lo - 1 && !presentNums.has(m); m--) missing.unshift(m);
+          if (!missing.length) return;
+          const names = missing.map(m => m === 4 ? '0 (printed in place of 4)' : String(m));
+          r.flagged = true;
+          r.flagReason = `SL.NO ${names.join(', ')} ${names.length > 1 ? 'seem' : 'seems'} to be missing — this page has real data both before and after, which usually means a row was skipped during extraction. Check the original sheet and add it by hand if it has real data.`;
+        });
+      }
       return filled.map(({ leftover_sl_no, ...row }) => row);
     },
   },
