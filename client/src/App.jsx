@@ -2499,11 +2499,20 @@ function FIMSApp() {
   // on the exact same image is a real fix, not a guess. Never retried for any OTHER flag reason (a
   // scribble, a leftover/weight mismatch) — those reflect something genuinely ambiguous on the page
   // itself, which asking again won't resolve; only a person can. One retry only, same as orientation.
+  // The retry is NOT trusted blindly: this same non-determinism means a second attempt can just as
+  // easily come back WORSE than the first (drop even more real strips) — confirmed directly as a real
+  // complaint, not a hypothetical. So the retry only replaces the original when it actually extracted
+  // at least as many rows; a retry that came back thinner is discarded and the original (with its gap
+  // flag intact, same as if no retry had run) is kept instead — a person checking by hand is strictly
+  // better than silently swapping in a worse result.
   const maybeRetryForDroppedRows = async (pageConfig, result, base64, prompt, signal, onWaiting, onTick) => {
     if (pageConfig.key !== 'consumption_sheet' || result.truncated) return result;
     const shaped = pageConfig.shape(result.raw);
     if (!shaped.some(r => r.flagged && r.flagReason && r.flagReason.includes(DROPPED_ROW_FLAG_MARKER))) return result;
     const retried = await extractWithRateLimitBackoff(prompt, base64, signal, onWaiting, onTick);
+    if (retried.truncated) return result;
+    const retriedShaped = pageConfig.shape(retried.raw);
+    if (retriedShaped.length < shaped.length) return result;
     return { raw: retried.raw, truncated: retried.truncated };
   };
   const cancelExtraction = () => {
