@@ -1470,7 +1470,7 @@ function BufferedCellInput({ value, onCommit, type = 'text', className }) {
     />
   );
 }
-function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow, sortByDate = true, showBatchFill = false }) {
+function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No entries yet.', suppressFlags = false, highlightRow, sortByDate = true, showBatchFill = false, slNoZeroMeansFour = false }) {
   // Row selection (also showBatchFill-only, see BatchFillRow's "Apply to selected"): a plain click
   // TOGGLES just that row's checkbox without touching any other row's selection — matches the literal
   // checkbox rendered in the gutter (Gmail-style: click one, click another, both end up checked),
@@ -1504,12 +1504,26 @@ function EditableTable({ columns, rows, onUpdate, onDelete, emptyLabel = 'No ent
   // by position), SL. No. is the row's own real identity, not something tied to upload/confirm order.
   // Some source sheets (e.g. Consumption) physically lay their columns out in decreasing SL. No. order
   // left-to-right, so preserving "the model's read order" there means preserving a page that's
-  // ALREADY backwards — sorting numerically fixes that instead of faithfully reproducing it.
+  // ALREADY backwards — sorting numerically fixes that instead of faithfully reproducing it. Also
+  // genuinely needed even once a page is read upright: the model's own row order isn't stable run to
+  // run (confirmed directly — the exact same page came back in reverse SL.NO order on one extraction),
+  // so cross-checking against the photo needs the TABLE to always land in a fixed, predictable order,
+  // not whatever order this particular response happened to list rows in.
   // Compares numerically when both sides parse as numbers (so "10" sorts after "2", not before).
+  // slNoZeroMeansFour (consumption_sheet only — see its "0 printed in place of 4" prompt rule and
+  // shape()'s own slNoNum helper): without this, a literal "0" sorts to the very front of the table
+  // instead of into the row's real 4th position, which is exactly the kind of mismatch against the
+  // physical page a person is trying to cross-check against. Every other register's sl_no (if it ever
+  // gets one) keeps sorting on the literal value, since this printed quirk is specific to this one form.
   const hasSlNoColumn = columns.some(c => c.key === 'sl_no');
+  const slNoSortValue = (slNo) => {
+    const n = parseFloat(slNo);
+    if (Number.isNaN(n)) return null;
+    return slNoZeroMeansFour && n === 0 ? 4 : n;
+  };
   const slNoCompare = (a, b) => {
-    const na = parseFloat(a.sl_no), nb = parseFloat(b.sl_no);
-    if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+    const na = slNoSortValue(a.sl_no), nb = slNoSortValue(b.sl_no);
+    if (na !== null && nb !== null) return na - nb;
     return String(a.sl_no ?? '').localeCompare(String(b.sl_no ?? ''), undefined, { numeric: true });
   };
   const sortedRows = hasDateColumn
@@ -3376,9 +3390,14 @@ function FIMSApp() {
     return Object.entries(groups)
       .map(([date, rows]) => ({
         date,
+        // Same "0 printed in place of 4" mapping as the pre-confirm review table (EditableTable's
+        // slNoZeroMeansFour) — without it a literal "0" sorts to the front of the group instead of
+        // into the row's real 4th position, which is exactly the mismatch against the physical page
+        // that makes cross-checking a saved entry against the original sheet harder than it should be.
         rows: [...rows].sort((a, b) => {
-          const na = parseFloat(a.sl_no), nb = parseFloat(b.sl_no);
-          if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
+          const sortVal = (slNo) => { const n = parseFloat(slNo); return Number.isNaN(n) ? null : (n === 0 ? 4 : n); };
+          const na = sortVal(a.sl_no), nb = sortVal(b.sl_no);
+          if (na !== null && nb !== null) return na - nb;
           return String(a.sl_no ?? '').localeCompare(String(b.sl_no ?? ''), undefined, { numeric: true });
         }),
         allMatched: rows.every(r => r.matchStatus === 'matched'),
@@ -6127,7 +6146,7 @@ function FIMSApp() {
                             onUpdate={(rowId, field, value) => updateReviewCell(idx, rowId, field, value)}
                             onDelete={(rowId) => deleteReviewRow(idx, rowId)}
                             emptyLabel="All rows removed — nothing to add."
-                            sortByDate={false} showBatchFill />
+                            sortByDate={false} showBatchFill slNoZeroMeansFour={pageConfig.register === 'consumption'} />
                           <div className="review-actions">
                             <button className="btn btn-primary" onClick={() => confirmPage(idx)} disabled={!page.rows.length}><CheckCircle2 size={15} /> Add {page.rows.length} row(s) to register</button>
                             {page.truncated && (
@@ -6397,7 +6416,7 @@ function FIMSApp() {
               {globalSearchResults && globalSearchResults.registerMatches.map(reg => (
                 <div className="panel" key={reg.key}>
                   <div className="section-label">{reg.label} ({reg.rows.length})</div>
-                  <EditableTable columns={reg.columns} rows={reg.rows} onUpdate={updateRow(reg.registerKey || reg.key)} onDelete={deleteRow(reg.registerKey || reg.key)} emptyLabel="No matches." />
+                  <EditableTable columns={reg.columns} rows={reg.rows} onUpdate={updateRow(reg.registerKey || reg.key)} onDelete={deleteRow(reg.registerKey || reg.key)} emptyLabel="No matches." slNoZeroMeansFour={(reg.registerKey || reg.key) === 'consumption'} />
                 </div>
               ))}
             </div>
