@@ -18,6 +18,7 @@ const APP_JSX = path.join(__dirname, '..', '..', 'client', 'src', 'App.jsx');
 function loadMaybeCorrectOrientationAndRetry(rotateBase64Image, extractWithRateLimitBackoff) {
   const blocks = [
     extractLine(APP_JSX, 'const ORIENTATION_TO_ROTATE_DEG = {'),
+    extractLine(APP_JSX, 'const MAX_ORIENTATION_ATTEMPTS = 3;'),
     extractBlock(APP_JSX, 'const maybeCorrectOrientationAndRetry = async (', (l) => l.trim() === '};'),
   ];
   return buildFromSource(blocks, 'maybeCorrectOrientationAndRetry', ['rotateBase64Image', 'extractWithRateLimitBackoff'], [rotateBase64Image, extractWithRateLimitBackoff]);
@@ -123,17 +124,41 @@ module.exports = (async () => {
     t.assertEqual(retryCalls.length, 0, 'UNRECOGNIZED: never retries');
   }
 
-  /* ===== 8. The retried call ITSELF reports a non-upright orientation again (e.g. still disagreeing
-     with the model) — capped at exactly one retry, never loops, whatever the second call returned is
-     used as-is. ===== */
+  /* ===== 8. The retried call keeps reporting non-upright, call after call (e.g. a genuinely
+     unreadable/skewed page) — bounded at MAX_ORIENTATION_ATTEMPTS (3) corrections so this can't loop
+     forever, and whatever the LAST attempt returned is used as final. ===== */
   {
-    const retriedAgainWrong = { raw: { orientation: 'rotate_cw', items: [] }, truncated: false };
-    const { rotateBase64Image, extractWithRateLimitBackoff, rotateCalls, retryCalls } = makeMocks(retriedAgainWrong);
+    const neverUpright = { raw: { orientation: 'rotate_cw', items: [] }, truncated: false };
+    const { rotateBase64Image, extractWithRateLimitBackoff, rotateCalls, retryCalls } = makeMocks(neverUpright);
     const fn = loadMaybeCorrectOrientationAndRetry(rotateBase64Image, extractWithRateLimitBackoff);
     const out = await fn({ key: 'consumption_sheet' }, { raw: { orientation: 'rotate_ccw' }, truncated: false }, 'B64', 'PROMPT', 'SIG');
-    t.assertEqual(rotateCalls.length, 1, 'CAPPED: rotates only once even though the retry also came back non-upright');
-    t.assertEqual(retryCalls.length, 1, 'CAPPED: retries only once, no second round-trip');
-    t.assertEqual(out.raw, retriedAgainWrong.raw, 'CAPPED: the (still-imperfect) retried result is used as-is, not discarded');
+    t.assertEqual(rotateCalls.length, 3, 'CAPPED: stops after MAX_ORIENTATION_ATTEMPTS (3) corrections, not an infinite loop');
+    t.assertEqual(retryCalls.length, 3, 'CAPPED: re-extracts 3 times, no more');
+    t.assertEqual(out.raw, neverUpright.raw, 'CAPPED: the last (still-imperfect) attempt is used as final, not discarded');
+  }
+
+  /* ===== 9. REAL CASE CAPTURED LIVE (2026-11-20, raw API traffic from an actual upload): the model
+     reported "rotate_cw" on the original, then — on that corrected copy — reported "upside_down"
+     instead of "upright" (a wrong first guess, or a page whose true skew wasn't a clean 90°). The OLD
+     single-retry code would have stopped right there and handed back that still-sideways, zero-row
+     result as final. The loop must instead rotate AGAIN off the new report and keep going until it
+     actually reaches upright. ===== */
+  {
+    const results = [
+      { raw: { orientation: 'upside_down', items: [] }, truncated: false },   // after 1st correction: still wrong
+      { raw: { orientation: 'upright', items: [{ sl_no: '1' }] }, truncated: false }, // after 2nd correction: fixed
+    ];
+    let callIdx = 0;
+    const rotateCalls = [];
+    const retryCalls = [];
+    const rotateBase64Image = async (base64, deg) => { rotateCalls.push({ base64, deg }); return `ROTATED(${base64},${deg})`; };
+    const extractWithRateLimitBackoff = async (prompt, base64) => { retryCalls.push({ base64 }); return results[callIdx++]; };
+    const fn = loadMaybeCorrectOrientationAndRetry(rotateBase64Image, extractWithRateLimitBackoff);
+    const out = await fn({ key: 'consumption_sheet' }, { raw: { orientation: 'rotate_cw', items: [] }, truncated: false }, 'B64', 'PROMPT', 'SIG');
+    t.assertEqual(rotateCalls, [{ base64: 'B64', deg: 90 }, { base64: 'ROTATED(B64,90)', deg: 180 }], 'CONVERGES: 2nd rotation is applied to the already-rotated image, by the newly reported delta — not re-rotating the original from scratch');
+    t.assertEqual(retryCalls.length, 2, 'CONVERGES: took 2 corrections to reach upright, both actually used');
+    t.assertEqual(out.raw.items, [{ sl_no: '1' }], 'CONVERGES: the final (now-upright, real) extraction is returned, not the still-sideways first retry');
+    t.assertEqual(out.base64, 'ROTATED(ROTATED(B64,90),180)', 'CONVERGES: returns the final, fully-corrected image');
   }
 
   return t.summary();

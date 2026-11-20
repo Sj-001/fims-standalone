@@ -2481,16 +2481,28 @@ function FIMSApp() {
   // data (see its systemPrompt) because scans from one phone scanning app come in sideways every time
   // — confirmed directly by rendering real uploaded pages, see client/src/App.jsx's rotateBase64Image.
   // Every other document type's raw response never has an "orientation" field, so the check below is a
-  // no-op for them. One retry only, with a physically-rotated copy of the SAME image — never a second
-  // guess at the data, just a second, fairer look at it right-side up.
+  // no-op for them. Loops instead of correcting just once (real, directly-captured evidence, 2026-11-20:
+  // on one actual upload, the model reported "rotate_cw", got rotated by +90 and re-sent, and STILL came
+  // back "upside_down" on that corrected copy — one fixed correction isn't always enough, and the old
+  // code gave up right there and used that still-sideways, zero-row result as final). Each pass rotates
+  // whatever image was just judged non-upright by the exact delta reported FOR that image — never
+  // re-rotates from the original — so a wrong first guess still converges. Capped at
+  // MAX_ORIENTATION_ATTEMPTS corrections (3: enough to reach upright from any of the other 3 possible
+  // states one 90° turn at a time) so a page the model simply can't judge can't loop forever; whatever
+  // the last attempt returned is used as final, same as the old single-retry behavior.
+  const MAX_ORIENTATION_ATTEMPTS = 3;
   const maybeCorrectOrientationAndRetry = async (pageConfig, result, base64, prompt, signal, onWaiting, onTick) => {
     if (pageConfig.key !== 'consumption_sheet') return { ...result, base64 };
-    const orientation = result.raw && result.raw.orientation;
-    const deg = ORIENTATION_TO_ROTATE_DEG[orientation];
-    if (!orientation || orientation === 'upright' || !deg) return { ...result, base64 };
-    const rotatedBase64 = await rotateBase64Image(base64, deg);
-    const retried = await extractWithRateLimitBackoff(prompt, rotatedBase64, signal, onWaiting, onTick);
-    return { ...retried, base64: rotatedBase64 };
+    let current = result;
+    let currentBase64 = base64;
+    for (let attempt = 0; attempt < MAX_ORIENTATION_ATTEMPTS; attempt++) {
+      const orientation = current.raw && current.raw.orientation;
+      const deg = ORIENTATION_TO_ROTATE_DEG[orientation];
+      if (!orientation || orientation === 'upright' || !deg) break;
+      currentBase64 = await rotateBase64Image(currentBase64, deg);
+      current = await extractWithRateLimitBackoff(prompt, currentBase64, signal, onWaiting, onTick);
+    }
+    return { ...current, base64: currentBase64 };
   };
   // consumption_sheet-only, and only for the specific interior-gap flag (DROPPED_ROW_FLAG_MARKER) —
   // confirmed directly (2026-11-19): the same already-upright page, re-sent unchanged, came back with
