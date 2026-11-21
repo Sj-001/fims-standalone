@@ -99,4 +99,50 @@ function gridFor(title, dataRows) {
   t.assertEqual(blocks[0].nextRowIdx, 2, 'SAFETY: nextRowIdx for a genuinely empty block stays right after the header');
 }
 
+/* ===== THE LIVE CASE (2026-11-21): a real customer's "VAAYU 250 ML" block had its title merged P1:S1
+   instead of O1:S1 -- one column short of the block's own Date column (O, confirmed via the header row)
+   -- a one-off manual formatting slip, not anything this app wrote. Checking only startCol (O) found
+   nothing there and reported an EMPTY title, making the block invisible to every title-matching check in
+   this file; a push for that exact item couldn't find it, fell through to "create a new block", and (the
+   person having explicitly picked that title, satisfying the exemption check) was authorized to create a
+   genuine duplicate right alongside the real one. Scanning the whole block width for the title fixes
+   this: a title merged starting ANYWHERE inside the block's own columns is still found. ===== */
+{
+  const grid = [
+    [null, 'VAAYU 250 ML', null, null, null], // title merged starting ONE COLUMN PAST startCol (0)
+    ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
+    ['21.09.26', 0, 0, 0, 0],
+  ];
+  const { blocks } = parseExistingBlocks(grid);
+  t.assertEqual(blocks.length, 1, 'LIVE CASE: the block is still found even with its title offset');
+  t.assertEqual(blocks[0].title, 'VAAYU 250 ML', 'LIVE CASE: the title merged one column past startCol is still read, not reported blank');
+  t.assertEqual(blocks[0].startCol, 0, 'LIVE CASE: startCol itself is still correctly the Date column, unaffected by where the title happened to land');
+}
+
+/* ===== SAFETY: a title offset into a SECOND block's columns must never be picked up as the FIRST
+   block's title -- the scan stays strictly within this block's own [startCol, startCol+width) range,
+   never reaching into a neighboring block. ===== */
+{
+  const grid = [
+    ['Block One', null, null, null, null, null, 'Block Two', null, null, null, null],
+    ['Date', 'Opening', 'Production', 'Dispatch', 'Closing', null, 'Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
+  ];
+  const { blocks } = parseExistingBlocks(grid);
+  t.assertEqual(blocks.length, 2, 'SAFETY: both blocks are found');
+  t.assertEqual(blocks[0].title, 'Block One', 'SAFETY: the first block keeps its own correct title');
+  t.assertEqual(blocks[1].title, 'Block Two', 'SAFETY: the second block\'s title is never mistaken for the first\'s, and vice versa');
+}
+
+/* ===== SAFETY: a block that is GENUINELY untitled (blank across its entire width, not just startCol)
+   still correctly reports an empty title -- this fix changes WHERE it looks, not whether a truly
+   titleless block is still recognized as titleless. ===== */
+{
+  const grid = [
+    [null, null, null, null, null],
+    ['Date', 'Opening', 'Production', 'Dispatch', 'Closing'],
+  ];
+  const { blocks } = parseExistingBlocks(grid);
+  t.assertEqual(blocks[0].title, '', 'SAFETY: a block genuinely blank across its whole width still reports an empty title, not something borrowed from elsewhere');
+}
+
 module.exports = t.summary();

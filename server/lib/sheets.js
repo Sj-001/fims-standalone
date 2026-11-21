@@ -454,10 +454,25 @@ function parseExistingBlocks(grid) {
     for (let c = startCol + 1; c < nextStart; c++) {
       if (normalizeCellStr(headerRow[c])) width = c - startCol + 1; else break;
     }
+    // Scans the block's FULL column width for the title, not just startCol — confirmed directly as the
+    // real cause of a live duplicate block (2026-11-21): a customer's real "VAAYU 250 ML" title was
+    // merged P1:S1 instead of O1:S1 (one column short of the block's own Date column, O) — a one-off
+    // manual formatting slip, not anything this app wrote. Google Sheets stores a merged range's value
+    // only in its top-left cell, so checking startCol alone (O) found nothing and this block parsed with
+    // an EMPTY title — invisible to every title-matching check in this file, so a push for that exact
+    // item couldn't find it, fell through to "create a new block", and (since the person had explicitly
+    // picked that title, satisfying the exemption check) was authorized to create a genuine duplicate
+    // right alongside the real one. Scanning the whole block width finds a title merged starting
+    // anywhere within the block's own columns, while still never reaching into a NEIGHBORING block's
+    // columns (nextStart already bounds `width` above).
     let title = '';
     for (let back = 1; back <= 3 && headerRowIdx - back >= 0; back++) {
-      const v = (rows[headerRowIdx - back] || [])[startCol];
-      if (normalizeCellStr(v)) { title = normalizeCellStr(v); break; }
+      const titleRow = rows[headerRowIdx - back] || [];
+      for (let c = startCol; c < startCol + width; c++) {
+        const v = normalizeCellStr(titleRow[c]);
+        if (v) { title = v; break; }
+      }
+      if (title) break;
     }
     // Every real physical row this block already has, in top-to-bottom order, one entry per row (never
     // merged across rows that share a date — dates are explicitly not unique in this ledger, multiple
@@ -1054,7 +1069,16 @@ const normalizeTabKey = (name) => {
   // noise: "Blacko 32g x120 new" collapsed to "blacko32g", the exact same key as the totally different,
   // unrelated item "Blacko 32g" — confirmed directly as a real misroute (the wrong item's tab absorbed
   // a real production entry meant for the "x120 new" variant's own tab).
-  s = s.replace(/[x×*]\s*\d+\s*(pkt|pkts|ppkt|ppkts|pcs|nos|ctn|ctns|box|boxes|bag|bags|unit|units)\.?\s*$/i, '').trim();
+  // Lookahead instead of a hard `$` anchor — confirmed directly as a real, live push refusal
+  // (2026-11-21): the register read "T 50 32g x120PKT (NEW)" while the real existing block was titled
+  // "T 50 32G * 120 PKT (new)" — same item, same pack count, just "x" vs "*" as the multiplier and a
+  // trailing "(new)" qualifier on both. The old `$`-anchored version only fired when the pack count was
+  // the literal last thing in the string, so neither survived to strip here; the stray "x" (a letter,
+  // never touched by the later punctuation-only strip, unlike "*") was left behind in one key but not
+  // the other, so the two never converged and a real, already-existing block was refused as if it were
+  // an unauthorized new one. Matches the client's own normalizeForCatalogMatch, which already uses this
+  // same lookahead for exactly this reason.
+  s = s.replace(/[x×*]\s*\d+\s*(pkt|pkts|ppkt|ppkts|pcs|nos|ctn|ctns|box|boxes|bag|bags|unit|units)\.?(?=[^\d]*$)/i, '').trim();
   // Trailing "60 PKT" / "60pkt" style pack-count with NO multiplier symbol — ambiguous in general (a
   // bare number+word could be a real product code, e.g. "N200 Jumbo"), so only strip a known list of
   // packaging-unit words here rather than any word.
@@ -1188,7 +1212,28 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, exemptBlockTitles = 
       }
     });
   }
-  const results = [...blockedResults];
+  // Reassembles a results array in allTabPlans' own ORIGINAL order — the order the client's itemGroups
+  // arrived in — no matter which tabs ended up blocked vs. authorized-and-written. Confirmed directly as
+  // the real cause of a live incident (2026-11-21): a push with one blocked tab (T 50) and one
+  // genuinely-written tab (CREAM) used to come back as `[...blockedResults, ...written-tab results]`,
+  // i.e. every blocked tab FIRST regardless of which position it was actually sent in, then every
+  // authorized tab after. The client matches a response entry back to its own rows purely by POSITION
+  // (see its own comment near idsToMarkByIndex: "results[] is built in the exact same order tabPlans...
+  // at every step of the server pipeline"), so this silently attributed one tab's real outcome to a
+  // completely different tab: the written tab's rows looked "refused" (left stuck pending despite
+  // already being on the Sheet) while the refused tab's rows looked "ok" and got silently marked
+  // confirmed — a real, silent data-loss risk, not just a cosmetic mislabel. itemGroups is already
+  // grouped one entry per tab name on the client (see buildCustomerSheetPayloadFromRows), so tab name is
+  // a safe, unique join key within a single push. Used by every return path below, including the
+  // early-return error paths, which used to drop already-blocked tabs' results from the response
+  // entirely rather than just misordering them.
+  const buildOrderedResults = (moreResults) => {
+    const byTab = {};
+    blockedResults.forEach(r => { byTab[r.tab] = r; });
+    (moreResults || []).forEach(r => { byTab[r.tab] = r; });
+    return allTabPlans.map(p => byTab[p.tabName]).filter(Boolean);
+  };
+  const writeResults = [];
   const formatRequests = [];
   const dataUpdates = [];
   const patchesByTab = {};
@@ -1294,14 +1339,14 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, exemptBlockTitles = 
     // pre-existing row gets when a new row lands directly above it (see computeMergePatches). Those are
     // real writes but not new rows, and conflating them is exactly what made this number confusing before.
     const newRows = patches.filter(p => p.isNewRow).reduce((s, p) => s + p.values.length, 0);
-    results.push({ tab: plan.tabName, ok: true, newRows, placements });
+    writeResults.push({ tab: plan.tabName, ok: true, newRows, placements });
   }
   if (gridExpansionRequests.length) {
     try {
       await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: gridExpansionRequests } });
     } catch (e) {
       const msg = friendlyGoogleError(e);
-      return tabPlans.map(plan => ({ tab: plan.tabName, ok: false, error: msg }));
+      return buildOrderedResults(tabPlans.map(plan => ({ tab: plan.tabName, ok: false, error: msg })));
     }
   }
   if (structuralInsertRequests.length) {
@@ -1309,7 +1354,7 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, exemptBlockTitles = 
       await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: structuralInsertRequests } });
     } catch (e) {
       const msg = friendlyGoogleError(e);
-      return tabPlans.map(plan => ({ tab: plan.tabName, ok: false, error: msg }));
+      return buildOrderedResults(tabPlans.map(plan => ({ tab: plan.tabName, ok: false, error: msg })));
     }
   }
   if (dataUpdates.length) {
@@ -1320,7 +1365,7 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, exemptBlockTitles = 
       });
     } catch (e) {
       const msg = friendlyGoogleError(e);
-      return tabPlans.map(plan => ({ tab: plan.tabName, ok: false, error: msg }));
+      return buildOrderedResults(tabPlans.map(plan => ({ tab: plan.tabName, ok: false, error: msg })));
     }
   }
   // Clear whatever's left highlighted from an EARLIER push before applying this one's — otherwise
@@ -1343,6 +1388,11 @@ async function pushCustomerSheet(spreadsheetId, itemGroups, exemptBlockTitles = 
     formatRequests.push(...buildNumberFormatRequestsForPatches(sheetId, patchesByTab[plan.tabName]));
     formatRequests.push(...buildHighlightRequestsForPatches(sheetId, patchesByTab[plan.tabName]));
   });
+  // Reassembled into original tab order now that every tab's real outcome (blocked or written) is known
+  // — see buildOrderedResults' own comment. The synthetic "(highlighting)" entry below is deliberately
+  // appended AFTER this reordering, at the very end: it was never one of itemGroups' own tabs, and the
+  // client already knows to never look it up by position (see its own "i < wireItemGroups.length" guard).
+  const results = buildOrderedResults(writeResults);
   if (formatRequests.length) {
     try {
       await sheets.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: formatRequests } });

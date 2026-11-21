@@ -32,6 +32,15 @@ t.assertNotEqual(normalizeTabKey('T 50 32G * 120 PKT'), normalizeTabKey('T 50 32
 
 t.assertEqual(normalizeTabKey('CREAM 30G*144PKT (new)'), normalizeTabKey('CREAM 30G*144PKT new'), 'PARENS: CREAM (new) variant also matches');
 
+// *** THE EXACT REPORTED CASE (2026-11-21): a real push was refused as "creating an unauthorized new
+// block" even though the person had explicitly picked the real, already-existing block — because the
+// register's own text used "x" as the multiplier while the real block's title used "*", AND both had a
+// trailing "(new)"/"(NEW)" qualifier after the pack count. The old `$`-anchored rule only stripped
+// "x120pkt"/"*120 pkt" when that was the literal end of the string, so with "(new)" trailing after it,
+// neither side got stripped — leaving the bare letter "x" behind in one key (never touched by the later
+// punctuation-only strip, unlike "*"), so the two never converged. ***
+t.assertEqual(normalizeTabKey('T 50 32g x120PKT (NEW)'), normalizeTabKey('T 50 32G * 120 PKT (new)'), 'X-VS-STAR: multiplier symbol + trailing "(new)" no longer keeps two spellings of the same real block apart');
+
 // --- Regression: every previously-confirmed alias/pattern still works exactly as before ---
 t.assertEqual(normalizeTabKey('Jeera Dhamal 70g'), normalizeTabKey('jeera 70g'), 'REGR: dhamal stripped, still matches');
 t.assertEqual(normalizeTabKey('N200 Jumbo Container'), normalizeTabKey('N200 J CONTAINER'), 'REGR: J -> Jumbo alias still works');
