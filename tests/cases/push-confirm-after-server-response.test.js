@@ -130,5 +130,21 @@ module.exports = (async () => {
     t.assertEqual(onConfirmedCalls.length, 0, 'NETWORK ERROR: onConfirmed is never called -- nothing is confirmed when the push outcome is unknown');
   }
 
+  // ===== THE EXACT LIVE INCIDENT (2026-11-21): a Google Sheets API quota error thrown inside
+  // readPushState, on the SERVER, before it ever reaches its per-tab processing loop -- the response
+  // the client actually receives is a plain `{ error: "Quota exceeded..." }`, with NO `results` array at
+  // all, not even one marked ok:false. The old code computed "failed" as "data.results[i].ok === false",
+  // which requires data.results to have an entry at that position in the first place -- with no results
+  // array whatsoever, that search found nothing "explicitly failed" and treated a TOTAL request failure
+  // as if nothing had failed, confirming the row anyway with no real Sheet write behind it. onConfirmed
+  // must still receive this row in its withheld list, exactly like the explicit-refusal case above. =====
+  {
+    const { onConfirmedCalls } = await run({
+      fetchResponse: { ok: false, status: 502, body: { error: 'Quota exceeded for quota metric \'Read requests\'...' } },
+    });
+    t.assertEqual(onConfirmedCalls.length, 1, 'TOTAL FAILURE: onConfirmed is still called exactly once');
+    t.assertEqual(onConfirmedCalls[0], ['Vishesh 100 ML'], 'TOTAL FAILURE: with no results array at all, the row is still withheld -- a missing results array is never silently read as success');
+  }
+
   return t.summary();
 })();

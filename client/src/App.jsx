@@ -4073,27 +4073,41 @@ function FIMSApp() {
     });
     if (skipped > 0) window.alert(`Skipped ${skipped} row${skipped === 1 ? '' : 's'} whose customer couldn't be matched automatically — pick a customer in the dropdown for ${skipped === 1 ? 'it' : 'them'}, then push again.`);
     if (notYetReady.length > 0) window.alert(`Skipped ${notYetReady.length} row${notYetReady.length === 1 ? '' : 's'} still checking the real Sheet for ${notYetReady.length === 1 ? 'its' : 'their'} customer — wait a moment for "(checking…)" to resolve, then push again.`);
-    byCustomer.forEach(({ rows: confirmedRows, routingOverrides, commits }, customer) => {
-      // Called with pushCustomerSheetNow's own `unmatched` list (description strings) once the user has
-      // accepted the confirm() dialog — any row whose description is in that list did NOT actually get
-      // sent (its block didn't check out against the real Sheet, fresh), so it must stay exactly as it
-      // was: still pending, still visible, still showing the Tab/Block picker, never silently confirmed.
-      const commitAll = (unmatchedDescriptions = []) => {
-        const skip = new Set((unmatchedDescriptions || []).map(d => normalizeForCatalogMatch(d)));
-        commits.forEach(({ description, run }) => { if (!skip.has(normalizeForCatalogMatch(description))) run(); });
-      };
-      // No Sheet linked yet — nothing to push to, so there's no confirm() dialog to gate on; commit
-      // straight away, exactly like before. Only the "there IS a Sheet, and a push dialog is about to
-      // ask" path needs the defer-until-accepted treatment.
-      if (!getCustomerSheetId(customer).trim()) { commitAll(); return; }
-      pushCustomerSheetNow(
-        customer,
-        registerKey === 'production' ? confirmedRows : [],
-        registerKey === 'customerDispatch' ? confirmedRows : [],
-        routingOverrides,
-        commitAll,
-      );
-    });
+    // Sequential, one customer fully before the next starts — not Promise.all/forEach-fire-all.
+    // Confirmed directly as a real, live failure (2026-11-21): a single bulk push spanning several
+    // customers (each with its own preview/verify read, its own push read, its own post-push mirror
+    // read) fired all of them concurrently, comfortably enough reads in one tight window to trip
+    // Google's per-user read quota partway through — on a push covering nothing unusual in size (a
+    // few dozen rows). withGoogleApiRetry (server/lib/sheets.js) now retries a single momentarily-
+    // rate-limited call on its own, but spreading N customers' read bursts out across time, instead of
+    // firing them all at once, is what keeps the burst from needing that retry margin in the first
+    // place. A customer whose push is slow (or itself queued/retrying) no longer makes every other
+    // customer's push wait behind IT — this only serializes the START of each customer's own push;
+    // pushCustomerSheetNow's own in-flight/queueing logic still applies per customer exactly as before.
+    (async () => {
+      for (const [customer, { rows: confirmedRows, routingOverrides, commits }] of byCustomer) {
+        // Called with pushCustomerSheetNow's own `unmatched` list (description strings) once the user
+        // has accepted the confirm() dialog — any row whose description is in that list did NOT
+        // actually get sent (its block didn't check out against the real Sheet, fresh), so it must stay
+        // exactly as it was: still pending, still visible, still showing the Tab/Block picker, never
+        // silently confirmed.
+        const commitAll = (unmatchedDescriptions = []) => {
+          const skip = new Set((unmatchedDescriptions || []).map(d => normalizeForCatalogMatch(d)));
+          commits.forEach(({ description, run }) => { if (!skip.has(normalizeForCatalogMatch(description))) run(); });
+        };
+        // No Sheet linked yet — nothing to push to, so there's no confirm() dialog to gate on; commit
+        // straight away, exactly like before. Only the "there IS a Sheet, and a push dialog is about to
+        // ask" path needs the defer-until-accepted treatment.
+        if (!getCustomerSheetId(customer).trim()) { commitAll(); continue; }
+        await pushCustomerSheetNow(
+          customer,
+          registerKey === 'production' ? confirmedRows : [],
+          registerKey === 'customerDispatch' ? confirmedRows : [],
+          routingOverrides,
+          commitAll,
+        );
+      }
+    })();
   };
   const updatePendingCustomer = (registerKey) => (id, value) => {
     registerSetters[registerKey](prev => {
@@ -5079,17 +5093,42 @@ function FIMSApp() {
       return { verifiedIndexes: [], mirrorRows: null };
     }
   };
+  // FAILS CLOSED, never open — confirmed directly as a real, live gap (2026-11-21): this used to return
+  // `{ safeItemGroups: itemGroups, newlyUnmatched: [] }` (the UNVERIFIED original list, completely
+  // untouched) whenever the fresh check itself couldn't complete — a non-ok HTTP response, a malformed
+  // body, or a thrown exception, exactly what a Google Sheets API quota error produces. The one function
+  // whose entire job is "double-check nothing unsafe slips through, using data fetched right now"
+  // responded to its own inability to fetch that data by skipping the check ENTIRELY rather than
+  // refusing to proceed — a direct violation of "a new block is never created automatically, no matter
+  // what, no matter at what stage." A transient failure here must never be silently equivalent to "looks
+  // safe": every non-exempt variant is now treated as unverified and excluded (stays pending, surfaced
+  // to the person to retry once the real Sheet can actually be checked) — only variants the person
+  // JUST explicitly picked in this exact action (exemptBlockTitles) are still let through, since those
+  // never depended on this fetch succeeding in the first place.
   const verifyAgainstFreshBlocks = async (customer, itemGroups, exemptBlockTitles) => {
     const sheetId = getCustomerSheetId(customer).trim();
     if (!sheetId || !itemGroups.length) return { safeItemGroups: itemGroups, newlyUnmatched: [] };
+    const failClosed = () => {
+      const newlyUnmatched = [];
+      const safeItemGroups = itemGroups.map(g => {
+        const safeVariants = (g.variants || []).filter(v => {
+          const effectiveTitle = v.blockTitleOverride || v.title || '';
+          const isExempt = exemptBlockTitles.has(normalizeForCatalogMatch(effectiveTitle));
+          if (!isExempt) newlyUnmatched.push(v.title || '(blank description)');
+          return isExempt;
+        });
+        return { ...g, variants: safeVariants };
+      }).filter(g => (g.variants || []).length > 0);
+      return { safeItemGroups, newlyUnmatched };
+    };
     try {
       const res = await fetch('/api/customer-sheets/preview', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
         body: JSON.stringify({ spreadsheetId: sheetId, itemGroups }),
       });
-      if (!res.ok) return { safeItemGroups: itemGroups, newlyUnmatched: [] };
+      if (!res.ok) return failClosed();
       const data = await res.json().catch(() => ({}));
-      if (!data.ok || !Array.isArray(data.tabs)) return { safeItemGroups: itemGroups, newlyUnmatched: [] };
+      if (!data.ok || !Array.isArray(data.tabs)) return failClosed();
       const newlyUnmatched = [];
       // No "tab has zero real blocks yet, so a first block is fine" exception here either — per
       // explicit instruction, a new block is only ever created when a person deliberately assigned it
@@ -5108,7 +5147,7 @@ function FIMSApp() {
       }).filter(g => (g.variants || []).length > 0);
       return { safeItemGroups, newlyUnmatched };
     } catch (e) {
-      return { safeItemGroups: itemGroups, newlyUnmatched: [] };
+      return failClosed();
     }
   };
   const pushInFlightRef = useRef(new Set());
@@ -5315,12 +5354,17 @@ function FIMSApp() {
         const partialRows = (data.results || []).filter(r => r.ok).reduce((s, r) => s + (r.newRows || 0), 0);
         const partialNote = partialRows ? ` ${partialRows} item${partialRows === 1 ? '' : 's'} still sent.` : '';
         setPushStatus(prev => ({ ...prev, [customer]: { state: 'error', message: (failedTabs || data.error || `Push failed (HTTP ${res.status}).`) + partialNote, unmatched, stillOutstanding } }));
-        // Every row belonging to a tab the server itself refused (results[i].ok === false — authorized
-        // by position, same rename-proof convention as idsToMarkByIndex above) must stay pending too,
-        // on top of whatever this function's own pre-check already knew about — the server's verdict is
-        // the real, final one, and a row it rejected must never be confirmed just because the client
-        // thought it looked fine a moment earlier.
-        const failedIndexes = (data.results || []).reduce((acc, r, i) => { if (!r.ok && i < itemGroups.length) acc.push(i); return acc; }, []);
+        // Every tab not POSITIVELY confirmed ok stays pending — confirmed directly as a real, live gap
+        // (2026-11-21): this used to compute "failed" as "data.results[i].ok === false", which requires
+        // data.results to actually have an entry for that position. A Google Sheets API quota error
+        // thrown inside readPushState, before the server ever reaches its per-tab processing loop,
+        // produces a response with NO results array at all (just a top-level error) — so this search
+        // found nothing "explicitly failed" and treated a TOTAL request failure as if nothing had failed,
+        // confirming every row in the push. Computed instead as "every index not in okIndexes" — which
+        // already requires an explicit, in-bounds r.ok === true — so a missing, truncated, or malformed
+        // results array can never be silently read as success for anything.
+        const okIndexSet = new Set(okIndexes);
+        const failedIndexes = itemGroups.map((_, i) => i).filter(i => !okIndexSet.has(i));
         const serverRejectedTitles = failedIndexes.flatMap(i => (itemGroups[i].variants || []).map(v => v.title));
         if (onConfirmed) onConfirmed(Array.from(new Set([...unmatched, ...serverRejectedTitles])));
         // Even on an overall-failed push, whatever DID land in the Sheet (the tabs in okIndexes) is real —

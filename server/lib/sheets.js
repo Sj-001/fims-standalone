@@ -36,6 +36,60 @@ function getCredentials() {
   throw new Error('Set either GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_BASE64.');
 }
 
+// Retries a single Sheets API call with exponential backoff, but ONLY for errors that are purely
+// about TIMING (a per-minute/per-100-seconds quota momentarily exhausted, or a transient 5xx) — never
+// for anything a retry can't fix (permission, not-found, a malformed request). Confirmed directly as a
+// real, live failure (2026-11-21): pushing a bulk batch spanning several customer Sheets in one go
+// fires several reads per Sheet (readPushState, the client's own preview/verify calls, the post-push
+// mirror refresh) in a tight window — comfortably enough to trip Google's default per-user read quota,
+// even though the total volume (a few dozen rows) is nothing unusual for this app. The user should
+// never have to think about how many customers or rows one action touches; retrying the handful of
+// calls that hit the quota, a moment later once it's recovered, is this app's job, not theirs.
+async function withGoogleApiRetry(fn, { retries = 5, baseDelayMs = 1000 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const status = e && (e.code || (e.response && e.response.status));
+      const reasons = (e && e.errors && e.errors.map(x => x.reason)) || [];
+      const isRateLimited = status === 429 || reasons.includes('rateLimitExceeded') || reasons.includes('userRateLimitExceeded') || reasons.includes('quotaExceeded');
+      const isTransient = status === 500 || status === 502 || status === 503;
+      if ((isRateLimited || isTransient) && attempt < retries) {
+        const delay = baseDelayMs * Math.pow(2, attempt) + Math.floor(Math.random() * 300);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
+// Wraps every actual API method (the leaf functions like spreadsheets.values.batchGet) with the retry
+// above — applied ONCE here, at the client itself, rather than at each of this file's two dozen call
+// sites, so a future call site can never accidentally be added without the same protection. A Proxy,
+// not a plain Object.keys walk — confirmed directly, by checking the real googleapis client's own
+// shape, that its methods (get, batchUpdate, values.batchGet, ...) are NOT own-enumerable properties
+// (Object.keys(sheets.spreadsheets) returns only `['context', 'developerMetadata', 'sheets', 'values']`
+// — every actual method lives on the prototype instead). An eager Object.keys copy would have silently
+// produced an object with none of the real methods on it, breaking every single Sheets API call outright
+// the moment this shipped. A Proxy's `get` trap fires on property access regardless of where the
+// property is actually defined, own or inherited, so it reaches every real method correctly — verified
+// directly against the real googleapis client before relying on it. `value.apply(target, args)` keeps
+// the original object as `this` so each method still has whatever internal context it expects.
+function wrapWithRetry(obj) {
+  if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) return obj;
+  return new Proxy(obj, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value === 'function') {
+        return (...args) => withGoogleApiRetry(() => value.apply(target, args));
+      }
+      if (value && typeof value === 'object') return wrapWithRetry(value);
+      return value;
+    },
+  });
+}
+
 function getSheetsClient() {
   if (_sheetsClient) return _sheetsClient;
   const credentials = getCredentials();
@@ -44,7 +98,8 @@ function getSheetsClient() {
     key: credentials.private_key,
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
-  _sheetsClient = google.sheets({ version: 'v4', auth });
+  const rawClient = google.sheets({ version: 'v4', auth });
+  _sheetsClient = { ...rawClient, spreadsheets: wrapWithRetry(rawClient.spreadsheets) };
   return _sheetsClient;
 }
 
@@ -79,6 +134,13 @@ function friendlyGoogleError(e) {
   const isNotFound = code === 404 || /requested entity was not found/i.test(raw);
   if (isNotFound) {
     return `No Google Sheet found with that ID. Double-check you copied the full ID from the Sheet's URL — the part between "/d/" and "/edit".`;
+  }
+  // Only ever reaches here after withGoogleApiRetry has already retried this exact call several times
+  // with backoff and still hit the limit — a real, sustained quota issue, not just a momentary burst.
+  const reasons = (e && e.errors && e.errors.map(x => x.reason)) || [];
+  const isRateLimited = code === 429 || reasons.includes('rateLimitExceeded') || reasons.includes('userRateLimitExceeded') || reasons.includes('quotaExceeded');
+  if (isRateLimited) {
+    return `Google Sheets' API rate limit is still being hit after several automatic retries — this clears on its own within a minute or two. Wait a moment and try again; nothing you did wrong, and nothing here has been written or confirmed.`;
   }
   return raw;
 }

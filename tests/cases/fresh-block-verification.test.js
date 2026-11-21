@@ -29,10 +29,14 @@ const normalizeForCatalogMatch = (s) => String(s || '')
 
 function loadFn(sheetIdsByCustomer, fetchImpl) {
   const getCustomerSheetIdLine = extractLine(APP_JSX, 'const getCustomerSheetId = (customer) =>');
+  // endExclusive + the next real declaration as the end anchor — not `(l) => l.trim() === '};'` — since
+  // this function now has its own inner helper (failClosed) that closes with its own `};` first; a bare
+  // trimmed-'};'  anchor would match that one and truncate the real function partway through.
   const verifyBlock = extractBlock(
     APP_JSX,
     'const verifyAgainstFreshBlocks = async (customer, itemGroups, exemptBlockTitles) => {',
-    (l) => l.trim() === '};',
+    'const pushInFlightRef = useRef(new Set());',
+    { endExclusive: true },
   );
   const customerSheetIds = Object.entries(sheetIdsByCustomer).map(([customer, sheetId]) => ({ customer, sheetId }));
   return buildFromSource(
@@ -137,15 +141,44 @@ module.exports = (async () => {
     t.assertEqual(newlyUnmatched, ['Butter Bake 999g x30 Packet (fake)'], 'only the mismatched one is reported unmatched');
   }
 
-  /* ===== 6. RESILIENCE: if the verification call itself fails, the push is not blocked entirely -- it
-     falls back to treating the input as safe (the synchronous check's own prior decision stands). ===== */
+  /* ===== 6. FAILS CLOSED, not open: a real, live incident (2026-11-21) -- a Google Sheets API quota
+     error struck this exact fetch mid-push. The OLD behavior here was "fall back to treating the input
+     as safe (the synchronous check's own prior decision stands)" -- which is exactly how a block the
+     synchronous pass had wrongly let through (its own cache stale or wrong) sailed past the ONE check
+     specifically meant to catch that, and got created for real. A thrown exception now means every
+     non-exempt variant is treated as UNVERIFIED and pulled out, not "probably fine" -- it stays pending
+     for the person to retry once the real Sheet can actually be checked again. ===== */
   {
     const fetchImpl = async () => { throw new Error('simulated network failure'); };
     const verify = loadFn({ DIAMOND: 'sheet-id-123' }, fetchImpl);
     const itemGroups = [{ tabName: 'T 50', variants: [{ title: 'T 50 32G * 120 PKT' }] }];
     const { safeItemGroups, newlyUnmatched } = await verify('DIAMOND', itemGroups, new Set());
-    t.assertEqual(safeItemGroups, itemGroups, 'RESILIENCE: a failed verification call falls back to the original input unchanged');
-    t.assertEqual(newlyUnmatched.length, 0, 'RESILIENCE: does not fabricate unmatched items on a verification failure');
+    t.assertEqual(safeItemGroups.length, 0, 'FAILS CLOSED: a verification failure pulls the unverified variant out of the push entirely');
+    t.assertEqual(newlyUnmatched, ['T 50 32G * 120 PKT'], 'FAILS CLOSED: reported as unmatched (unverified), not silently trusted');
+  }
+
+  /* ===== 6b. FAILS CLOSED, same non-ok-response case (a 502 from a quota-exceeded error, exactly what
+     the real incident's HTTP response looked like) -- not just a thrown exception. ===== */
+  {
+    const fetchImpl = async () => ({ ok: false, status: 502, json: async () => ({ error: 'Quota exceeded for quota metric...' }) });
+    const verify = loadFn({ DIAMOND: 'sheet-id-123' }, fetchImpl);
+    const itemGroups = [{ tabName: 'VAAYU', variants: [{ title: 'VAAYU 250 ML' }] }];
+    const { safeItemGroups, newlyUnmatched } = await verify('DIAMOND', itemGroups, new Set());
+    t.assertEqual(safeItemGroups.length, 0, 'FAILS CLOSED (502): a non-ok response pulls the unverified variant out, same as a thrown exception');
+    t.assertEqual(newlyUnmatched, ['VAAYU 250 ML'], 'FAILS CLOSED (502): reported as unmatched, exactly the real incident');
+  }
+
+  /* ===== 6c. ...but a variant explicitly picked THIS session (exemptBlockTitles) still goes through even
+     when the fresh check itself fails -- that exemption never depended on this fetch succeeding, since a
+     person just made that exact choice moments ago, independent of whether the Sheet could be re-read. ===== */
+  {
+    const fetchImpl = async () => { throw new Error('simulated network failure'); };
+    const verify = loadFn({ DIAMOND: 'sheet-id-123' }, fetchImpl);
+    const itemGroups = [{ tabName: 'T 50', variants: [{ title: 'Freshly Picked Item', blockTitleOverride: 'Freshly Picked Item' }] }];
+    const exempt = new Set([normalizeForCatalogMatch('Freshly Picked Item')]);
+    const { safeItemGroups, newlyUnmatched } = await verify('DIAMOND', itemGroups, exempt);
+    t.assertEqual(safeItemGroups[0].variants.length, 1, 'FAILS CLOSED, EXEMPT: a this-session deliberate pick still proceeds even when the fetch itself fails');
+    t.assertEqual(newlyUnmatched.length, 0, 'FAILS CLOSED, EXEMPT: not reported as unmatched');
   }
 
   /* ===== 7. No Sheet ID for this customer: nothing to verify against, falls back cleanly ===== */
